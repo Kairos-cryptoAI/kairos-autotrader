@@ -64,6 +64,11 @@ Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers af
      15-minute candles.
    - Open: closed Binance USD-M 1m bars from the Quant Scouts collector as the signal
      source. `candidates.Candidate` stays until step 2 replaces it with the contracts.
+   - Measured 2026-11-12 before any switch (36 days, ten instruments, outcome on EVEDEX
+     minute bars, round-trip cost 0.13%): signal on Binance bars 2167 candidates,
+     -0.049 R ± 0.024; signal on EVEDEX bars 2142 candidates, -0.080 R ± 0.024; 93% of
+     the candidates coincide. The source of the bars does not change the picture: the
+     switch is an alignment with the design, not a source of edge.
 2. **Routing and review.** `CandidateRouterPolicy.build`, `CandidateContextStore.build`
    and `CandidateReviewBrain.review_with_context`; `aggregator_worker.py`'s own context
    assembly is deleted. Provider calls move to `LLMGateway`.
