@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from .strategy import Candidate, Features
+from .candidates import Candidate, Features
 
 # RSS feeds handed to Text Scouts as its configured backstop sources. This module does
 # not read them itself: raw headlines never reach a model, only Text Scouts' typed signals.

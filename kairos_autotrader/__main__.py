@@ -19,7 +19,8 @@ from pathlib import Path
 
 import aiohttp
 
-from . import strategy, system_cli
+from . import candidates as candidate_types
+from . import system_cli
 from .engine import Config, ConfigError, LiveBroker, PaperBroker, Store, Trader, say
 from .evedex import Evedex, EvedexError, OrderSigner, Rejected, new_order_id
 from .system_engine import EngineError
@@ -304,11 +305,11 @@ async def cmd_report(args: argparse.Namespace) -> int:
         return 0
 
     # What would every signal have done, whether or not it was traded.
-    candidates: dict[str, strategy.Candidate] = {}
+    candidates: dict[str, candidate_types.Candidate] = {}
     for record in records:
         if record["event"] == "scan":
             for raw in record.get("candidates", []):
-                candidates[raw["id"]] = strategy.Candidate(**raw)
+                candidates[raw["id"]] = candidate_types.Candidate(**raw)
 
     def picks(decision: dict) -> list[str]:
         return decision.get("picks") or ([decision["candidate_id"]] if decision.get("candidate_id") else [])
@@ -334,7 +335,7 @@ async def cmd_report(args: argparse.Namespace) -> int:
         for cid, candidate in candidates.items():
             end = candidate.signal_time + (candidate.timeout_minutes + 10) * 60_000
             bars = await api.candles(candidate.symbol, "5m", candidate.signal_time, end)
-            result = strategy.outcome(candidate, bars, cost_fraction=2 * (fee + 0.0002))
+            result = candidate_types.outcome(candidate, bars, cost_fraction=2 * (fee + 0.0002))
             if result["r"] is not None:
                 results[cid] = result["r"]
 

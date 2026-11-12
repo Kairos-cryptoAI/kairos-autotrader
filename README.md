@@ -23,13 +23,15 @@ exchanges JSON with the runner ([`kairos_autotrader/sibling.py`](kairos_autotrad
 | 3 Aggregator | `kairos-aggregator` | candidate-review prompt, `CandidateReviewOutput`, conflict guard | shadow by default (`review_mode`) |
 | 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: one allocation a day |
 | 5 Risk Manager | `kairos-risk-manager` | `RiskSettings` limits, allocation gate, loss-at-stop sizing, economics | shadow by default (`risk_mode`) |
-| Strategy Engine | `kairos-strategy-engine` | registered sleeve generators on EVEDEX 1m bars | shadow only (`shadow`, `engine-replay`) |
+| Strategy Engine | `kairos-strategy-engine` | `kairos_strategy.hourly_trend` — the candidate rules — on EVEDEX 1m bars, pinned by the package's own source identity; registered sleeve generators | live: every candidate comes from it; registered sleeves in shadow only (`shadow`, `engine-replay`) |
 
 Owned by the runner itself:
 
-- `strategy.py` — two candidate rules on one-hour bars (trend pullback, breakout) with fixed
-  exits. The hourly bars are rebuilt from 15-minute candles on every scan (`scan_minutes`),
-  so the rules run four times an hour on the same timeframe.
+- `candidates.py` — the local shapes of a market state and a candidate. The rules that
+  produce them are not here: every scan (`scan_minutes`, four times an hour) asks the
+  Strategy Engine, and an engine whose source differs from the pinned one is refused.
+- `system_engine.py` — the bridge to the engine: minute cache, the conversion of EVEDEX
+  history into complete closed minute bars, and the pin.
 - `brain.py` — a single probability review of all candidates (the default reviewer).
 - `evedex.py` — EVEDEX REST client and EIP-712 order signing, byte-compatible with
   `@evedex/exchange-bot-sdk` 1.2.11 (fixture-tested).
@@ -50,7 +52,9 @@ These are tracked, not hidden. See
   approval. `CONTRIBUTING.md` in the meta-repository forbids bypassing Risk validation;
   `risk_mode="kairos"` restores it and is the intended end state.
 - State is two files, not the transactional inbox/outbox and execution journal.
-- The two rules in `strategy.py` are not a registered Strategy Engine sleeve.
+- The candidate rules are an isolated research package of the Strategy Engine, not a
+  registered or promoted sleeve, and they read EVEDEX minute bars, not the Binance bars of
+  the design. A minute without trades is filled with a flat bar at the previous close.
 
 ## Local development
 
@@ -64,6 +68,10 @@ uv run --locked python -m kairos_autotrader run --mode paper --no-llm --runtime-
 Layer workers need the sibling repositories checked out next to this one, each with its
 own `uv sync --locked` environment. A missing sibling disables that layer with a message;
 tests that start real sibling code are skipped where it is absent.
+
+`kairos-strategy-engine` must contain `kairos_strategy.hourly_trend` (commit `dc601e4`,
+branch `hourly-trend-candidates-20261112`, until it is on `main`). Without it, or with a
+different source of that package, the runner manages open positions and opens nothing.
 
 Real orders require `run --mode live --confirm-real-orders` and key files supplied by the
 operator. Keys are read at start and are never printed, logged or written. The operator

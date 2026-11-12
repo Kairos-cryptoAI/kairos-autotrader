@@ -20,7 +20,7 @@ from typing import Any
 
 import aiohttp
 
-from . import brain, strategy
+from . import brain
 from .aggregator_review import (
     AggregatorConfig,
     AggregatorError,
@@ -28,6 +28,7 @@ from .aggregator_review import (
     review_candidates,
     revisions,
 )
+from .candidates import Candidate, Features
 from .evedex import (
     Book,
     Evedex,
@@ -43,6 +44,15 @@ from .evedex import (
     plain,
     round_step,
 )
+from .system_engine import (
+    HOURLY_TREND_CACHE_DAYS,
+    EngineConfig,
+    EngineError,
+    MinuteStore,
+    decision_window,
+    engine_revision,
+    hourly_trend_scan,
+)
 from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of, risk_review
 from .system_rules import revisions as rules_revisions
 from .text_scouts import NewsDesk, TextScoutsError
@@ -55,9 +65,8 @@ HARD_MAX_OPEN_POSITIONS = 3
 HISTORY_LENGTH = 20
 HOUR_MS = 60 * 60_000
 BAR_MS = HOUR_MS  # signals come from closed 1h bars
-TREND_MS = 4 * HOUR_MS
-QUARTER_MS = 15 * 60_000  # the candles the hourly bars are rebuilt from
-STRATEGY_IDS = ("BREAKOUT", "PULLBACK_RECLAIM")  # the setups of strategy.analyse, as Macro and Risk know them
+# The setups of the Strategy Engine's hourly_trend rules, as Macro and Risk know them.
+STRATEGY_IDS = ("BREAKOUT", "PULLBACK_RECLAIM")
 
 
 # The venue's refusals of a TP/SL whose price is on the wrong side of the market for the
@@ -300,7 +309,7 @@ class PaperBroker:
 
     async def enter(
         self,
-        candidate: strategy.Candidate,
+        candidate: Candidate,
         quantity: Decimal,
         book: Book,
         instrument: Instrument,
@@ -410,7 +419,7 @@ class LiveBroker:
 
     async def enter(
         self,
-        candidate: strategy.Candidate,
+        candidate: Candidate,
         quantity: Decimal,
         book: Book,
         instrument: Instrument,
@@ -734,11 +743,22 @@ class Trader:
         fee: Decimal,
         instruments: dict[str, Instrument],
         openai_key: str | None,
+        minutes: MinuteStore | None = None,
     ) -> None:
         self.api, self.session, self.store, self.config = api, session, store, config
         self.broker, self.fee, self.instruments, self.openai_key = broker, fee, instruments, openai_key
         self._extras: dict[str, dict[str, Any]] = {}
         self._status_at: dict[str, int] = {}  # when each position was last reported on screen
+        # Signals come from the Strategy Engine; without it the runner only manages positions.
+        self.minutes = minutes or MinuteStore(store.directory / "minute-cache")
+        self.engine: EngineConfig | None = EngineConfig()
+        self._engine_revision = "unknown"
+        try:
+            self.engine.check_hourly_trend()
+            self._engine_revision = engine_revision(self.engine.source)
+        except EngineError as exc:
+            self.engine = None
+            say(f"Strategy Engine недоступен, новых сигналов не будет: {exc}")
         self.aggregator: AggregatorConfig | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
@@ -830,7 +850,7 @@ class Trader:
 
     # ---- Kairos Macro Strategist and Risk Manager -------------------------------
 
-    def _market_view(self, features: list[strategy.Features]) -> dict[str, dict[str, Any]]:
+    def _market_view(self, features: list[Features]) -> dict[str, dict[str, Any]]:
         view: dict[str, dict[str, Any]] = {}
         for f in features:
             extras = self._extras.get(f.symbol, {})
@@ -880,9 +900,7 @@ class Trader:
             ],
         }
 
-    def _risk_item(
-        self, candidate: strategy.Candidate, book: Book, stop: Any = None, take: Any = None
-    ) -> dict:
+    def _risk_item(self, candidate: Candidate, book: Book, stop: Any = None, take: Any = None) -> dict:
         depth = book.ask_qty * book.ask if candidate.side == "LONG" else book.bid_qty * book.bid
         return {
             "id": candidate.id,
@@ -934,7 +952,7 @@ class Trader:
         )
         return decisions
 
-    async def risk_shadow(self, candidates: list[strategy.Candidate], now_ms: int) -> None:
+    async def risk_shadow(self, candidates: list[Candidate], now_ms: int) -> None:
         """Record what the Risk Manager says about every candidate. Never affects trading."""
         if self.risk_rules is None or not self.config.risk_shadow or not candidates:
             return
@@ -946,7 +964,7 @@ class Trader:
         except (TimeoutError, RulesError, EvedexError, aiohttp.ClientError, OSError) as exc:
             self.store.journal("risk_error", kind=type(exc).__name__, message=str(exc)[:300])
 
-    async def macro_tick(self, features: list[strategy.Features], now_ms: int) -> None:
+    async def macro_tick(self, features: list[Features], now_ms: int) -> None:
         """Ask the Macro Strategist if an allocation is due. Its failures never reach the trading loop."""
         if self.macro is None or not features:
             return
@@ -1051,6 +1069,7 @@ class Trader:
                 "session_start", equity=str(equity), mode=self.broker.mode, config=asdict(self.config)
             )
         self.store.save()
+        await self.warm_history()
         say(
             f"Режим: {self.broker.mode}. Стартовый баланс сессии: {state['session']['start_equity']} USDT. "
             f"Позиций одновременно: до {self.slot_limit()}"
@@ -1098,57 +1117,93 @@ class Trader:
         scan_ms = int(self.config.scan_minutes) * 60_000
         return now_ms // scan_ms * scan_ms
 
-    async def scan(self, now_ms: int) -> tuple[list[strategy.Features], list[strategy.Candidate]]:
-        """Look for signals on the hourly bar that has just closed.
+    async def warm_history(self) -> None:
+        """Bring the minute cache up to date before the loop starts.
 
-        The rules always read one-hour bars. With ``scan_minutes=15`` those bars are rebuilt
-        from 15-minute candles four times an hour (closing at :00, :15, :30 and :45), so the
-        market is looked at four times as often without moving to a shorter, costlier timeframe.
+        The very first start downloads three weeks of minute bars per instrument; later
+        starts fetch only what is missing. A failure here is not fatal: the next scan
+        tries again.
+        """
+        if self.engine is None:
+            return
+        now_ms = int(time.time() * 1000)
+        gate = asyncio.Semaphore(4)
+
+        async def one(symbol: str) -> None:
+            async with gate:
+                await self.minutes.update(self.api, symbol, now_ms, HOURLY_TREND_CACHE_DAYS)
+
+        results = await asyncio.gather(*(one(s) for s in self.config.symbols), return_exceptions=True)
+        failed = [
+            f"{symbol}: {type(result).__name__}"
+            for symbol, result in zip(self.config.symbols, results, strict=False)
+            if isinstance(result, BaseException)
+        ]
+        if failed:
+            say("Минутная история загружена не полностью (" + ", ".join(failed) + "); повторю на скане.")
+
+    async def scan(self, now_ms: int) -> tuple[list[Features], list[Candidate]]:
+        """Ask the Strategy Engine about the hourly bar that has just closed.
+
+        The rules are ``kairos_strategy.hourly_trend`` in the Strategy Engine repository.
+        They read one-hour bars rebuilt from closed one-minute bars so that the newest bar
+        ends at this scan's boundary; with ``scan_minutes=15`` that is four decisions an
+        hour (:00, :15, :30 and :45) on the same timeframe.
         """
         slot = self.scan_slot(now_ms)
         last_closed = slot - BAR_MS
+        if self.engine is None:
+            self.store.journal("scan_error", bar=last_closed, message="Strategy Engine is not available")
+            return [], []
         gate = asyncio.Semaphore(4)
 
-        async def one(symbol: str):
+        async def history(symbol: str) -> tuple[list[list[float]], int]:
             async with gate:
-                raw = await self.api.candles(symbol, "15m", now_ms - 21 * 24 * HOUR_MS, now_ms)
-            quarters = strategy.closed_only(raw, QUARTER_MS, now_ms)
-            if not quarters or quarters[-1].t != slot - QUARTER_MS:
-                return symbol, None, [], {}
-            bars = strategy.aggregate(quarters, QUARTER_MS, BAR_MS, offset_ms=slot % BAR_MS)
-            trend_bars = strategy.aggregate(bars, BAR_MS, TREND_MS)
-            # A missing candle would stretch the last step and misplace the signal time.
-            if len(bars) < 2 or bars[-1].t != last_closed or bars[-1].t - bars[-2].t != BAR_MS:
-                return symbol, None, [], {}
-            features, candidates = strategy.analyse(
-                symbol,
-                bars[-300:],
-                trend_bars,
-                reward_risk=self.config.reward_risk,
-                timeout_minutes=self.config.timeout_minutes,
-            )
-            return symbol, features, candidates, strategy.bar_context(bars)
+                rows = await self.minutes.update(self.api, symbol, now_ms, HOURLY_TREND_CACHE_DAYS)
+            return decision_window(rows, slot)
 
-        results = await asyncio.gather(*(one(s) for s in self.config.symbols), return_exceptions=True)
+        loaded = await asyncio.gather(*(history(s) for s in self.config.symbols), return_exceptions=True)
+        series: dict[str, list[list[float]]] = {}
+        skipped: list[str] = []
+        filled = 0
+        for symbol, result in zip(self.config.symbols, loaded, strict=False):
+            if isinstance(result, BaseException):
+                skipped.append(f"{symbol}: {type(result).__name__}")
+            elif not result[0]:
+                skipped.append(f"{symbol}: no minute history")
+            else:
+                series[symbol], filled = result[0], filled + result[1]
+        found = None
+        if series:
+            try:
+                found = await hourly_trend_scan(
+                    self.engine,
+                    series,
+                    slot,
+                    reward_risk=self.config.reward_risk,
+                    timeout_minutes=self.config.timeout_minutes,
+                )
+            except EngineError as exc:
+                say(f"Strategy Engine не дал ответа, скан пропущен: {str(exc)[:200]}")
+                self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
+                return [], []
+            skipped.extend(found.skipped)
         try:
             metrics = await self.api.metrics()
         except EvedexError:
             metrics = {}
-        features, candidates, skipped = [], [], []
-        self._extras = {}
-        for symbol, result in zip(self.config.symbols, results, strict=False):
-            if isinstance(result, BaseException):
-                skipped.append(f"{symbol}: {type(result).__name__}")
-                continue
-            if result[1] is None:
-                skipped.append(f"{symbol}: no fresh closed bar")
-                continue
-            features.append(result[1])
-            candidates.extend(result[2])
-            self._extras[symbol] = {**result[3], **metrics.get(symbol, {})}
+        features = [found.features[s] for s in self.config.symbols if found and s in found.features]
+        candidates = list(found.candidates) if found else []
+        self._extras = {
+            f.symbol: {**(found.context[f.symbol] if found else {}), **metrics.get(f.symbol, {})}
+            for f in features
+        }
         self.store.journal(
             "scan",
             bar=last_closed,
+            source="strategy_engine",
+            engine={**(found.identity if found else {}), "engine_revision": self._engine_revision},
+            filled_minutes=filled,
             features=[{**f.as_dict(), **self._extras.get(f.symbol, {})} for f in features],
             candidates=[c.as_dict() for c in candidates],
             skipped=skipped,
@@ -1156,7 +1211,7 @@ class Trader:
         return features, candidates
 
     async def decide(
-        self, features: list[strategy.Features], candidates: list[strategy.Candidate], free_slots: int = 1
+        self, features: list[Features], candidates: list[Candidate], free_slots: int = 1
     ) -> brain.Decision:
         control = brain.control_decision(candidates, free_slots)
         day = self._day()
@@ -1246,8 +1301,8 @@ class Trader:
 
     async def _aggregator_decision(
         self,
-        features: list[strategy.Features],
-        candidates: list[strategy.Candidate],
+        features: list[Features],
+        candidates: list[Candidate],
         payload: dict[str, Any],
         free_slots: int,
         now_ms: int,
@@ -1308,7 +1363,7 @@ class Trader:
             usage={k: sum(r["usage"].get(k, 0) for r in reviews) for k in ("input_tokens", "output_tokens")},
         )
 
-    async def try_enter(self, candidate: strategy.Candidate, decision: brain.Decision) -> None:
+    async def try_enter(self, candidate: Candidate, decision: brain.Decision) -> None:
         trades = self.trades()
         instrument = self.instruments.get(candidate.symbol)
         if instrument is None or not instrument.tradable:

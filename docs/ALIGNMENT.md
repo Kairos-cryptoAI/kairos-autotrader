@@ -23,8 +23,8 @@ What rejects a real venue today is service configuration, not the contracts:
 
 | repository (revision) | used unchanged today | re-stated or duplicated in the runner | target |
 | --- | --- | --- | --- |
-| `kairos-core` (`ff3af75`) | `SentimentSignal`, `StrategicAllocation`, enums — inside workers only | `strategy.Candidate` stands in for `StrategyIntentV1`; review context stands in for `DecisionContextV1`; no `CandidateRouteV1`, `CandidateReviewV1`, `RiskTradeDecisionV1` | the runner passes the real contracts between layers |
-| `kairos-strategy-engine` (`9ff13e7`) | `registry.generate_sleeve_intents` in shadow, on EVEDEX 1m bars | `strategy.analyse` (two hourly rules) is not a registered sleeve | rules become a sleeve; intents come from `runtime.generate_runtime_strategy_intents` on Binance bars |
+| `kairos-core` (`ff3af75`) | `SentimentSignal`, `StrategicAllocation`, enums — inside workers only | `candidates.Candidate` stands in for `StrategyIntentV1`; review context stands in for `DecisionContextV1`; no `CandidateRouteV1`, `CandidateReviewV1`, `RiskTradeDecisionV1` | the runner passes the real contracts between layers |
+| `kairos-strategy-engine` (`dc601e4`, branch `hourly-trend-candidates-20261112`) | `kairos_strategy.hourly_trend` produces every live candidate, pinned by `hourly_trend_source_identity`; `registry.generate_sleeve_intents` in shadow; both on EVEDEX 1m bars | no rule code. `system_engine.fill_quiet_minutes` turns EVEDEX history into complete minute bars; the package is isolated, not registered | registration is a separate source-pinned step (it changes eleven fingerprints); intents come from `runtime.generate_runtime_strategy_intents` on Binance bars |
 | `kairos-quant-scouts` (`647c8b5`) | nothing | market data is read from EVEDEX by `evedex.py`; no `ClosedBarEventV1`; spread and age checks stand in for `VenueQualityV1` | closed Binance bars and `VenueQualityV1` from this repository's collectors |
 | `kairos-text-scouts` (`a8dbd88`) | full pipeline except the provider call | the model call is made by `text_scouts.model_extract`, not `kairos-llm` | provider call through the gateway |
 | `kairos-router` (`a373e62`) | `SignalWindow`, `classify_candidate`, time-to-live value | `CandidateRouterPolicy.build` is not called (needs `StrategyIntentV1`) | real `CandidateRouteV1` |
@@ -54,9 +54,16 @@ What rejects a real venue today is service configuration, not the contracts:
 
 Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers after.
 
-1. **Signals.** Closed Binance USD-M 1m bars (Quant Scouts collector) to the Strategy
-   Engine; the runner's two rules are contributed as a sleeve in `kairos-strategy-engine`
-   with parity fixtures; `strategy.analyse` and `strategy.Candidate` are deleted.
+1. **Signals.**
+   - Done 2026-11-12: the runner's two rules are `kairos_strategy.hourly_trend` in
+     `kairos-strategy-engine` (`dc601e4`); `strategy.py` with its indicators, bar builder
+     and `analyse` is deleted; `Trader.scan` and `engine-replay` call the engine. Parity:
+     a frozen fixture in the engine repository (169 candidates, 1525 decisions), and on
+     22 days of real EVEDEX history for ten instruments the engine path on minute bars
+     gave the same 1231 candidates, with equal prices, as the old path on the venue's
+     15-minute candles.
+   - Open: closed Binance USD-M 1m bars from the Quant Scouts collector as the signal
+     source. `candidates.Candidate` stays until step 2 replaces it with the contracts.
 2. **Routing and review.** `CandidateRouterPolicy.build`, `CandidateContextStore.build`
    and `CandidateReviewBrain.review_with_context`; `aggregator_worker.py`'s own context
    assembly is deleted. Provider calls move to `LLMGateway`.

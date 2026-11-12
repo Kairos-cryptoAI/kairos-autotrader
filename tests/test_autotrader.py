@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from kairos_autotrader import brain, strategy
+from kairos_autotrader import brain, candidates, system_engine
 from kairos_autotrader.engine import (
     Config,
     ConfigError,
@@ -173,53 +173,10 @@ def test_software_exit_rules():
     assert software_exit(short, Book(0, Decimal("80.9"), Decimal("81.0")), now_ms()) == "TAKE"
 
 
-# ---- strategy -----------------------------------------------------------------
+# ---- candidates ----------------------------------------------------------------
 
 
-def trending_bars(n: int, step_ms: int, start: float, drift: float) -> list[Candle]:
-    bars, price = [], start
-    for i in range(n):
-        open_ = price
-        price = price + drift
-        bars.append(
-            Candle(i * step_ms, open_, max(open_, price) + 0.05, min(open_, price) - 0.05, price, 1000.0)
-        )
-    return bars
-
-
-def test_pullback_reclaim_long_candidate_and_levels():
-    bars_1h = trending_bars(80, 3_600_000, 60.0, 0.25)
-    # a choppy climb (+0.3, -0.2, ...) so momentum is realistic rather than pinned at 100
-    bars_15m, price = [], 70.0
-    for i in range(97):
-        open_, price = price, price + (0.3 if i % 2 == 0 else -0.2)
-        bars_15m.append(
-            Candle(i * 900_000, open_, max(open_, price) + 0.05, min(open_, price) - 0.05, price, 1.0)
-        )
-    # two bars dip through the average, the last one closes back above it on a green candle
-    t = 97 * 900_000
-    bars_15m.append(Candle(t, price, price + 0.05, price - 0.7, price - 0.6, 1.0))
-    bars_15m.append(Candle(t + 900_000, price - 0.6, price - 0.55, price - 0.9, price - 0.7, 1.0))
-    bars_15m.append(Candle(t + 1_800_000, price - 0.7, price - 0.15, price - 0.75, price - 0.2, 1.0))
-    features, candidates = strategy.analyse("SOLUSD", bars_15m, bars_1h)
-    assert features is not None and features.trend == "UP"
-    assert [c.setup for c in candidates] == ["PULLBACK_RECLAIM"]
-    c = candidates[0]
-    assert c.side == "LONG" and c.stop < c.ref_price < c.take
-    assert c.take - c.ref_price == pytest.approx(1.5 * (c.ref_price - c.stop))
-    assert c.signal_time == c.bar_time + 900_000
-
-
-def test_no_candidates_in_flat_market_or_short_history():
-    flat = [Candle(i * 900_000, 80.0, 80.1, 79.9, 80.0 + (0.05 if i % 2 else -0.05), 1.0) for i in range(100)]
-    flat_h = [
-        Candle(i * 3_600_000, 80.0, 80.1, 79.9, 80.0 + (0.05 if i % 2 else -0.05), 1.0) for i in range(80)
-    ]
-    assert strategy.analyse("SOLUSD", flat, flat_h)[1] == []
-    assert strategy.analyse("SOLUSD", flat[:10], flat_h) == (None, [])
-
-
-def candidate(**over) -> strategy.Candidate:
+def candidate(**over) -> candidates.Candidate:
     base = dict(
         id="SOLUSD-LONG-PULLBACK_RECLAIM-1",
         symbol="SOLUSD",
@@ -236,17 +193,17 @@ def candidate(**over) -> strategy.Candidate:
         rationale="test",
     )
     base.update(over)
-    return strategy.Candidate(**base)
+    return candidates.Candidate(**base)
 
 
 def test_outcome_counts_stop_first_and_charges_costs():
     c = candidate()
     both = [Candle(900_000, 82.3, 83.7, 81.4, 82.0, 1.0)]
-    assert strategy.outcome(c, both, cost_fraction=0.0013)["reason"] == "STOP"
+    assert candidates.outcome(c, both, cost_fraction=0.0013)["reason"] == "STOP"
     win = [Candle(900_000, 82.3, 83.7, 82.0, 83.6, 1.0)]
-    result = strategy.outcome(c, win, cost_fraction=0.0013)
+    result = candidates.outcome(c, win, cost_fraction=0.0013)
     assert result["reason"] == "TAKE" and 1.3 < result["r"] < 1.5
-    assert strategy.outcome(c, [Candle(0, 82.3, 99, 1, 82.0, 1.0)], cost_fraction=0.0)["r"] is None
+    assert candidates.outcome(c, [Candle(0, 82.3, 99, 1, 82.0, 1.0)], cost_fraction=0.0)["r"] is None
 
 
 # ---- brain --------------------------------------------------------------------
@@ -368,6 +325,9 @@ class FakeVenue:
     async def metrics(self):
         return {}
 
+    async def candle_rows(self, symbol, group, start_ms, end_ms):
+        return []
+
     async def balance(self):
         return self.funding, self.funding
 
@@ -481,7 +441,7 @@ def only(owner):
     return trades[0] if trades else None
 
 
-def link_candidate() -> strategy.Candidate:
+def link_candidate() -> candidates.Candidate:
     return candidate(
         id="LINKUSD-LONG-PULLBACK_RECLAIM-1",
         symbol="LINKUSD",
@@ -938,71 +898,6 @@ def test_one_empty_position_answer_does_not_end_a_trade_or_cancel_its_protection
     assert only(trader) is None and sorted(venue.cancelled) == ["SOLUSD-t0", "SOLUSD-t1"]
 
 
-# ---- extra context for the reviewer -------------------------------------------
-
-
-def test_bar_context_describes_recent_bars():
-    bars = [Candle(i * 3_600_000, 100 + i, 101.5 + i, 99.5 + i, 101 + i, 10.0) for i in range(200)]
-    bars[-1] = Candle(bars[-1].t, bars[-1].o, bars[-1].h, bars[-1].l, bars[-1].c, 30.0)
-    context = strategy.bar_context(bars)
-    assert context["consecutive_up_bars"] == 12 and context["consecutive_down_bars"] == 0
-    assert context["last_bar_volume_vs_20bar_avg"] == 3.0 and context["position_in_7d_range"] > 0.95
-    assert strategy.bar_context(bars[:10]) == {}
-
-
-def test_exchange_metrics_are_parsed_and_broken_rows_skipped():
-    from kairos_autotrader.evedex import Evedex
-
-    api = Evedex(None)
-
-    async def request(method, url, **kwargs):
-        return [
-            {
-                "name": "SOLUSD",
-                "lastPrice": 80,
-                "high": 90,
-                "low": 70,
-                "fundingRate": -0.0001,
-                "markPrice": 80.08,
-                "fundingRateInterval": 8,
-                "openInterest": 1000,
-                "volumeBase": 4_000_000,
-            },
-            {"name": "BROKEN", "lastPrice": None},
-        ]
-
-    api._request = request
-    metrics = asyncio.run(api.metrics())
-    assert list(metrics) == ["SOLUSD"]
-    assert metrics["SOLUSD"]["funding_rate_pct"] == -0.01 and metrics["SOLUSD"]["open_interest_usd"] == 80_000
-    assert metrics["SOLUSD"]["position_in_24h_range"] == 0.5 and metrics["SOLUSD"]["mark_vs_last_bps"] == 10.0
-
-
-def test_payload_carries_context_and_reviewer_sees_open_positions():
-    features = strategy.Features("SOLUSD", 82.0, "UP", 81.0, 80.0, 0.4, 55.0, 0.8, 1.0, 0.5, 2.0, 0.3)
-    payload = brain.build_payload(
-        [features],
-        [candidate()],
-        trades_today=2,
-        free_slots=2,
-        open_positions=[{"symbol": "LINKUSD", "side": "LONG"}],
-        extras={"SOLUSD": {"funding_rate_pct": -0.01}},
-        fear_greed={"value": 32, "label": "Fear"},
-        recent_trades=[{"symbol": "SOLUSD", "result_r": -1.2}],
-    )
-    assert (
-        payload["market_features"][0]["funding_rate_pct"] == -0.01
-        and payload["market_features"][0]["rsi"] == 55.0
-    )
-    assert payload["portfolio"] == {
-        "open_positions": [{"symbol": "LINKUSD", "side": "LONG"}],
-        "free_slots": 2,
-        "trades_today": 2,
-    }
-    assert payload["crypto_fear_greed_index"]["value"] == 32 and payload["own_recent_closed_trades"]
-    assert payload["base_rates"] and "headlines" not in payload, "raw headlines never reach a model"
-
-
 # ---- model call glue and secrets ---------------------------------------------
 
 
@@ -1095,72 +990,192 @@ def test_secrets_are_read_by_line_and_validated(tmp_path):
 # ---- scanning four times an hour ------------------------------------------------
 
 
-def test_hourly_bars_can_be_rebuilt_on_any_quarter_hour():
-    quarter, hour = 15 * 60_000, 60 * 60_000
-    bars = [Candle(i * quarter, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 1.0) for i in range(12)]
-    on_the_hour = strategy.aggregate(bars, quarter, hour)
-    assert [b.t for b in on_the_hour] == [0, hour, 2 * hour] and on_the_hour[0].c == 103.5
-    shifted = strategy.aggregate(bars, quarter, hour, offset_ms=quarter)
-    assert [b.t for b in shifted] == [quarter, quarter + hour], "incomplete groups at both ends are dropped"
-    assert (shifted[0].o, shifted[0].h, shifted[0].l, shifted[0].c, shifted[0].v) == (
-        101.0,
-        105.0,
-        100.0,
-        104.5,
-        4.0,
-    )
+MINUTE, QUARTER, HOUR = 60_000, 15 * 60_000, 60 * 60_000
 
 
-class QuarterApi(FakeVenue):
-    """A venue that serves 15-minute candles up to a chosen moment."""
+class MinuteApi(FakeVenue):
+    """A venue that serves closed one-minute bars up to a chosen moment."""
 
     def __init__(self, last_open_ms: int, drop: int | None = None) -> None:
         super().__init__()
         self.last_open_ms, self.drop, self.asked = last_open_ms, drop, []
 
-    async def candles(self, symbol, group, start_ms, end_ms):
+    async def candle_rows(self, symbol, group, start_ms, end_ms):
         self.asked.append(group)
-        quarter = 15 * 60_000
-        first = self.last_open_ms - 1999 * quarter
-        rows = [
-            Candle(first + i * quarter, 80.0, 80.2, 79.8, 80.0 + (i % 7) * 0.01, 5.0) for i in range(2000)
+        first = max(start_ms // MINUTE * MINUTE, self.last_open_ms - 3 * 1440 * MINUTE)
+        return [
+            [t, 80.0, 80.2, 79.8, 80.0 + (t // MINUTE % 7) * 0.01, 5.0, 400.0]
+            for t in range(first, min(end_ms, self.last_open_ms + MINUTE), MINUTE)
+            if t != self.drop
         ]
-        return [c for c in rows if c.t != self.drop]
+
+
+def engine_state(symbol: str, rows: list) -> dict | None:
+    """What the engine reports for the newest quarter hour that is complete in ``rows``."""
+    opens = {int(r[0]) for r in rows}
+    quarter = max(opens) // QUARTER * QUARTER
+    while quarter >= min(opens) and any(quarter + i * MINUTE not in opens for i in range(15)):
+        quarter -= QUARTER
+    if quarter < min(opens):
+        return None
+    return {
+        "symbol": symbol,
+        "decision_ts_ms": quarter + QUARTER - 1,
+        "price": 80.0,
+        "trend": "UP",
+        "trend_ema_fast": 79.0,
+        "trend_ema_slow": 78.0,
+        "trend_efficiency": 0.41237,
+        "rsi": 55.0,
+        "atr": 0.8,
+        "atr_pct": 1.0,
+        "change_1h_pct": 0.12345,
+        "change_4h_pct": 0.5,
+        "change_24h_pct": 2.0,
+        "change_7d_pct": 3.14159,
+        "dist_ema_atr": 0.3,
+        "position_in_7d_range": None,
+        "last_bar_volume_vs_20bar_avg": 1.2345,
+        "consecutive_up_bars": 2,
+        "consecutive_down_bars": 0,
+    }
+
+
+def engine_intent(state: dict, *, reward_risk: float, hold_minutes: int) -> dict:
+    return {
+        "intent_id": "f" * 64,
+        "sleeve_id": system_engine.HOURLY_TREND_ID,
+        "symbol": state["symbol"],
+        "side": "LONG",
+        "decision_ts_ms": state["decision_ts_ms"],
+        "entry_eligible_ts_ms": state["decision_ts_ms"] + 1,
+        "entry_expires_ts_ms": state["decision_ts_ms"] + QUARTER,
+        "reference_price": 80.0,
+        "signal_strength": state["trend_efficiency"],
+        "gross_reward_bps": 100.0,
+        "stop_price": 79.2,
+        "target_price": 80.0 + reward_risk * 0.8,
+        "max_holding_ms": hold_minutes * MINUTE,
+        "trailing_activation_price": None,
+        "trailing_distance": None,
+        "metadata": {"setup": "PULLBACK_RECLAIM", "atr": "0.80000000000000004", "trend": "UP"},
+    }
+
+
+def fake_engine(monkeypatch, *, code_sha256: str = system_engine.HOURLY_TREND_CODE_SHA256, signal=True):
+    """Replace the engine process with a function; returns the list of requests it received."""
+    requests: list[dict] = []
+
+    def runner(config, request):
+        requests.append(request)
+        results = {}
+        for symbol, rows in request["series"].items():
+            state = engine_state(symbol, rows)
+            intent = None
+            if state is not None and signal:
+                intent = engine_intent(
+                    state,
+                    reward_risk=request["config"]["target_reward_to_risk"],
+                    hold_minutes=request["config"]["max_hold_minutes"],
+                )
+            results[symbol] = {"state": state, "intent": intent}
+        identity = {
+            "strategy_id": system_engine.HOURLY_TREND_ID,
+            "revision": "1",
+            "strategy_code_sha256": code_sha256,
+            "config_sha256": "c" * 64,
+        }
+        return {"identity": identity, "results": results}
+
+    monkeypatch.setattr(system_engine, "_run_hourly_trend", runner)
+    return requests
 
 
 def scanning_trader(tmp_path, venue, **config) -> Trader:
-    return paper_trader(tmp_path, venue, Config(use_llm=False, symbols=["SOLUSD"], **config))
+    trader = paper_trader(tmp_path, venue, Config(use_llm=False, symbols=["SOLUSD"], **config))
+    trader.engine = system_engine.EngineConfig()  # the engine process itself is replaced by fake_engine
+    return trader
 
 
-def test_scan_reads_the_hourly_bar_that_closed_at_the_last_quarter_hour(tmp_path):
-    quarter, hour = 15 * 60_000, 60 * 60_000
-    slot = 1_794_400_000_000 // hour * hour + quarter  # a boundary at :15
-    venue = QuarterApi(last_open_ms=slot - quarter)
-    trader = scanning_trader(tmp_path, venue)
-    features, _ = asyncio.run(trader.scan(slot + 12_000))
-    assert venue.asked == ["15m"] and [f.symbol for f in features] == ["SOLUSD"]
-    scan = [json.loads(line) for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()][
-        -1
-    ]
-    assert scan["bar"] == slot - hour, "the bar under review runs from :15 to :15"
+def journal_of(trader) -> list[dict]:
+    return [json.loads(line) for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()]
 
-    stale = scanning_trader(tmp_path / "stale", QuarterApi(last_open_ms=slot - 2 * quarter))
-    assert asyncio.run(stale.scan(slot + 12_000)) == ([], []), (
-        "the newest quarter-hour candle is not there yet"
-    )
-    holed = scanning_trader(
-        tmp_path / "hole", QuarterApi(last_open_ms=slot - quarter, drop=slot - hour - quarter)
-    )
-    assert asyncio.run(holed.scan(slot + 12_000)) == ([], []), (
-        "a missing candle before the last bar skips the scan"
-    )
 
-    hourly = scanning_trader(tmp_path / "hourly", QuarterApi(last_open_ms=slot - quarter), scan_minutes=60)
+def test_scan_asks_the_engine_about_the_hourly_bar_that_closed_at_the_last_quarter_hour(
+    tmp_path, monkeypatch
+):
+    slot = 1_794_400_000_000 // HOUR * HOUR + QUARTER  # a boundary at :15
+    requests = fake_engine(monkeypatch)
+    venue = MinuteApi(last_open_ms=slot + 2 * MINUTE)  # two minutes of the next quarter already exist
+    trader = scanning_trader(tmp_path, venue, reward_risk=2.0, timeout_minutes=240)
+    features, found = asyncio.run(trader.scan(slot + 130_000))
+
+    assert set(venue.asked) == {"1m"} and [f.symbol for f in features] == ["SOLUSD"]
+    request = requests[0]
+    assert request["op"] == "hourly_trend" and request["all"] is False
+    assert request["config"] == {"target_reward_to_risk": 2.0, "max_hold_minutes": 240}
+    sent = request["series"]["SOLUSD"]
+    assert sent[-1][0] == slot - MINUTE, "minutes after the boundary are not part of the decision"
+    assert sent[0][0] >= slot - system_engine.HOURLY_TREND_HISTORY_MS
+
+    (c,) = found
+    assert c.id == f"SOLUSD-LONG-PULLBACK_RECLAIM-{slot - HOUR}"
+    assert (c.bar_time, c.signal_time, c.setup) == (slot - HOUR, slot, "PULLBACK_RECLAIM")
+    assert (c.ref_price, c.stop, c.take, c.timeout_minutes) == (80.0, 79.2, 81.6, 240)
+    assert c.atr == pytest.approx(0.8) and c.score == 0.4124 and "uptrend" in c.rationale
+    assert features[0].trend_ema20 == 79.0 and features[0].dist_ema20_atr == 0.3
+
+    scan = journal_of(trader)[-1]
+    assert scan["event"] == "scan" and scan["bar"] == slot - HOUR, "the bar under review runs from :15 to :15"
+    assert scan["source"] == "strategy_engine"
+    assert scan["engine"]["strategy_code_sha256"] == system_engine.HOURLY_TREND_CODE_SHA256
+    assert scan["features"][0]["change_1h_pct"] == 0.123 and scan["features"][0]["change_7d_pct"] == 3.14
+    assert scan["features"][0]["position_in_7d_range"] is None
+    assert scan["candidates"][0]["id"] == c.id
+    assert (trader.store.directory / "minute-cache" / "SOLUSD.1m.json").exists()
+
+
+def test_scan_skips_an_instrument_without_a_fresh_bar_and_follows_the_scan_interval(tmp_path, monkeypatch):
+    slot = 1_794_400_000_000 // HOUR * HOUR + QUARTER
+    fake_engine(monkeypatch)
+    stale = scanning_trader(tmp_path / "stale", MinuteApi(last_open_ms=slot - 2 * MINUTE))
+    assert asyncio.run(stale.scan(slot + 12_000)) == ([], []), "the last minute of the bar is not there yet"
+    assert journal_of(stale)[-1]["skipped"] == ["SOLUSD: no fresh closed bar"]
+
+    holed = scanning_trader(tmp_path / "hole", MinuteApi(last_open_ms=slot - MINUTE, drop=slot - 5 * MINUTE))
+    features, _ = asyncio.run(holed.scan(slot + 12_000))
+    assert [f.symbol for f in features] == ["SOLUSD"], "one missing minute inside a traded quarter is bridged"
+    assert journal_of(holed)[-1]["filled_minutes"] == 1
+
+    hourly = scanning_trader(tmp_path / "hourly", MinuteApi(last_open_ms=slot + 5 * MINUTE), scan_minutes=60)
     asyncio.run(hourly.scan(slot + 12_000))
-    scan = [json.loads(line) for line in (hourly.store.directory / "journal.jsonl").read_text().splitlines()][
-        -1
-    ]
-    assert scan["bar"] == slot - quarter - hour, "with hourly scans the bar closes on the hour"
+    assert journal_of(hourly)[-1]["bar"] == slot - QUARTER - HOUR, (
+        "with hourly scans the bar closes on the hour"
+    )
+
+
+def test_scan_trades_nothing_when_the_engine_is_missing_fails_or_is_not_the_pinned_source(
+    tmp_path, monkeypatch
+):
+    slot = 1_794_400_000_000 // HOUR * HOUR
+    fake_engine(monkeypatch, code_sha256="0" * 64)
+    other = scanning_trader(tmp_path / "other", MinuteApi(last_open_ms=slot - MINUTE))
+    assert asyncio.run(other.scan(slot + 12_000)) == ([], [])
+    error = journal_of(other)[-1]
+    assert error["event"] == "scan_error" and "differs from the pinned one" in error["message"]
+
+    def broken(config, request):
+        raise system_engine.EngineError("Strategy Engine: worker failed")
+
+    monkeypatch.setattr(system_engine, "_run_hourly_trend", broken)
+    failing = scanning_trader(tmp_path / "failing", MinuteApi(last_open_ms=slot - MINUTE))
+    assert asyncio.run(failing.scan(slot + 12_000)) == ([], [])
+    assert journal_of(failing)[-1]["event"] == "scan_error"
+
+    absent = scanning_trader(tmp_path / "absent", MinuteApi(last_open_ms=slot - MINUTE))
+    absent.engine = None
+    assert asyncio.run(absent.scan(slot + 12_000)) == ([], [])
+    assert journal_of(absent)[-1]["message"] == "Strategy Engine is not available"
 
 
 def test_one_scan_per_quarter_hour_slot(tmp_path):

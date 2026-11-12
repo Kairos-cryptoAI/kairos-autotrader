@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from kairos_autotrader import aggregator_review, brain, engine, strategy
+from kairos_autotrader import aggregator_review, brain, candidates, engine
 from kairos_autotrader.aggregator_review import (
     AggregatorConfig,
     AggregatorError,
@@ -28,10 +28,10 @@ def candidate(
     symbol: str = "SOLUSD",
     side: str = "SHORT",
     score: float = 0.4,
-) -> strategy.Candidate:
+) -> candidates.Candidate:
     ref = 83.0
     stop, take = (83.9, 81.65) if side == "SHORT" else (82.1, 84.35)
-    return strategy.Candidate(
+    return candidates.Candidate(
         id=cid,
         symbol=symbol,
         side=side,

@@ -19,8 +19,8 @@ from typing import Any
 
 import aiohttp
 
+from .candidates import Candidate
 from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
-from .strategy import Candidate
 from .text_scouts import model_extract
 
 WORKER = Path(__file__).with_name("aggregator_worker.py")

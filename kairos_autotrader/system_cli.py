@@ -18,8 +18,8 @@ from typing import Any
 
 import aiohttp
 
-from . import strategy
-from .engine import BAR_MS, TREND_MS, Config, ConfigError, Store, say
+from .candidates import Candidate, outcome
+from .engine import BAR_MS, Config, ConfigError, Store, say
 from .evedex import Evedex
 from .system_engine import (
     DAY_MS,
@@ -29,29 +29,28 @@ from .system_engine import (
     MinuteStore,
     collect,
     engine_revision,
+    hourly_trend_history,
     to_candles,
 )
 from .text_scouts import NewsDesk
 
 SHADOW_MODE = "engine-shadow"
-OWN_RULES = "правила запускателя, скан раз в час"
-OWN_RULES_QUARTER = "правила запускателя, скан каждые 15 минут"
+LIVE_RULES = "боевые правила (hourly_trend в движке), скан раз в час"
+LIVE_RULES_QUARTER = "боевые правила (hourly_trend в движке), скан каждые 15 минут"
 
 
 def _day(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, UTC).strftime("%d.%m")
 
 
-def evaluate(
-    candidates: list[strategy.Candidate], candles: list, cost_fraction: float
-) -> list[dict[str, Any]]:
+def evaluate(candidates: list[Candidate], candles: list, cost_fraction: float) -> list[dict[str, Any]]:
     """Outcome of each candidate on the minute bars that followed it. Unfinished ones are left out."""
     times = [c.t for c in candles]
     rows = []
     for candidate in candidates:
         start = bisect_left(times, candidate.signal_time)
         later = candles[start : start + candidate.timeout_minutes + 2]
-        result = strategy.outcome(candidate, later, cost_fraction=cost_fraction)
+        result = outcome(candidate, later, cost_fraction=cost_fraction)
         if result["r"] is None:
             continue
         risk = abs(candidate.ref_price - candidate.stop)
@@ -69,35 +68,6 @@ def evaluate(
             }
         )
     return rows
-
-
-def own_rule_candidates(
-    symbol: str, candles: list, config: Config, phases_minutes: tuple[int, ...] = (0,)
-) -> list[strategy.Candidate]:
-    """The runner's own hourly rules on the same minute history, for a like-for-like comparison.
-
-    ``phases_minutes`` lists where the hourly bars close: ``(0,)`` is one scan an hour,
-    ``(0, 15, 30, 45)`` is the four scans an hour of ``scan_minutes=15``.
-    """
-    found: list[strategy.Candidate] = []
-    for phase in phases_minutes:
-        hourly = strategy.aggregate(candles, MINUTE_MS, BAR_MS, offset_ms=phase * MINUTE_MS)
-        for i in range(300, len(hourly)):
-            window = hourly[: i + 1]
-            trend = [
-                b
-                for b in strategy.aggregate(window, BAR_MS, TREND_MS)
-                if b.t + TREND_MS <= window[-1].t + BAR_MS
-            ]
-            _, candidates = strategy.analyse(
-                symbol,
-                window[-300:],
-                trend,
-                reward_risk=config.reward_risk,
-                timeout_minutes=config.timeout_minutes,
-            )
-            found.extend(candidates)
-    return found
 
 
 def summarise(name: str, rows: list[dict[str, Any]], days: float) -> dict[str, Any] | None:
@@ -152,6 +122,16 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
         candidates, problems, bars = await collect(api, store, engine, symbols, now_ms)
     for problem in problems:
         say(f"  замечание: {problem}")
+    # The rules that trade live, from the same engine and on the same minute history.
+    live, live_problems = hourly_trend_history(
+        engine,
+        {symbol: rows for symbol, rows in bars.items() if rows},
+        reward_risk=config.reward_risk,
+        timeout_minutes=config.timeout_minutes,
+    )
+    problems.extend(live_problems)
+    for problem in live_problems:
+        say(f"  замечание: {problem}")
     rows: list[dict[str, Any]] = []
     own: list[dict[str, Any]] = []
     own_quarter: list[dict[str, Any]] = []
@@ -160,9 +140,9 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
         if not candles:
             continue
         rows.extend(evaluate([c for c in candidates if c.symbol == symbol], candles, cost_fraction))
-        own.extend(evaluate(own_rule_candidates(symbol, candles, config), candles, cost_fraction))
-        quarter = own_rule_candidates(symbol, candles, config, (0, 15, 30, 45))
+        quarter = [c for c in live if c.symbol == symbol]
         own_quarter.extend(evaluate(quarter, candles, cost_fraction))
+        own.extend(evaluate([c for c in quarter if c.signal_time % BAR_MS == 0], candles, cost_fraction))
     say(
         f"Результат каждого сигнала по минутным свечам, с комиссиями и проскальзыванием "
         f"({cost_fraction * 100:.3f}% на круг). R = один риск на сделку."
@@ -173,8 +153,8 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
         summary.append(
             summarise(sleeve, [r for r in rows if r["setup"] == sleeve], max(1.0, args.days - warmup))
         )
-    summary.append(summarise(OWN_RULES, own, max(1.0, args.days - 12.5)))
-    summary.append(summarise(OWN_RULES_QUARTER, own_quarter, max(1.0, args.days - 12.5)))
+    summary.append(summarise(LIVE_RULES, own, max(1.0, args.days - 12.5)))
+    summary.append(summarise(LIVE_RULES_QUARTER, own_quarter, max(1.0, args.days - 12.5)))
     say("Не запускались: " + "; ".join(f"{name} ({reason})" for name, reason in EXCLUDED_SLEEVES.items()))
     say(
         "Это условный результат по истории, не сделки. "

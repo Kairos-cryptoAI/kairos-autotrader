@@ -1,7 +1,7 @@
 """Offline tests of the bridge to the real Kairos Strategy Engine.
 
-Only ``test_real_engine_worker_runs_registered_sleeves`` starts the engine itself; it is
-skipped where the engine checkout or its environment is absent.
+Only the two ``test_real_engine_...`` tests start the engine itself; they are skipped where
+the engine checkout or its environment is absent.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from kairos_autotrader import strategy, system_cli, system_engine
+from kairos_autotrader import candidates, system_cli, system_engine
 from kairos_autotrader.evedex import Candle, Evedex
 from kairos_autotrader.system_engine import (
     MINUTE_MS,
@@ -198,7 +198,7 @@ def test_shadow_records_each_new_intent_once_and_refuses_a_trading_directory(tmp
         and scans[0]["source"] == "strategy_engine"
         and scans[0]["engine_revision"] == "rev-test"
     )
-    assert strategy.Candidate(**scans[0]["candidates"][0]) == offered[0], (
+    assert candidates.Candidate(**scans[0]["candidates"][0]) == offered[0], (
         "the report can rebuild the candidate"
     )
     state = json.loads((args.runtime_dir / "state.json").read_text())
@@ -250,3 +250,159 @@ def test_minute_cache_fetches_the_older_part_when_a_longer_window_is_asked(tmp_p
     assert api.calls[-1] == (now - 4 * day * MINUTE_MS, now - 2 * day * MINUTE_MS), (
         "only the missing head is fetched"
     )
+
+
+# ---- the live rules: kairos_strategy.hourly_trend ---------------------------------------
+
+QUARTER_MS, HOUR_MS = 15 * MINUTE_MS, 60 * MINUTE_MS
+B0 = T0 // HOUR_MS * HOUR_MS  # an hour boundary
+
+
+def hourly_intent(**over) -> dict:
+    base = intent(
+        sleeve_id=system_engine.HOURLY_TREND_ID,
+        decision_ts_ms=B0 + QUARTER_MS - 1,
+        max_holding_ms=720 * MINUTE_MS,
+        metadata={"setup": "BREAKOUT", "atr": "0.40000000000000002", "trend": "DOWN"},
+    )
+    base.update(over)
+    return base
+
+
+def test_quiet_minutes_are_bridged_only_inside_a_quarter_hour_that_traded():
+    rows = minute_rows(60, start=B0)
+    kept = [r for i, r in enumerate(rows) if i not in (3, 4) and not 15 <= i < 30]
+    kept[2][4] = 101.5  # the close before the hole
+    filled, added = system_engine.fill_quiet_minutes(kept)
+    assert added == 2 and [r[0] for r in filled[:6]] == [B0 + i * MINUTE_MS for i in range(6)]
+    assert filled[3] == [B0 + 3 * MINUTE_MS, 101.5, 101.5, 101.5, 101.5, 0.0, 0.0]
+    assert not any(B0 + 15 * MINUTE_MS <= r[0] < B0 + 30 * MINUTE_MS for r in filled), (
+        "a quarter hour without a single minute stays missing"
+    )
+    assert system_engine.fill_quiet_minutes(rows) == (rows, 0)
+    assert system_engine.fill_quiet_minutes([]) == ([], 0)
+    polled = [list(r) for r in rows]
+    polled[20] = [polled[20][0], 100.3, 100.4, 100.2, 100.25, 0.0, 0.0]  # a live-polled quiet minute
+    normalised, added = system_engine.fill_quiet_minutes(polled)
+    assert added == 1 and normalised[20] == [polled[20][0], 100.0, 100.0, 100.0, 100.0, 0.0, 0.0], (
+        "a zero-volume row is replaced, so the series does not depend on how it was collected"
+    )
+
+    window, _ = system_engine.decision_window(minute_rows(600, start=B0), B0 + 300 * MINUTE_MS)
+    assert window[0][0] == B0 and window[-1][0] == B0 + 299 * MINUTE_MS
+
+
+def test_hourly_intent_keeps_the_setup_name_prices_and_bar_times():
+    c = system_engine.hourly_intent_to_candidate(hourly_intent())
+    assert c.id == f"SOLUSD-SHORT-BREAKOUT-{B0 + QUARTER_MS - HOUR_MS}"
+    assert (c.bar_time, c.signal_time) == (B0 + QUARTER_MS - HOUR_MS, B0 + QUARTER_MS)
+    assert (c.ref_price, c.stop, c.take, c.timeout_minutes) == (83.0, 83.5, 82.0, 720)
+    assert c.atr == pytest.approx(0.4) and c.score == 0.6123 and "20-bar low" in c.rationale
+    for bad in (
+        {"side": "LONG"},
+        {"stop_price": 82.5},
+        {"metadata": {"setup": "SOMETHING_ELSE", "atr": "0.4"}},
+        {"metadata": {"setup": "BREAKOUT"}},
+    ):
+        with pytest.raises((EngineError, KeyError)):
+            system_engine.hourly_intent_to_candidate(hourly_intent(**bad))
+
+
+def test_engine_answer_is_refused_unless_it_is_the_pinned_source():
+    identity = {
+        "strategy_id": system_engine.HOURLY_TREND_ID,
+        "revision": "1",
+        "strategy_code_sha256": system_engine.HOURLY_TREND_CODE_SHA256,
+        "config_sha256": "c" * 64,
+    }
+    assert system_engine.checked_hourly_answer({"identity": identity, "results": {}}) == (identity, {})
+    for bad in (
+        {"identity": {**identity, "strategy_code_sha256": "0" * 64}, "results": {}},
+        {"identity": {**identity, "strategy_id": "other_v1"}, "results": {}},
+        {"identity": identity},
+        {"results": {}},
+    ):
+        with pytest.raises(EngineError):
+            system_engine.checked_hourly_answer(bad)
+
+
+def test_history_of_the_live_rules_reports_bad_instruments_and_keeps_the_rest():
+    asked = []
+
+    def runner(config, request):
+        asked.append(request)
+        return {
+            "identity": {
+                "strategy_id": system_engine.HOURLY_TREND_ID,
+                "strategy_code_sha256": system_engine.HOURLY_TREND_CODE_SHA256,
+            },
+            "results": {
+                "SOLUSD": {"intents": [hourly_intent(), hourly_intent(stop_price=1.0)]},
+                "XRPUSD": {"error": "ValueError: boom"},
+            },
+        }
+
+    rows = [r for r in minute_rows(30, start=B0) if r[0] != B0 + 7 * MINUTE_MS]
+    found, problems = system_engine.hourly_trend_history(
+        EngineConfig(), {"SOLUSD": rows, "XRPUSD": rows}, reward_risk=1.5, timeout_minutes=720, runner=runner
+    )
+    assert asked[0]["all"] is True and len(asked[0]["series"]["SOLUSD"]) == 30, "the hole is bridged"
+    assert [c.setup for c in found] == ["BREAKOUT"]
+    assert (
+        len(problems) == 2 and any("boom" in p for p in problems) and any("bad intent" in p for p in problems)
+    )
+
+
+def test_real_engine_decides_on_the_newest_quarter_hour_with_the_pinned_rules():
+    config = EngineConfig()
+    try:
+        config.check_hourly_trend()
+    except EngineError:
+        pytest.skip("Strategy Engine checkout with kairos_strategy.hourly_trend is not present")
+    rows, price = [], 100.0
+    boundary = B0 + 12 * 1440 * MINUTE_MS + QUARTER_MS
+    for i in range(12 * 1440 + 15):  # twelve days of a slow climb with pullbacks
+        step = 0.012 if (i // 240) % 3 else -0.015
+        nxt = price + step
+        rows.append(
+            [B0 + i * MINUTE_MS, price, max(price, nxt) + 0.01, min(price, nxt) - 0.01, nxt, 5.0, 5.0 * nxt]
+        )
+        price = nxt
+    window, added = system_engine.decision_window(rows, boundary)
+    assert added == 0 and window[-1][0] == boundary - MINUTE_MS
+    found = asyncio.run(
+        system_engine.hourly_trend_scan(
+            config, {"TESTUSD": window}, boundary, reward_risk=1.5, timeout_minutes=720
+        )
+    )
+    assert found.identity["strategy_code_sha256"] == system_engine.HOURLY_TREND_CODE_SHA256, (
+        "the pin in system_engine.py must be updated together with the engine source"
+    )
+    assert found.skipped == [] and list(found.features) == ["TESTUSD"]
+    features = found.features["TESTUSD"]
+    assert features.trend in ("UP", "DOWN", "FLAT") and features.price == pytest.approx(rows[-1][4])
+    assert set(found.context["TESTUSD"]) == {
+        "change_1h_pct",
+        "change_7d_pct",
+        "position_in_7d_range",
+        "last_bar_volume_vs_20bar_avg",
+        "consecutive_up_bars",
+        "consecutive_down_bars",
+    }
+    for c in found.candidates:
+        assert c.signal_time == boundary and c.setup in ("PULLBACK_RECLAIM", "BREAKOUT")
+
+    late = asyncio.run(
+        system_engine.hourly_trend_scan(
+            config, {"TESTUSD": window[:-1]}, boundary, reward_risk=1.5, timeout_minutes=720
+        )
+    )
+    assert late.features == {} and late.skipped == ["TESTUSD: no fresh closed bar"]
+
+    history, problems = system_engine.hourly_trend_history(
+        config, {"TESTUSD": rows}, reward_risk=2.0, timeout_minutes=240
+    )
+    assert problems == [] and history, "the synthetic climb must produce candidates"
+    for c in history:
+        assert c.timeout_minutes == 240
+        assert abs(c.take - c.ref_price) == pytest.approx(2.0 * abs(c.ref_price - c.stop))
