@@ -1,33 +1,41 @@
 """Offline tests of the bridge to the real Kairos Strategy Engine.
 
-Only the two ``test_real_engine_...`` tests start the engine itself; they are skipped where
-the engine checkout or its environment is absent.
+Only the ``test_real_engine_...`` tests start the engine itself; they are skipped where
+the engine checkout or its environment is absent. ``KAIROS_TEST_ENGINE_SOURCE`` points
+them at another engine source directory than the sibling checkout.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
+from pathlib import Path
 
 import pytest
+from kairos_core.contracts import ClosedBarEventV1
+from support import CONFIG_SHA256, engine_state, strict_intent
 
-from kairos_autotrader import candidates, system_cli, system_engine
+from kairos_autotrader import system_cli, system_engine
 from kairos_autotrader.evedex import Candle, Evedex
 from kairos_autotrader.system_engine import (
+    HOURLY_TREND_HISTORY_MS,
     MINUTE_MS,
     EngineConfig,
     EngineError,
     MinuteStore,
-    candidates_from,
     collect,
-    intent_to_candidate,
+    records_from,
+    sleeve_record,
 )
 
 T0 = 1_794_000_000_000 // MINUTE_MS * MINUTE_MS
 
 
 def intent(**over) -> dict:
+    """A research ``SleeveIntent`` as ``system_engine_worker.py`` serialises it."""
     base = {
         "intent_id": "abc",
         "sleeve_id": "trend_pullback_reclaim_v1",
@@ -56,34 +64,49 @@ def minute_rows(count: int, start: int = T0, price: float = 100.0) -> list[list[
     ]
 
 
-def test_intent_keeps_side_exits_and_hold_time():
-    c = intent_to_candidate(intent(), revision="1", status="rejected")
-    assert (c.symbol, c.side, c.setup) == ("SOLUSD", "SHORT", "trend_pullback_reclaim_v1")
-    assert (c.ref_price, c.stop, c.take, c.timeout_minutes) == (83.0, 83.5, 82.0, 180)
-    assert c.signal_time == T0 + 5 * MINUTE_MS, "the engine's inclusive close becomes the next millisecond"
-    assert c.id == f"SOLUSD-SHORT-trend_pullback_reclaim_v1-{T0 + 5 * MINUTE_MS - 1}"
-    assert c.atr == pytest.approx(0.5) and c.score == 0.6123 and "status rejected" in c.rationale
-    trailing = intent_to_candidate(
-        intent(trailing_distance=0.2, trailing_activation_price=82.5), revision="1", status="rejected"
+def test_sleeve_record_keeps_side_exits_and_hold_time():
+    r = sleeve_record(intent(), note="engine status rejected")
+    assert (r["symbol"], r["side"], r["setup"]) == ("SOLUSD", "SHORT", "trend_pullback_reclaim_v1")
+    assert (r["ref_price"], r["stop"], r["take"], r["timeout_minutes"]) == (83.0, 83.5, 82.0, 180)
+    assert r["signal_time"] == T0 + 5 * MINUTE_MS, "the engine's inclusive close becomes the next millisecond"
+    assert r["id"] == f"SOLUSD-SHORT-trend_pullback_reclaim_v1-{T0 + 5 * MINUTE_MS - 1}"
+    assert r["atr"] == pytest.approx(0.5) and r["score"] == 0.6123 and r["note"] == "engine status rejected"
+    assert r["strategy_id"] == "trend_pullback_reclaim_v1"
+    trailing = sleeve_record(intent(trailing_distance=0.2, trailing_activation_price=82.5))
+    assert trailing["note"] == "engine trailing stop not applied"
+
+    live = sleeve_record(
+        intent(
+            sleeve_id=system_engine.HOURLY_TREND_ID,
+            symbol="SOLUSDT",
+            metadata={"setup": "BREAKOUT", "atr": "0.40000000000000002"},
+        ),
+        instrument="SOLUSD",
     )
-    assert "trailing stop not applied" in trailing.rationale
+    assert (live["symbol"], live["setup"], live["strategy_id"]) == (
+        "SOLUSD",
+        "BREAKOUT",
+        system_engine.HOURLY_TREND_ID,
+    )
+    assert live["atr"] == pytest.approx(0.4) and live["id"].startswith("SOLUSD-SHORT-BREAKOUT-")
 
 
 @pytest.mark.parametrize("bad", [{"side": "FLAT"}, {"stop_price": 82.5}, {"side": "LONG"}])
-def test_inconsistent_intent_is_refused(bad):
+def test_inconsistent_sleeve_intent_is_refused(bad):
     with pytest.raises(EngineError):
-        intent_to_candidate(intent(**bad), revision="1", status="rejected")
+        sleeve_record(intent(**bad))
 
 
-def test_candidates_are_filtered_by_time_and_sleeve_errors_are_reported():
+def test_records_are_filtered_by_time_and_sleeve_errors_are_reported():
     old = intent(decision_ts_ms=T0 - 1)
     results = {
         "trend_pullback_reclaim_v1": {"revision": "1", "status": "rejected", "intents": [old, intent()]},
         "range_mean_reversion_v1": {"error": "ValueError: boom"},
         "right_tail_trend_v1": {"revision": "1", "status": "rejected", "intents": [intent(stop_price=1.0)]},
     }
-    found, problems = candidates_from(results, since_ms=T0)
-    assert [c.signal_time for c in found] == [T0 + 5 * MINUTE_MS]
+    found, problems = records_from(results, since_ms=T0)
+    assert [r["signal_time"] for r in found] == [T0 + 5 * MINUTE_MS]
+    assert "rev 1" in found[0]["note"] and "status rejected" in found[0]["note"]
     assert len(problems) == 2 and "boom" in problems[0] and "bad intent" in problems[1]
 
 
@@ -140,7 +163,7 @@ def test_collect_runs_every_instrument_and_reports_gaps_and_failures(tmp_path):
             runner=runner,
         )
     )
-    assert [c.symbol for c in found] == ["SOLUSD"] and len(bars["SOLUSD"]) == 59
+    assert [r["symbol"] for r in found] == ["SOLUSD"] and len(bars["SOLUSD"]) == 59
     assert any("1 gaps" in p for p in problems) and any("XRPUSD" in p and "venue down" in p for p in problems)
 
 
@@ -148,12 +171,10 @@ def test_outcomes_use_only_the_bars_after_the_signal():
     candles = [Candle(T0 + i * MINUTE_MS, 83.0, 83.1, 82.9, 83.0, 1.0) for i in range(400)]
     candles[2] = Candle(candles[2].t, 83.0, 84.0, 82.9, 83.0, 1.0)  # a spike before the signal must not count
     candles[20] = Candle(candles[20].t, 83.0, 83.1, 81.9, 82.0, 1.0)  # the target is reached here
-    done = intent_to_candidate(intent(), revision="1", status="rejected")
-    open_one = intent_to_candidate(
-        intent(decision_ts_ms=T0 + 399 * MINUTE_MS - 1), revision="1", status="rejected"
-    )
+    done = sleeve_record(intent())
+    open_one = sleeve_record(intent(decision_ts_ms=T0 + 399 * MINUTE_MS - 1))
     rows = system_cli.evaluate([done, open_one], candles, cost_fraction=0.0013)
-    assert len(rows) == 1 and rows[0]["reason"] == "TAKE"
+    assert len(rows) == 1 and rows[0]["reason"] == "TAKE" and rows[0]["setup"] == "trend_pullback_reclaim_v1"
     assert rows[0]["r"] == pytest.approx(2.0 - 0.0013 * 83.0 / 0.5, abs=1e-3)
     assert rows[0]["cost_r"] == pytest.approx(0.2158, abs=1e-3) and rows[0]["stop_pct"] == pytest.approx(
         0.602, abs=1e-3
@@ -180,7 +201,7 @@ def shadow_args(tmp_path) -> argparse.Namespace:
 
 
 def test_shadow_records_each_new_intent_once_and_refuses_a_trading_directory(tmp_path, monkeypatch):
-    offered = [intent_to_candidate(intent(), revision="1", status="rejected")]
+    offered = [sleeve_record(intent(), note="engine status rejected")]
 
     async def fake_collect(api, store, engine, symbols, now_ms, *, since_ms=0, runner=None):
         return list(offered), [], {}
@@ -198,11 +219,9 @@ def test_shadow_records_each_new_intent_once_and_refuses_a_trading_directory(tmp
         and scans[0]["source"] == "strategy_engine"
         and scans[0]["engine_revision"] == "rev-test"
     )
-    assert candidates.Candidate(**scans[0]["candidates"][0]) == offered[0], (
-        "the report can rebuild the candidate"
-    )
+    assert scans[0]["candidates"] == offered, "the report reads the record as it was written"
     state = json.loads((args.runtime_dir / "state.json").read_text())
-    assert state["mode"] == "engine-shadow" and list(state["seen"]) == [offered[0].id]
+    assert state["mode"] == "engine-shadow" and list(state["seen"]) == [offered[0]["id"]]
 
     live = tmp_path / "live"
     live.mkdir()
@@ -235,7 +254,7 @@ def test_real_engine_worker_runs_registered_sleeves():
         assert "error" not in result, (sleeve, result)
         assert result["status"] and isinstance(result["intents"], list)
         for raw in result["intents"]:
-            intent_to_candidate(raw, revision=result["revision"], status=result["status"])
+            sleeve_record(raw)
 
 
 def test_minute_cache_fetches_the_older_part_when_a_longer_window_is_asked(tmp_path):
@@ -256,123 +275,181 @@ def test_minute_cache_fetches_the_older_part_when_a_longer_window_is_asked(tmp_p
 
 QUARTER_MS, HOUR_MS = 15 * MINUTE_MS, 60 * MINUTE_MS
 B0 = T0 // HOUR_MS * HOUR_MS  # an hour boundary
+IDENTITY = {
+    "strategy_id": system_engine.HOURLY_TREND_ID,
+    "revision": "1",
+    "strategy_code_sha256": system_engine.HOURLY_TREND_CODE_SHA256,
+    "config_sha256": CONFIG_SHA256,
+}
 
 
-def hourly_intent(**over) -> dict:
-    base = intent(
-        sleeve_id=system_engine.HOURLY_TREND_ID,
-        decision_ts_ms=B0 + QUARTER_MS - 1,
-        max_holding_ms=720 * MINUTE_MS,
-        metadata={"setup": "BREAKOUT", "atr": "0.40000000000000002", "trend": "DOWN"},
-    )
-    base.update(over)
-    return base
-
-
-def test_quiet_minutes_are_bridged_only_inside_a_quarter_hour_that_traded():
-    rows = minute_rows(60, start=B0)
-    kept = [r for i, r in enumerate(rows) if i not in (3, 4) and not 15 <= i < 30]
-    kept[2][4] = 101.5  # the close before the hole
-    filled, added = system_engine.fill_quiet_minutes(kept)
-    assert added == 2 and [r[0] for r in filled[:6]] == [B0 + i * MINUTE_MS for i in range(6)]
-    assert filled[3] == [B0 + 3 * MINUTE_MS, 101.5, 101.5, 101.5, 101.5, 0.0, 0.0]
-    assert not any(B0 + 15 * MINUTE_MS <= r[0] < B0 + 30 * MINUTE_MS for r in filled), (
-        "a quarter hour without a single minute stays missing"
-    )
-    assert system_engine.fill_quiet_minutes(rows) == (rows, 0)
-    assert system_engine.fill_quiet_minutes([]) == ([], 0)
-    polled = [list(r) for r in rows]
-    polled[20] = [polled[20][0], 100.3, 100.4, 100.2, 100.25, 0.0, 0.0]  # a live-polled quiet minute
-    normalised, added = system_engine.fill_quiet_minutes(polled)
-    assert added == 1 and normalised[20] == [polled[20][0], 100.0, 100.0, 100.0, 100.0, 0.0, 0.0], (
-        "a zero-volume row is replaced, so the series does not depend on how it was collected"
-    )
-
-    window, _ = system_engine.decision_window(minute_rows(600, start=B0), B0 + 300 * MINUTE_MS)
-    assert window[0][0] == B0 and window[-1][0] == B0 + 299 * MINUTE_MS
-
-
-def test_hourly_intent_keeps_the_setup_name_prices_and_bar_times():
-    c = system_engine.hourly_intent_to_candidate(hourly_intent())
-    assert c.id == f"SOLUSD-SHORT-BREAKOUT-{B0 + QUARTER_MS - HOUR_MS}"
-    assert (c.bar_time, c.signal_time) == (B0 + QUARTER_MS - HOUR_MS, B0 + QUARTER_MS)
-    assert (c.ref_price, c.stop, c.take, c.timeout_minutes) == (83.0, 83.5, 82.0, 720)
-    assert c.atr == pytest.approx(0.4) and c.score == 0.6123 and "20-bar low" in c.rationale
-    for bad in (
-        {"side": "LONG"},
-        {"stop_price": 82.5},
-        {"metadata": {"setup": "SOMETHING_ELSE", "atr": "0.4"}},
-        {"metadata": {"setup": "BREAKOUT"}},
-    ):
-        with pytest.raises((EngineError, KeyError)):
-            system_engine.hourly_intent_to_candidate(hourly_intent(**bad))
+def cached_bars(first_ms: int, count: int, symbol: str = "SOLUSDT") -> list[list]:
+    """Cache rows with stand-in identities: enough for everything but the real engine."""
+    return [
+        [
+            first_ms + i * MINUTE_MS,
+            80.0,
+            80.2,
+            79.8,
+            80.0,
+            5.0,
+            400.0,
+            2.5,
+            200.0,
+            hashlib.sha256(f"{symbol}:{first_ms + i * MINUTE_MS}".encode()).hexdigest(),
+        ]
+        for i in range(count)
+    ]
 
 
 def test_engine_answer_is_refused_unless_it_is_the_pinned_source():
-    identity = {
-        "strategy_id": system_engine.HOURLY_TREND_ID,
-        "revision": "1",
-        "strategy_code_sha256": system_engine.HOURLY_TREND_CODE_SHA256,
-        "config_sha256": "c" * 64,
-    }
-    assert system_engine.checked_hourly_answer({"identity": identity, "results": {}}) == (identity, {})
+    assert system_engine.checked_hourly_answer({"identity": IDENTITY, "results": {}}) == (IDENTITY, {})
     for bad in (
-        {"identity": {**identity, "strategy_code_sha256": "0" * 64}, "results": {}},
-        {"identity": {**identity, "strategy_id": "other_v1"}, "results": {}},
-        {"identity": identity},
+        {"identity": {**IDENTITY, "strategy_code_sha256": "0" * 64}, "results": {}},
+        {"identity": {**IDENTITY, "strategy_id": "other_v1"}, "results": {}},
+        {"identity": IDENTITY},
         {"results": {}},
     ):
         with pytest.raises(EngineError):
             system_engine.checked_hourly_answer(bad)
 
 
+def test_scan_spreads_instruments_over_engine_processes_and_needs_the_whole_window():
+    boundary = B0 + HOURLY_TREND_HISTORY_MS + QUARTER_MS
+    full = HOURLY_TREND_HISTORY_MS // MINUTE_MS
+    series = {
+        "SOLUSD": cached_bars(boundary - HOURLY_TREND_HISTORY_MS - 30 * MINUTE_MS, full + 32, "SOLUSDT"),
+        "ETHUSD": cached_bars(boundary - HOURLY_TREND_HISTORY_MS, full, "ETHUSDT"),
+        "XRPUSD": cached_bars(boundary - HOURLY_TREND_HISTORY_MS, full - 1, "XRPUSDT"),  # last minute absent
+        "ZECUSD": cached_bars(boundary - HOURLY_TREND_HISTORY_MS + MINUTE_MS, full - 1, "ZECUSDT"),
+        "LINKUSD": cached_bars(boundary - HOURLY_TREND_HISTORY_MS, full, "LINKUSDT"),
+    }
+    requests = []
+
+    def runner(config, request):
+        requests.append(request)
+        results = {}
+        for symbol, rows in request["series"].items():
+            decision = int(rows[-1][0]) + MINUTE_MS - 1
+            if symbol == "LINKUSDT":
+                results[symbol] = {"error": "ClosedBarSequenceError: closed-bar gap"}
+                continue
+            raw = strict_intent(
+                symbol=symbol, decision_ts_ms=decision, bar_hashes=tuple(r[9] for r in rows)
+            ).model_dump(mode="json")
+            results[symbol] = {
+                "decision_ts_ms": decision,
+                "state": engine_state(symbol, decision),
+                "intent": raw if symbol == "SOLUSDT" else None,
+            }
+        return {"identity": IDENTITY, "results": results}
+
+    found = asyncio.run(
+        system_engine.hourly_trend_scan(
+            EngineConfig(), series, boundary, reward_risk=1.5, timeout_minutes=720, runner=runner, processes=2
+        )
+    )
+    assert len(requests) == 2 and all(r["op"] == "hourly_trend_bars" for r in requests)
+    sent = {symbol: rows for request in requests for symbol, rows in request["series"].items()}
+    assert set(sent) == {"SOLUSDT", "ETHUSDT", "LINKUSDT"}, "requests are keyed by the Binance symbol"
+    assert len(sent["SOLUSDT"]) == full and sent["SOLUSDT"][-1][0] == boundary - MINUTE_MS
+    assert sorted(found.features) == ["ETHUSD", "SOLUSD"] and list(found.intents) == ["SOLUSD"]
+    assert found.features["SOLUSD"].symbol == "SOLUSD" and found.intents["SOLUSD"].symbol == "SOLUSDT"
+    assert sorted(found.skipped) == [
+        "LINKUSD: ClosedBarSequenceError: closed-bar gap",
+        "XRPUSD: no fresh closed bar",
+        "ZECUSD: closed bars do not reach back the whole history window",
+    ]
+
+    def other_clock(config, request):
+        answer = runner(config, request)
+        for result in answer["results"].values():
+            if "decision_ts_ms" in result:
+                result["decision_ts_ms"] -= QUARTER_MS
+        return answer
+
+    late = asyncio.run(
+        system_engine.hourly_trend_scan(
+            EngineConfig(),
+            {"ETHUSD": series["ETHUSD"]},
+            boundary,
+            reward_risk=1.5,
+            timeout_minutes=720,
+            runner=other_clock,
+        )
+    )
+    assert late.features == {} and late.skipped == ["ETHUSD: the engine decided on another clock"]
+
+
 def test_history_of_the_live_rules_reports_bad_instruments_and_keeps_the_rest():
     asked = []
+    good = intent(
+        sleeve_id=system_engine.HOURLY_TREND_ID,
+        symbol="SOLUSDT",
+        metadata={"setup": "BREAKOUT", "atr": "0.4"},
+    )
 
     def runner(config, request):
         asked.append(request)
         return {
-            "identity": {
-                "strategy_id": system_engine.HOURLY_TREND_ID,
-                "strategy_code_sha256": system_engine.HOURLY_TREND_CODE_SHA256,
-            },
+            "identity": IDENTITY,
             "results": {
-                "SOLUSD": {"intents": [hourly_intent(), hourly_intent(stop_price=1.0)]},
-                "XRPUSD": {"error": "ValueError: boom"},
+                "SOLUSDT": {"intents": [good, {**good, "stop_price": 1.0}]},
+                "XRPUSDT": {"error": "ValueError: boom"},
             },
         }
 
-    rows = [r for r in minute_rows(30, start=B0) if r[0] != B0 + 7 * MINUTE_MS]
+    bars = cached_bars(B0, 30)
     found, problems = system_engine.hourly_trend_history(
-        EngineConfig(), {"SOLUSD": rows, "XRPUSD": rows}, reward_risk=1.5, timeout_minutes=720, runner=runner
+        EngineConfig(), {"SOLUSD": bars, "XRPUSD": bars}, reward_risk=1.5, timeout_minutes=720, runner=runner
     )
-    assert asked[0]["all"] is True and len(asked[0]["series"]["SOLUSD"]) == 30, "the hole is bridged"
-    assert [c.setup for c in found] == ["BREAKOUT"]
+    assert asked[0]["op"] == "hourly_trend_history" and set(asked[0]["series"]) == {"SOLUSDT", "XRPUSDT"}
+    assert asked[0]["config"] == {"target_reward_to_risk": 1.5, "max_hold_minutes": 720}
+    assert [(r["symbol"], r["setup"]) for r in found] == [("SOLUSD", "BREAKOUT")]
     assert (
         len(problems) == 2 and any("boom" in p for p in problems) and any("bad intent" in p for p in problems)
     )
 
 
-def test_real_engine_decides_on_the_newest_quarter_hour_with_the_pinned_rules():
-    config = EngineConfig()
+def real_engine() -> EngineConfig:
+    source = os.environ.get("KAIROS_TEST_ENGINE_SOURCE")
+    config = EngineConfig(source=Path(source)) if source else EngineConfig()
     try:
         config.check_hourly_trend()
     except EngineError:
-        pytest.skip("Strategy Engine checkout with kairos_strategy.hourly_trend is not present")
-    rows, price = [], 100.0
-    boundary = B0 + 12 * 1440 * MINUTE_MS + QUARTER_MS
-    for i in range(12 * 1440 + 15):  # twelve days of a slow climb with pullbacks
+        pytest.skip("Strategy Engine checkout with the strict hourly_trend adapter is not present")
+    return config
+
+
+def test_real_engine_gives_a_strict_intent_on_bars_with_contract_identities():
+    config = real_engine()
+    full = HOURLY_TREND_HISTORY_MS // MINUTE_MS
+    boundary = B0 + HOURLY_TREND_HISTORY_MS + QUARTER_MS
+    first = boundary - HOURLY_TREND_HISTORY_MS
+    bars, price = [], 100.0
+    for i in range(full):  # three weeks of a slow climb with pullbacks
         step = 0.012 if (i // 240) % 3 else -0.015
         nxt = price + step
-        rows.append(
-            [B0 + i * MINUTE_MS, price, max(price, nxt) + 0.01, min(price, nxt) - 0.01, nxt, 5.0, 5.0 * nxt]
+        values = [price, max(price, nxt) + 0.01, min(price, nxt) - 0.01, nxt, 5.0, 5.0 * nxt, 2.0, 2.0 * nxt]
+        bar = ClosedBarEventV1(
+            source="test",
+            symbol="TESTUSDT",
+            open_time_ms=first + i * MINUTE_MS,
+            close_time_ms=first + (i + 1) * MINUTE_MS - 1,
+            open=values[0],
+            high=values[1],
+            low=values[2],
+            close=values[3],
+            base_volume=values[4],
+            quote_volume=values[5],
+            taker_buy_base_volume=values[6],
+            taker_buy_quote_volume=values[7],
         )
+        bars.append([bar.open_time_ms, *values, bar.bar_sha256])
         price = nxt
-    window, added = system_engine.decision_window(rows, boundary)
-    assert added == 0 and window[-1][0] == boundary - MINUTE_MS
     found = asyncio.run(
         system_engine.hourly_trend_scan(
-            config, {"TESTUSD": window}, boundary, reward_risk=1.5, timeout_minutes=720
+            config, {"TESTUSD": bars}, boundary, reward_risk=1.5, timeout_minutes=720
         )
     )
     assert found.identity["strategy_code_sha256"] == system_engine.HOURLY_TREND_CODE_SHA256, (
@@ -380,7 +457,7 @@ def test_real_engine_decides_on_the_newest_quarter_hour_with_the_pinned_rules():
     )
     assert found.skipped == [] and list(found.features) == ["TESTUSD"]
     features = found.features["TESTUSD"]
-    assert features.trend in ("UP", "DOWN", "FLAT") and features.price == pytest.approx(rows[-1][4])
+    assert features.trend in ("UP", "DOWN", "FLAT") and features.price == pytest.approx(bars[-1][4])
     assert set(found.context["TESTUSD"]) == {
         "change_1h_pct",
         "change_7d_pct",
@@ -389,20 +466,29 @@ def test_real_engine_decides_on_the_newest_quarter_hour_with_the_pinned_rules():
         "consecutive_up_bars",
         "consecutive_down_bars",
     }
-    for c in found.candidates:
-        assert c.signal_time == boundary and c.setup in ("PULLBACK_RECLAIM", "BREAKOUT")
-
-    late = asyncio.run(
-        system_engine.hourly_trend_scan(
-            config, {"TESTUSD": window[:-1]}, boundary, reward_risk=1.5, timeout_minutes=720
-        )
-    )
-    assert late.features == {} and late.skipped == ["TESTUSD: no fresh closed bar"]
+    for strict in found.intents.values():
+        assert strict.symbol == "TESTUSDT" and strict.decision_ts_ms == boundary - 1
+        assert len(strict.provenance.input_bar_sha256s) == full
 
     history, problems = system_engine.hourly_trend_history(
-        config, {"TESTUSD": rows}, reward_risk=2.0, timeout_minutes=240
+        config, {"TESTUSD": bars}, reward_risk=2.0, timeout_minutes=240
     )
     assert problems == [] and history, "the synthetic climb must produce candidates"
-    for c in history:
-        assert c.timeout_minutes == 240
-        assert abs(c.take - c.ref_price) == pytest.approx(2.0 * abs(c.ref_price - c.stop))
+    for record in history:
+        assert record["symbol"] == "TESTUSD" and record["timeout_minutes"] == 240
+        assert abs(record["take"] - record["ref_price"]) == pytest.approx(
+            2.0 * abs(record["ref_price"] - record["stop"])
+        )
+    newest = [r for r in history if r["signal_time"] == boundary]
+    assert [(r["side"], r["ref_price"], r["stop"]) for r in newest] == [
+        (i.side.value, i.reference_price, i.exit_plan.stop_price) for i in found.intents.values()
+    ], "the strict intent is the research candidate of the same decision"
+
+    forged = [list(row) for row in bars]
+    forged[-3][4] += 0.01  # a close that no longer matches its recorded identity
+    refused = asyncio.run(
+        system_engine.hourly_trend_scan(
+            config, {"TESTUSD": forged}, boundary, reward_risk=1.5, timeout_minutes=720
+        )
+    )
+    assert refused.features == {} and "does not hash to its recorded identity" in refused.skipped[0]

@@ -28,7 +28,7 @@ from .aggregator_review import (
     review_candidates,
     revisions,
 )
-from .candidates import Candidate, Features
+from .binance_bars import BarsError, ClosedBarStore, FetchPage, QuantConfig, http_fetcher, quant_revision
 from .evedex import (
     Book,
     Evedex,
@@ -44,12 +44,12 @@ from .evedex import (
     plain,
     round_step,
 )
+from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
+from .signals import SIGNAL_VENUE, Features, Routed, signal_symbol
 from .system_engine import (
-    HOURLY_TREND_CACHE_DAYS,
+    HOURLY_TREND_HISTORY_MS,
     EngineConfig,
     EngineError,
-    MinuteStore,
-    decision_window,
     engine_revision,
     hourly_trend_scan,
 )
@@ -127,6 +127,9 @@ class Config:
     # only recorded, so the two can be compared in the report.
     review_mode: str = "probability"
     review_shadow: bool = True
+    # The review deadline the Router writes into every route, counted from the decision.
+    # RouterSettings allows at most 60 seconds.
+    review_timeout_s: float = 60.0
     # The Kairos Macro Strategist: one strategic allocation a day, and after a price crash.
     use_macro: bool = True
     macro_effort: str = "high"
@@ -162,6 +165,14 @@ class Config:
     def validate(self) -> None:
         if not self.symbols or any(not isinstance(s, str) or not s.isalnum() for s in self.symbols):
             raise ConfigError("symbols must be plain instrument names like SOLUSD")
+        try:
+            signals = [signal_symbol(s) for s in self.symbols]
+        except ValueError as exc:
+            raise ConfigError(f"symbols must be EVEDEX instruments quoted in USD: {exc}") from exc
+        if len(set(signals)) != len(signals):
+            raise ConfigError("symbols must not repeat")
+        if not 1 <= self.review_timeout_s * 1000 <= MAX_REVIEW_TIMEOUT_MS:
+            raise ConfigError("review_timeout_s must be within 0.001..60")
         if not 0 < Decimal(str(self.capital_basis_usd)) <= HARD_MAX_CAPITAL_USD:
             raise ConfigError(f"capital_basis_usd must be within (0, {HARD_MAX_CAPITAL_USD}]")
         if not 0 < Decimal(str(self.risk_per_trade_usd)) <= HARD_MAX_RISK_PER_TRADE_USD:
@@ -309,7 +320,7 @@ class PaperBroker:
 
     async def enter(
         self,
-        candidate: Candidate,
+        candidate: Routed,
         quantity: Decimal,
         book: Book,
         instrument: Instrument,
@@ -419,14 +430,14 @@ class LiveBroker:
 
     async def enter(
         self,
-        candidate: Candidate,
+        candidate: Routed,
         quantity: Decimal,
         book: Book,
         instrument: Instrument,
         stop: Decimal,
         take: Decimal,
     ) -> dict[str, Any] | None:
-        store, symbol = self._store, candidate.symbol
+        store, symbol = self._store, candidate.instrument
         side = "BUY" if candidate.side == "LONG" else "SELL"
         ref = book.ask if side == "BUY" else book.bid
         # The venue turns cash into quantity at the fill price. A 0.1% margin keeps a
@@ -454,7 +465,7 @@ class LiveBroker:
                 "side": candidate.side,
                 "stop": str(stop),
                 "take": str(take),
-                "candidate": candidate.as_dict(),
+                "candidate": candidate.record(),
             }
             store.save()
             store.journal(
@@ -743,22 +754,34 @@ class Trader:
         fee: Decimal,
         instruments: dict[str, Instrument],
         openai_key: str | None,
-        minutes: MinuteStore | None = None,
+        bars: ClosedBarStore | None = None,
+        fetch_bars: FetchPage | None = None,
     ) -> None:
         self.api, self.session, self.store, self.config = api, session, store, config
         self.broker, self.fee, self.instruments, self.openai_key = broker, fee, instruments, openai_key
         self._extras: dict[str, dict[str, Any]] = {}
         self._status_at: dict[str, int] = {}  # when each position was last reported on screen
-        # Signals come from the Strategy Engine; without it the runner only manages positions.
-        self.minutes = minutes or MinuteStore(store.directory / "minute-cache")
+        # The signal chain of the Kairos design: closed Binance bars checked by Quant Scouts,
+        # the Strategy Engine's rules, the Router's route. Without any of the three the
+        # runner only manages positions.
+        self.bars = bars or ClosedBarStore(store.directory / "closed-bars")
+        self._fetch_bars = fetch_bars or http_fetcher(session)
         self.engine: EngineConfig | None = EngineConfig()
-        self._engine_revision = "unknown"
+        self.quant, self.router = QuantConfig(), RouterConfig()
+        self._signal_revisions: dict[str, str] = {}
+        self._routing_text: dict[str, dict[str, Any]] = {}
         try:
             self.engine.check_hourly_trend()
-            self._engine_revision = engine_revision(self.engine.source)
-        except EngineError as exc:
+            self.quant.check()
+            self.router.check()
+            self._signal_revisions = {
+                "engine_revision": engine_revision(self.engine.source),
+                "quant_scouts_revision": quant_revision(self.quant),
+                "router_revision": router_revision(self.router),
+            }
+        except (EngineError, BarsError, RouterError) as exc:
             self.engine = None
-            say(f"Strategy Engine недоступен, новых сигналов не будет: {exc}")
+            say(f"Сигнальная цепочка Kairos недоступна, новых сигналов не будет: {exc}")
         self.aggregator: AggregatorConfig | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
@@ -900,11 +923,11 @@ class Trader:
             ],
         }
 
-    def _risk_item(self, candidate: Candidate, book: Book, stop: Any = None, take: Any = None) -> dict:
+    def _risk_item(self, candidate: Routed, book: Book, stop: Any = None, take: Any = None) -> dict:
         depth = book.ask_qty * book.ask if candidate.side == "LONG" else book.bid_qty * book.bid
         return {
             "id": candidate.id,
-            "symbol": candidate.symbol,
+            "symbol": candidate.instrument,
             "side": candidate.side,
             "strategy_id": candidate.setup,
             "stop": float(stop if stop is not None else candidate.stop),
@@ -952,12 +975,12 @@ class Trader:
         )
         return decisions
 
-    async def risk_shadow(self, candidates: list[Candidate], now_ms: int) -> None:
+    async def risk_shadow(self, candidates: list[Routed], now_ms: int) -> None:
         """Record what the Risk Manager says about every candidate. Never affects trading."""
         if self.risk_rules is None or not self.config.risk_shadow or not candidates:
             return
         try:
-            books = await asyncio.gather(*(self.api.book(c.symbol) for c in candidates))
+            books = await asyncio.gather(*(self.api.book(c.instrument) for c in candidates))
             await self._risk_decisions(
                 [self._risk_item(c, b) for c, b in zip(candidates, books, strict=False)], now_ms
             )
@@ -1117,62 +1140,56 @@ class Trader:
         scan_ms = int(self.config.scan_minutes) * 60_000
         return now_ms // scan_ms * scan_ms
 
-    async def warm_history(self) -> None:
-        """Bring the minute cache up to date before the loop starts.
+    async def _update_bars(self, now_ms: int) -> tuple[dict[str, list[Any]], dict[str, str]]:
+        """Closed Binance bars per EVEDEX instrument, and why an instrument has none."""
+        by_signal = {signal_symbol(instrument): instrument for instrument in self.config.symbols}
+        bars, problems = await self.bars.update(
+            self.quant,
+            list(by_signal),
+            now_ms,
+            HOURLY_TREND_HISTORY_MS + HOUR_MS,
+            fetch=self._fetch_bars,
+        )
+        return (
+            {by_signal[symbol]: rows for symbol, rows in bars.items()},
+            {by_signal[symbol]: reason for symbol, reason in problems.items()},
+        )
 
-        The very first start downloads three weeks of minute bars per instrument; later
-        starts fetch only what is missing. A failure here is not fatal: the next scan
-        tries again.
+    async def warm_history(self) -> None:
+        """Bring the closed-bar cache up to date before the loop starts.
+
+        The very first start downloads three weeks of Binance minute bars per instrument,
+        which takes a couple of minutes; later starts fetch only what is missing. A failure
+        here is not fatal: the next scan tries again.
         """
         if self.engine is None:
             return
-        now_ms = int(time.time() * 1000)
-        gate = asyncio.Semaphore(4)
+        _, problems = await self._update_bars(int(time.time() * 1000))
+        if problems:
+            say(
+                "Минутная история Binance загружена не полностью ("
+                + ", ".join(f"{symbol}: {reason[:60]}" for symbol, reason in problems.items())
+                + "); повторю на скане."
+            )
 
-        async def one(symbol: str) -> None:
-            async with gate:
-                await self.minutes.update(self.api, symbol, now_ms, HOURLY_TREND_CACHE_DAYS)
+    async def scan(self, now_ms: int) -> tuple[list[Features], list[Routed]]:
+        """Ask the Kairos signal chain about the hourly bar that has just closed.
 
-        results = await asyncio.gather(*(one(s) for s in self.config.symbols), return_exceptions=True)
-        failed = [
-            f"{symbol}: {type(result).__name__}"
-            for symbol, result in zip(self.config.symbols, results, strict=False)
-            if isinstance(result, BaseException)
-        ]
-        if failed:
-            say("Минутная история загружена не полностью (" + ", ".join(failed) + "); повторю на скане.")
-
-    async def scan(self, now_ms: int) -> tuple[list[Features], list[Candidate]]:
-        """Ask the Strategy Engine about the hourly bar that has just closed.
-
-        The rules are ``kairos_strategy.hourly_trend`` in the Strategy Engine repository.
-        They read one-hour bars rebuilt from closed one-minute bars so that the newest bar
+        Closed Binance USD-M one-minute bars, accepted by the Quant Scouts parser, go to
+        ``kairos_strategy.hourly_trend`` in the Strategy Engine, which answers with a
+        ``StrategyIntentV1`` per candidate. The Router's policy turns each intent into a
+        ``CandidateRouteV1``. The rules read one-hour bars rebuilt so that the newest one
         ends at this scan's boundary; with ``scan_minutes=15`` that is four decisions an
         hour (:00, :15, :30 and :45) on the same timeframe.
         """
         slot = self.scan_slot(now_ms)
         last_closed = slot - BAR_MS
+        self._routing_text = {}
         if self.engine is None:
-            self.store.journal("scan_error", bar=last_closed, message="Strategy Engine is not available")
+            self.store.journal("scan_error", bar=last_closed, message="the signal chain is not available")
             return [], []
-        gate = asyncio.Semaphore(4)
-
-        async def history(symbol: str) -> tuple[list[list[float]], int]:
-            async with gate:
-                rows = await self.minutes.update(self.api, symbol, now_ms, HOURLY_TREND_CACHE_DAYS)
-            return decision_window(rows, slot)
-
-        loaded = await asyncio.gather(*(history(s) for s in self.config.symbols), return_exceptions=True)
-        series: dict[str, list[list[float]]] = {}
-        skipped: list[str] = []
-        filled = 0
-        for symbol, result in zip(self.config.symbols, loaded, strict=False):
-            if isinstance(result, BaseException):
-                skipped.append(f"{symbol}: {type(result).__name__}")
-            elif not result[0]:
-                skipped.append(f"{symbol}: no minute history")
-            else:
-                series[symbol], filled = result[0], filled + result[1]
+        series, problems = await self._update_bars(now_ms)
+        skipped = [f"{symbol}: {reason}" for symbol, reason in problems.items()]
         found = None
         if series:
             try:
@@ -1193,25 +1210,44 @@ class Trader:
         except EvedexError:
             metrics = {}
         features = [found.features[s] for s in self.config.symbols if found and s in found.features]
-        candidates = list(found.candidates) if found else []
         self._extras = {
             f.symbol: {**(found.context[f.symbol] if found else {}), **metrics.get(f.symbol, {})}
             for f in features
         }
+        candidates: list[Routed] = []
+        rejected: list[dict[str, Any]] = []
+        router: dict[str, Any] = {}
+        if found and found.intents:
+            try:
+                routing = await route_intents(
+                    self.router,
+                    found.intents,
+                    signals=self.news.raw_signals() if self.news else [],
+                    now_ms=int(time.time() * 1000),
+                    review_timeout_ms=int(self.config.review_timeout_s * 1000),
+                )
+            except RouterError as exc:
+                say(f"Router не дал ответа, сигналы этого скана пропущены: {str(exc)[:200]}")
+                self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
+                return features, []
+            candidates, rejected, router = routing.routed, routing.rejected, routing.settings
+            self._routing_text = routing.text
         self.store.journal(
             "scan",
             bar=last_closed,
             source="strategy_engine",
-            engine={**(found.identity if found else {}), "engine_revision": self._engine_revision},
-            filled_minutes=filled,
+            signal_venue=SIGNAL_VENUE,
+            engine={**(found.identity if found else {}), **self._signal_revisions},
+            router=router,
             features=[{**f.as_dict(), **self._extras.get(f.symbol, {})} for f in features],
-            candidates=[c.as_dict() for c in candidates],
+            candidates=[c.record() for c in candidates],
+            rejected=rejected,
             skipped=skipped,
         )
         return features, candidates
 
     async def decide(
-        self, features: list[Features], candidates: list[Candidate], free_slots: int = 1
+        self, features: list[Features], candidates: list[Routed], free_slots: int = 1
     ) -> brain.Decision:
         control = brain.control_decision(candidates, free_slots)
         day = self._day()
@@ -1302,7 +1338,7 @@ class Trader:
     async def _aggregator_decision(
         self,
         features: list[Features],
-        candidates: list[Candidate],
+        candidates: list[Routed],
         payload: dict[str, Any],
         free_slots: int,
         now_ms: int,
@@ -1317,6 +1353,7 @@ class Trader:
                 api_key=self.openai_key,
                 model=self.config.llm_model,
                 candidates=candidates,
+                routing_text=self._routing_text,
                 signals=self.news.raw_signals() if self.news else [],
                 market={f.symbol: {**f.as_dict(), **self._extras.get(f.symbol, {})} for f in features},
                 portfolio=payload["portfolio"],
@@ -1363,24 +1400,28 @@ class Trader:
             usage={k: sum(r["usage"].get(k, 0) for r in reviews) for k in ("input_tokens", "output_tokens")},
         )
 
-    async def try_enter(self, candidate: Candidate, decision: brain.Decision) -> None:
+    async def try_enter(self, candidate: Routed, decision: brain.Decision) -> None:
         trades = self.trades()
-        instrument = self.instruments.get(candidate.symbol)
+        instrument = self.instruments.get(candidate.instrument)
         if instrument is None or not instrument.tradable:
             self.store.journal("entry_skipped", candidate=candidate.id, reason="instrument is not tradable")
             return
-        book = await self.api.book(candidate.symbol)
+        book = await self.api.book(candidate.instrument)
         now_ms = int(time.time() * 1000)
         ref = book.ask if candidate.side == "LONG" else book.bid
-        drift = abs(float(ref) - candidate.ref_price)
+        # The reference is the Binance close of the decision bar, so this also bounds the
+        # price difference between the two venues.
+        drift = abs(float(ref) - candidate.reference_price)
         spread_bps = float((book.ask - book.bid) / book.ask) * 1e4
         stop = round_step(dec(repr(candidate.stop)), instrument.price_step)
         take = round_step(dec(repr(candidate.take)), instrument.price_step)
         reason = None
-        if any(t["symbol"] == candidate.symbol for t in trades):
+        if any(t["symbol"] == candidate.instrument for t in trades):
             reason = "there is already a position in this instrument"
         elif len(trades) >= self.slot_limit():
             reason = "no free position slot"
+        elif now_ms > candidate.intent.entry_expires_ts_ms:
+            reason = "the candidate's entry window has expired"
         elif abs(now_ms - book.time_ms) > 30_000:
             reason = "order book is stale"
         elif spread_bps > self.config.max_spread_bps:
@@ -1427,7 +1468,7 @@ class Trader:
                     quantity, reason = None, "Risk Manager size is below the instrument's minimum lot"
         if quantity is None:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=reason)
-            say(f"Вход пропущен ({candidate.symbol} {candidate.side}): {reason}")
+            say(f"Вход пропущен ({candidate.instrument} {candidate.side}): {reason}")
             return
         foreign = await self.broker.foreign_exposure({t["symbol"] for t in trades})
         if foreign:
@@ -1438,8 +1479,10 @@ class Trader:
         if fill is None:
             return
         trade: dict[str, Any] = {
-            "id": fill["order_id"] if fill["order_id"] != "paper" else f"paper-{now_ms}-{candidate.symbol}",
-            "symbol": candidate.symbol,
+            "id": (
+                fill["order_id"] if fill["order_id"] != "paper" else f"paper-{now_ms}-{candidate.instrument}"
+            ),
+            "symbol": candidate.instrument,
             "side": candidate.side,
             "quantity": str(fill["quantity"]),
             "entry_price": str(fill["price"]),
@@ -1448,7 +1491,7 @@ class Trader:
             "opened_ms": now_ms,
             "deadline_ms": now_ms + candidate.timeout_minutes * 60_000,
             "equity_before": str(equity_before),
-            "candidate": candidate.as_dict(),
+            "candidate": candidate.record(),
             "decision": decision.as_dict(),
             # Alone for its whole life: the balance change is exactly this trade's result.
             "solo": not trades,
@@ -1616,11 +1659,13 @@ class Trader:
             self._macro_task = asyncio.create_task(self.macro_tick(features, now_ms))
         busy = {t["symbol"] for t in trades}
         cooldowns = self.store.state.get("cooldowns", {})
-        eligible = [c for c in candidates if c.symbol not in busy and now_ms >= cooldowns.get(c.symbol, 0)]
+        eligible = [
+            c for c in candidates if c.instrument not in busy and now_ms >= cooldowns.get(c.instrument, 0)
+        ]
         if not eligible:
             say(f"Скан: {len(features)} инструментов, новых сигналов нет. Открыто позиций: {len(trades)}.")
             return
-        say("Скан: сигналы — " + ", ".join(f"{c.symbol} {c.side} {c.setup}" for c in eligible))
+        say("Скан: сигналы — " + ", ".join(f"{c.instrument} {c.side} {c.setup}" for c in eligible))
         decision, _ = await asyncio.gather(
             self.decide(features, eligible, free), self.risk_shadow(eligible, now_ms)
         )

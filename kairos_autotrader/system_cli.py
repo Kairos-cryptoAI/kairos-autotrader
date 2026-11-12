@@ -1,7 +1,9 @@
 """Commands that run the real Kairos Strategy Engine next to the trader, without orders or keys.
 
-``engine-replay``  measures the engine's sleeves on EVEDEX minute history, with costs.
+``engine-replay``  measures the engine's sleeves and the live rules on history, with costs.
 ``shadow``         records the engine's new intents as they appear, for later evaluation.
+
+Signals are handled as the journal's signal records (``signals.outcome`` reads them).
 """
 
 from __future__ import annotations
@@ -18,9 +20,10 @@ from typing import Any
 
 import aiohttp
 
-from .candidates import Candidate, outcome
+from .binance_bars import ClosedBarStore, QuantConfig, http_fetcher
 from .engine import BAR_MS, Config, ConfigError, Store, say
 from .evedex import Evedex
+from .signals import outcome, signal_symbol
 from .system_engine import (
     DAY_MS,
     EXCLUDED_SLEEVES,
@@ -35,36 +38,36 @@ from .system_engine import (
 from .text_scouts import NewsDesk
 
 SHADOW_MODE = "engine-shadow"
-LIVE_RULES = "боевые правила (hourly_trend в движке), скан раз в час"
-LIVE_RULES_QUARTER = "боевые правила (hourly_trend в движке), скан каждые 15 минут"
+LIVE_RULES = "боевые правила (hourly_trend, сигнал по свечам Binance), скан раз в час"
+LIVE_RULES_QUARTER = "боевые правила (hourly_trend, сигнал по свечам Binance), скан каждые 15 минут"
 
 
 def _day(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, UTC).strftime("%d.%m")
 
 
-def evaluate(candidates: list[Candidate], candles: list, cost_fraction: float) -> list[dict[str, Any]]:
-    """Outcome of each candidate on the minute bars that followed it. Unfinished ones are left out."""
+def evaluate(records: list[dict[str, Any]], candles: list, cost_fraction: float) -> list[dict[str, Any]]:
+    """Outcome of each signal record on the minute bars that followed it. Unfinished ones are left out."""
     times = [c.t for c in candles]
     rows = []
-    for candidate in candidates:
-        start = bisect_left(times, candidate.signal_time)
-        later = candles[start : start + candidate.timeout_minutes + 2]
-        result = outcome(candidate, later, cost_fraction=cost_fraction)
+    for record in records:
+        start = bisect_left(times, record["signal_time"])
+        later = candles[start : start + record["timeout_minutes"] + 2]
+        result = outcome(record, later, cost_fraction=cost_fraction)
         if result["r"] is None:
             continue
-        risk = abs(candidate.ref_price - candidate.stop)
+        risk = abs(record["ref_price"] - record["stop"])
         rows.append(
             {
-                "id": candidate.id,
-                "setup": candidate.setup,
-                "symbol": candidate.symbol,
-                "side": candidate.side,
-                "signal_time": candidate.signal_time,
+                "id": record["id"],
+                "setup": record["strategy_id"],
+                "symbol": record["symbol"],
+                "side": record["side"],
+                "signal_time": record["signal_time"],
                 "reason": result["reason"],
                 "r": result["r"],
-                "cost_r": cost_fraction * candidate.ref_price / risk,
-                "stop_pct": 100 * risk / candidate.ref_price,
+                "cost_r": cost_fraction * record["ref_price"] / risk,
+                "stop_pct": 100 * risk / record["ref_price"],
             }
         )
     return rows
@@ -111,21 +114,37 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
     store = MinuteStore(args.runtime_dir / "minute-cache")
     say(
         f"Strategy Engine: {engine.source}, ревизия {revision[:12]}. "
-        f"История: {args.days} дней минутных свечей EVEDEX, "
+        f"История: {args.days} дней минутных свечей EVEDEX и Binance, "
         f"{len(symbols)} инструментов."
     )
+    quant = QuantConfig()
+    quant.check()
+    closed = ClosedBarStore(args.runtime_dir / "closed-bars")
     async with aiohttp.ClientSession(trust_env=True) as session:
         api = Evedex(session)
         fee = float(await api.taker_fee())
         cost_fraction = 2 * (fee + config.slippage_fraction)
         now_ms = int(time.time() * 1000)
         candidates, problems, bars = await collect(api, store, engine, symbols, now_ms)
+        signal_bars, bar_problems = await closed.update(
+            quant,
+            [signal_symbol(symbol) for symbol in symbols],
+            now_ms,
+            args.days * DAY_MS,
+            fetch=http_fetcher(session),
+        )
+    problems.extend(f"{symbol}: {reason}" for symbol, reason in bar_problems.items())
     for problem in problems:
         say(f"  замечание: {problem}")
-    # The rules that trade live, from the same engine and on the same minute history.
+    # The rules that trade live: the signal on Binance bars, as in the live scan, the
+    # outcome on the EVEDEX minute bars the order would have met.
     live, live_problems = hourly_trend_history(
         engine,
-        {symbol: rows for symbol, rows in bars.items() if rows},
+        {
+            symbol: signal_bars[signal_symbol(symbol)]
+            for symbol in symbols
+            if signal_symbol(symbol) in signal_bars
+        },
         reward_risk=config.reward_risk,
         timeout_minutes=config.timeout_minutes,
     )
@@ -139,10 +158,10 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
         candles = to_candles(bars.get(symbol, []))
         if not candles:
             continue
-        rows.extend(evaluate([c for c in candidates if c.symbol == symbol], candles, cost_fraction))
-        quarter = [c for c in live if c.symbol == symbol]
+        rows.extend(evaluate([c for c in candidates if c["symbol"] == symbol], candles, cost_fraction))
+        quarter = [c for c in live if c["symbol"] == symbol]
         own_quarter.extend(evaluate(quarter, candles, cost_fraction))
-        own.extend(evaluate([c for c in quarter if c.signal_time % BAR_MS == 0], candles, cost_fraction))
+        own.extend(evaluate([c for c in quarter if c["signal_time"] % BAR_MS == 0], candles, cost_fraction))
     say(
         f"Результат каждого сигнала по минутным свечам, с комиссиями и проскальзыванием "
         f"({cost_fraction * 100:.3f}% на круг). R = один риск на сделку."
@@ -220,9 +239,9 @@ async def cmd_shadow(args: argparse.Namespace) -> int:
                 say(f"Ошибка связи ({type(exc).__name__}); повтор в следующем цикле.")
                 candidates, problems = [], []
             seen = state["seen"]
-            fresh = [c for c in candidates if c.id not in seen]
+            fresh = [c for c in candidates if c["id"] not in seen]
             for candidate in fresh:
-                seen[candidate.id] = candidate.signal_time
+                seen[candidate["id"]] = candidate["signal_time"]
             for key in [
                 k for k, moment in seen.items() if moment < now_ms - (engine.window_days + 1) * DAY_MS
             ]:
@@ -235,12 +254,15 @@ async def cmd_shadow(args: argparse.Namespace) -> int:
                     source="strategy_engine",
                     engine_revision=revision,
                     features=[],
-                    candidates=[c.as_dict() for c in fresh],
+                    candidates=fresh,
                     skipped=problems,
                 )
             store.save()
             if fresh:
-                say("Новые сигналы движка: " + ", ".join(f"{c.symbol} {c.side} {c.setup}" for c in fresh))
+                say(
+                    "Новые сигналы движка: "
+                    + ", ".join(f"{c['symbol']} {c['side']} {c['setup']}" for c in fresh)
+                )
             elif cycles == 1 or cycles % 12 == 0:
                 say(
                     f"Новых сигналов нет. Всего записано: {len(seen)}."

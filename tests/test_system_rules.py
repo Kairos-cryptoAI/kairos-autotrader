@@ -1,4 +1,4 @@
-"""Offline tests of the bridge to the real Kairos Macro Strategist, Risk Manager and Router freshness rule.
+"""Offline tests of the bridge to the real Kairos Macro Strategist and Risk Manager.
 
 ``test_real_*`` start the real repository code (no network, no model); they are skipped
 where the checkouts or their environments are absent.
@@ -15,8 +15,7 @@ from decimal import Decimal
 import pytest
 from test_autotrader import FakeVenue, candidate, enter, events, live_trader, only
 
-from kairos_autotrader import aggregator_review, engine, system_rules
-from kairos_autotrader.aggregator_review import AggregatorConfig, AggregatorError, review_candidates
+from kairos_autotrader import engine, system_rules
 from kairos_autotrader.engine import Store
 from kairos_autotrader.evedex import Evedex
 from kairos_autotrader.system_rules import MacroDesk, RulesConfig, RulesError
@@ -414,121 +413,6 @@ def test_day_realized_result_is_kept_for_the_drawdown_rule(tmp_path):
     account_view = asyncio.run(trader._risk_account())
     assert account_view["daily_realized_pnl_usd"] == pytest.approx(-0.21)
     assert account_view["day_start_equity_usd"] == pytest.approx(109.21) and account_view["positions"] == []
-
-
-def test_router_freshness_rule_defers_an_old_candidate_without_asking_the_model():
-    old, fresh = candidate(), candidate(id="FRESH")
-
-    def runner(config, request):
-        if request["op"] == "prepare":
-            return {
-                "system": "SYS",
-                "review_timeout_ms": 20_000,
-                "prepared": [
-                    {
-                        "id": old.id,
-                        "side": "LONG",
-                        "tier": "NORMAL",
-                        "effort": "medium",
-                        "routing_ids": [],
-                        "text_score": 0.0,
-                        "user": "U-OLD",
-                        "expired": True,
-                        "age_s": 960.0,
-                    },
-                    {
-                        "id": "FRESH",
-                        "side": "LONG",
-                        "tier": "NORMAL",
-                        "effort": "medium",
-                        "routing_ids": [],
-                        "text_score": 0.0,
-                        "user": "U-FRESH",
-                        "expired": False,
-                        "age_s": 15.0,
-                    },
-                ],
-            }
-        assert request["reviews"][0]["model_output"] is None
-        return {
-            "reviews": [
-                {
-                    "id": old.id,
-                    "decision": "DEFER",
-                    "priority": 0,
-                    "reason_codes": ["LLM_FAILURE"],
-                    "reviewer": "DETERMINISTIC",
-                    "guard": False,
-                },
-                {
-                    "id": "FRESH",
-                    "decision": "ALLOW",
-                    "priority": 60,
-                    "reason_codes": ["OK"],
-                    "reviewer": "LLM",
-                    "guard": False,
-                },
-            ]
-        }
-
-    asked = []
-
-    async def extract(session, *, api_key, model, system, user, effort, timeout_s):
-        asked.append(user)
-        return {"decision": "ALLOW"}, {}, ""
-
-    reviews = asyncio.run(
-        review_candidates(
-            None,
-            AggregatorConfig(),
-            api_key="k",
-            model="m",
-            candidates=[old, fresh],
-            signals=[],
-            market={},
-            portfolio={},
-            context={},
-            now_ms=1,
-            macro={"regime": "BEAR"},
-            runner=runner,
-            extract=extract,
-        )
-    )
-    assert asked == ["U-FRESH"]
-    by_id = {r["id"]: r for r in reviews}
-    assert (by_id[old.id]["decision"], by_id[old.id]["reason_codes"], by_id[old.id]["reviewer"]) == (
-        "DEFER",
-        ["CANDIDATE_EXPIRED"],
-        "ROUTER",
-    )
-    assert by_id["FRESH"]["decision"] == "ALLOW" and by_id["FRESH"]["router_deadline_missed"] is False
-
-
-def test_real_router_time_to_live_and_macro_reach_the_review_context():
-    config = AggregatorConfig()
-    try:
-        config.check()
-    except AggregatorError:
-        pytest.skip("Aggregator / Router checkouts or environment are not present")
-    now_ms = int(time.time() * 1000)
-    fresh = {**candidate().as_dict(), "id": "FRESH", "signal_time": now_ms - 15_000}
-    old = {**candidate().as_dict(), "id": "OLD", "signal_time": now_ms - 16 * 60_000}
-    prepared = aggregator_review._run_worker(
-        config,
-        {
-            "op": "prepare",
-            "now_ms": now_ms,
-            "candidates": [fresh, old],
-            "signals": [],
-            "market": {},
-            "portfolio": {},
-            "context": {},
-            "macro": {"regime": "BEAR", "stable_reserve_pct": 0.6},
-        },
-    )
-    assert prepared["candidate_ttl_s"] == 120.0 and prepared["review_timeout_ms"] == 20_000
-    assert [(p["id"], p["expired"]) for p in prepared["prepared"]] == [("FRESH", False), ("OLD", True)]
-    assert json.loads(prepared["prepared"][0]["user"])["decision_context"]["macro"]["regime"] == "BEAR"
 
 
 def test_order_book_sizes_are_read_when_the_venue_sends_them():

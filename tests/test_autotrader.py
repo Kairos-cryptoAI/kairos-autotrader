@@ -10,8 +10,19 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from support import (
+    HOUR,
+    MINUTE,
+    QUARTER,
+    BarFeed,
+    fake_engine,
+    fake_parser,
+    fake_router,
+    routed,
+    strict_intent,
+)
 
-from kairos_autotrader import brain, candidates, system_engine
+from kairos_autotrader import brain, routing, signals, system_engine
 from kairos_autotrader.engine import (
     Config,
     ConfigError,
@@ -176,34 +187,41 @@ def test_software_exit_rules():
 # ---- candidates ----------------------------------------------------------------
 
 
-def candidate(**over) -> candidates.Candidate:
-    base = dict(
-        id="SOLUSD-LONG-PULLBACK_RECLAIM-1",
-        symbol="SOLUSD",
-        side="LONG",
-        setup="PULLBACK_RECLAIM",
-        bar_time=0,
-        signal_time=900_000,
-        ref_price=82.35,
-        stop=81.5,
-        take=83.625,
-        timeout_minutes=720,
-        atr=0.8,
-        score=0.4,
-        rationale="test",
-    )
-    base.update(over)
-    return candidates.Candidate(**base)
+def candidate(**over) -> signals.Routed:
+    """A routed SOLUSD long: a real ``CandidateRouteV1`` around a real ``StrategyIntentV1``."""
+    return routed(**over)
+
+
+def test_a_routed_candidate_reads_everything_from_the_contracts():
+    c = candidate(signal_time=900_000, score=0.41237)
+    intent = c.intent
+    assert (c.instrument, intent.symbol, intent.venue) == ("SOLUSD", "SOLUSDT", "BINANCE_UM")
+    assert c.id == intent.intent_id and len(c.id) == 64
+    assert (c.side, c.setup, c.signal_time) == ("LONG", "PULLBACK_RECLAIM", 900_000)
+    assert (c.reference_price, c.stop, c.take, c.timeout_minutes) == (82.35, 81.5, 83.625, 720)
+    assert c.atr == 0.8 and c.strength == 0.41237
+    record = c.record()
+    assert record["id"] == c.id and record["symbol"] == "SOLUSD" and record["score"] == 0.4124
+    assert (record["signal_symbol"], record["signal_venue"]) == ("SOLUSDT", "BINANCE_UM")
+    assert record["route_id"] == c.route.route_id and record["review_tier"] == "NORMAL"
+    assert record["review_deadline_ms"] == intent.decision_ts_ms + 60_000
+    assert record["input_bars"] == 1 and record["strategy_id"] == system_engine.HOURLY_TREND_ID
+    assert len(json.dumps(record)) < 1_500, "records stay small whatever the intent declares"
+
+    with pytest.raises(ValueError, match="not the signal symbol"):
+        signals.Routed("LINKUSD", c.route)
+    with pytest.raises(ValueError, match="no Binance signal symbol"):
+        signals.signal_symbol("SOLEUR")
 
 
 def test_outcome_counts_stop_first_and_charges_costs():
-    c = candidate()
+    c = candidate(signal_time=900_000).record()
     both = [Candle(900_000, 82.3, 83.7, 81.4, 82.0, 1.0)]
-    assert candidates.outcome(c, both, cost_fraction=0.0013)["reason"] == "STOP"
+    assert signals.outcome(c, both, cost_fraction=0.0013)["reason"] == "STOP"
     win = [Candle(900_000, 82.3, 83.7, 82.0, 83.6, 1.0)]
-    result = candidates.outcome(c, win, cost_fraction=0.0013)
+    result = signals.outcome(c, win, cost_fraction=0.0013)
     assert result["reason"] == "TAKE" and 1.3 < result["r"] < 1.5
-    assert candidates.outcome(c, [Candle(0, 82.3, 99, 1, 82.0, 1.0)], cost_fraction=0.0)["r"] is None
+    assert signals.outcome(c, [Candle(0, 82.3, 99, 1, 82.0, 1.0)], cost_fraction=0.0)["r"] is None
 
 
 # ---- brain --------------------------------------------------------------------
@@ -243,8 +261,8 @@ def test_inconsistent_reply_becomes_wait(bad):
 
 
 def test_several_allowed_candidates_become_ordered_picks_one_per_symbol():
-    sol, link = candidate(), candidate(id="LINK-1", symbol="LINKUSD")
-    sol_again = candidate(id="SOL-2")
+    sol, link = candidate(), candidate(symbol="LINKUSD")
+    sol_again = candidate(score=0.45)
     answer = reply(
         verdicts=[
             verdict(sol.id, confidence=0.6),
@@ -253,11 +271,12 @@ def test_several_allowed_candidates_become_ordered_picks_one_per_symbol():
         ]
     )
     both = brain.validate_reply(answer, [sol, link, sol_again], 0.55, max_picks=3)
-    assert both.picks == ["SOL-2", "LINK-1"] and both.candidate_id == "SOL-2" and both.confidence == 0.9
+    assert both.picks == [sol_again.id, link.id] and both.candidate_id == sol_again.id
+    assert both.confidence == 0.9
     one = brain.validate_reply(answer, [sol, link, sol_again], 0.55, max_picks=1)
-    assert one.picks == ["SOL-2"]
+    assert one.picks == [sol_again.id]
     picky = brain.validate_reply(answer, [sol, link, sol_again], 0.85, max_picks=3)
-    assert picky.picks == ["SOL-2"]
+    assert picky.picks == [sol_again.id]
 
 
 def test_non_object_reply_is_wait():
@@ -278,11 +297,11 @@ def test_output_text_extraction():
 
 
 def test_control_decision_takes_best_score():
-    a, b = candidate(id="A", score=0.3), candidate(id="B", score=0.6)
-    assert brain.control_decision([a, b]).candidate_id == "B"
+    a, b = candidate(score=0.3), candidate(score=0.6)
+    assert brain.control_decision([a, b]).candidate_id == b.id
     assert brain.control_decision([]).action == "WAIT"
-    c = candidate(id="C", symbol="LINKUSD", score=0.5)
-    assert brain.control_decision([a, b, c], 3).picks == ["B", "C"], "one pick per instrument"
+    c = candidate(symbol="LINKUSD", score=0.5)
+    assert brain.control_decision([a, b, c], 3).picks == [b.id, c.id], "one pick per instrument"
 
 
 # ---- engine against a fake venue ----------------------------------------------
@@ -441,9 +460,8 @@ def only(owner):
     return trades[0] if trades else None
 
 
-def link_candidate() -> candidates.Candidate:
+def link_candidate() -> signals.Routed:
     return candidate(
-        id="LINKUSD-LONG-PULLBACK_RECLAIM-1",
         symbol="LINKUSD",
         ref_price=10.30,
         stop=10.18,
@@ -590,7 +608,7 @@ def test_crash_between_order_and_bookkeeping_is_recovered(tmp_path):
         "side": "LONG",
         "stop": "81.5",
         "take": "83.62",
-        "candidate": candidate().as_dict(),
+        "candidate": candidate().record(),
     }
     trader.store.save()
     venue.position_list = [Position("SOLUSD", "BUY", Decimal("0.2"), Decimal("82.35"), False)]
@@ -633,6 +651,17 @@ def test_entry_skipped_when_price_ran_away(tmp_path):
     asyncio.run(trader.start())
     enter(trader)
     assert not venue.market_bodies and "entry_skipped" in events(trader)
+
+
+def test_entry_skipped_after_the_intent_entry_window(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    old = candidate(signal_time=now_ms() // QUARTER * QUARTER - 2 * QUARTER)
+    asyncio.run(trader.try_enter(old, brain.control_decision([old])))
+    skipped = journal_of(trader)[-1]
+    assert not venue.market_bodies and skipped["event"] == "entry_skipped"
+    assert skipped["reason"] == "the candidate's entry window has expired" and skipped["candidate"] == old.id
 
 
 def paper_trader(tmp_path, venue: FakeVenue, cfg: Config) -> Trader:
@@ -695,7 +724,7 @@ def test_one_scan_can_open_two_positions_but_never_two_in_one_instrument(tmp_pat
     two_books(venue)
     trader = paper_trader(tmp_path, venue, Config(use_llm=False, max_open_positions=2))
     asyncio.run(trader.start())
-    offered = [candidate(), candidate(id="SOL-2", score=0.9), link_candidate()]
+    offered = [candidate(), candidate(score=0.9), link_candidate()]
 
     async def scan(now):
         return [], offered
@@ -708,7 +737,7 @@ def test_one_scan_can_open_two_positions_but_never_two_in_one_instrument(tmp_pat
     for trade in trades:
         notional = Decimal(trade["quantity"]) * Decimal(trade["entry_price"])
         assert notional <= Decimal(50), "each position gets an equal share of the capital at most"
-    asyncio.run(trader.try_enter(candidate(id="SOL-3"), brain.control_decision(offered)))
+    asyncio.run(trader.try_enter(candidate(score=0.2), brain.control_decision(offered)))
     assert len(trader.store.state["open_trades"]) == 2 and "entry_skipped" in events(trader)
 
 
@@ -990,110 +1019,15 @@ def test_secrets_are_read_by_line_and_validated(tmp_path):
 # ---- scanning four times an hour ------------------------------------------------
 
 
-MINUTE, QUARTER, HOUR = 60_000, 15 * 60_000, 60 * 60_000
+HISTORY = system_engine.HOURLY_TREND_HISTORY_MS
+SLOT = 1_794_400_000_000 // HOUR * HOUR + QUARTER  # a boundary at :15
 
 
-class MinuteApi(FakeVenue):
-    """A venue that serves closed one-minute bars up to a chosen moment."""
-
-    def __init__(self, last_open_ms: int, drop: int | None = None) -> None:
-        super().__init__()
-        self.last_open_ms, self.drop, self.asked = last_open_ms, drop, []
-
-    async def candle_rows(self, symbol, group, start_ms, end_ms):
-        self.asked.append(group)
-        first = max(start_ms // MINUTE * MINUTE, self.last_open_ms - 3 * 1440 * MINUTE)
-        return [
-            [t, 80.0, 80.2, 79.8, 80.0 + (t // MINUTE % 7) * 0.01, 5.0, 400.0]
-            for t in range(first, min(end_ms, self.last_open_ms + MINUTE), MINUTE)
-            if t != self.drop
-        ]
-
-
-def engine_state(symbol: str, rows: list) -> dict | None:
-    """What the engine reports for the newest quarter hour that is complete in ``rows``."""
-    opens = {int(r[0]) for r in rows}
-    quarter = max(opens) // QUARTER * QUARTER
-    while quarter >= min(opens) and any(quarter + i * MINUTE not in opens for i in range(15)):
-        quarter -= QUARTER
-    if quarter < min(opens):
-        return None
-    return {
-        "symbol": symbol,
-        "decision_ts_ms": quarter + QUARTER - 1,
-        "price": 80.0,
-        "trend": "UP",
-        "trend_ema_fast": 79.0,
-        "trend_ema_slow": 78.0,
-        "trend_efficiency": 0.41237,
-        "rsi": 55.0,
-        "atr": 0.8,
-        "atr_pct": 1.0,
-        "change_1h_pct": 0.12345,
-        "change_4h_pct": 0.5,
-        "change_24h_pct": 2.0,
-        "change_7d_pct": 3.14159,
-        "dist_ema_atr": 0.3,
-        "position_in_7d_range": None,
-        "last_bar_volume_vs_20bar_avg": 1.2345,
-        "consecutive_up_bars": 2,
-        "consecutive_down_bars": 0,
-    }
-
-
-def engine_intent(state: dict, *, reward_risk: float, hold_minutes: int) -> dict:
-    return {
-        "intent_id": "f" * 64,
-        "sleeve_id": system_engine.HOURLY_TREND_ID,
-        "symbol": state["symbol"],
-        "side": "LONG",
-        "decision_ts_ms": state["decision_ts_ms"],
-        "entry_eligible_ts_ms": state["decision_ts_ms"] + 1,
-        "entry_expires_ts_ms": state["decision_ts_ms"] + QUARTER,
-        "reference_price": 80.0,
-        "signal_strength": state["trend_efficiency"],
-        "gross_reward_bps": 100.0,
-        "stop_price": 79.2,
-        "target_price": 80.0 + reward_risk * 0.8,
-        "max_holding_ms": hold_minutes * MINUTE,
-        "trailing_activation_price": None,
-        "trailing_distance": None,
-        "metadata": {"setup": "PULLBACK_RECLAIM", "atr": "0.80000000000000004", "trend": "UP"},
-    }
-
-
-def fake_engine(monkeypatch, *, code_sha256: str = system_engine.HOURLY_TREND_CODE_SHA256, signal=True):
-    """Replace the engine process with a function; returns the list of requests it received."""
-    requests: list[dict] = []
-
-    def runner(config, request):
-        requests.append(request)
-        results = {}
-        for symbol, rows in request["series"].items():
-            state = engine_state(symbol, rows)
-            intent = None
-            if state is not None and signal:
-                intent = engine_intent(
-                    state,
-                    reward_risk=request["config"]["target_reward_to_risk"],
-                    hold_minutes=request["config"]["max_hold_minutes"],
-                )
-            results[symbol] = {"state": state, "intent": intent}
-        identity = {
-            "strategy_id": system_engine.HOURLY_TREND_ID,
-            "revision": "1",
-            "strategy_code_sha256": code_sha256,
-            "config_sha256": "c" * 64,
-        }
-        return {"identity": identity, "results": results}
-
-    monkeypatch.setattr(system_engine, "_run_hourly_trend", runner)
-    return requests
-
-
-def scanning_trader(tmp_path, venue, **config) -> Trader:
-    trader = paper_trader(tmp_path, venue, Config(use_llm=False, symbols=["SOLUSD"], **config))
-    trader.engine = system_engine.EngineConfig()  # the engine process itself is replaced by fake_engine
+def scanning_trader(tmp_path, feed: BarFeed, **config) -> Trader:
+    """A paper trader whose three sibling processes are the stand-ins of ``support``."""
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False, symbols=["SOLUSD"], **config))
+    trader.engine = system_engine.EngineConfig()
+    trader._fetch_bars = feed.fetch
     return trader
 
 
@@ -1101,66 +1035,106 @@ def journal_of(trader) -> list[dict]:
     return [json.loads(line) for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()]
 
 
-def test_scan_asks_the_engine_about_the_hourly_bar_that_closed_at_the_last_quarter_hour(
-    tmp_path, monkeypatch
-):
-    slot = 1_794_400_000_000 // HOUR * HOUR + QUARTER  # a boundary at :15
-    requests = fake_engine(monkeypatch)
-    venue = MinuteApi(last_open_ms=slot + 2 * MINUTE)  # two minutes of the next quarter already exist
-    trader = scanning_trader(tmp_path, venue, reward_risk=2.0, timeout_minutes=240)
-    features, found = asyncio.run(trader.scan(slot + 130_000))
+def test_scan_runs_binance_bars_through_the_engine_and_the_router(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
+    engine_requests = fake_engine(monkeypatch)
+    router_requests = fake_router(monkeypatch)
+    feed = BarFeed(last_open_ms=SLOT + 2 * MINUTE)  # two minutes of the next quarter already exist
+    trader = scanning_trader(tmp_path, feed, reward_risk=2.0, timeout_minutes=240, review_timeout_s=45.0)
+    features, found = asyncio.run(trader.scan(SLOT + 130_000))
 
-    assert set(venue.asked) == {"1m"} and [f.symbol for f in features] == ["SOLUSD"]
-    request = requests[0]
-    assert request["op"] == "hourly_trend" and request["all"] is False
+    assert {symbol for symbol, _, _ in feed.asked} == {"SOLUSDT"}, "the signal symbol is the Binance one"
+    assert [f.symbol for f in features] == ["SOLUSD"], "features are labelled with the EVEDEX instrument"
+    request = engine_requests[0]
+    assert request["op"] == "hourly_trend_bars"
     assert request["config"] == {"target_reward_to_risk": 2.0, "max_hold_minutes": 240}
-    sent = request["series"]["SOLUSD"]
-    assert sent[-1][0] == slot - MINUTE, "minutes after the boundary are not part of the decision"
-    assert sent[0][0] >= slot - system_engine.HOURLY_TREND_HISTORY_MS
+    sent = request["series"]["SOLUSDT"]
+    assert sent[-1][0] == SLOT - MINUTE, "minutes after the boundary are not part of the decision"
+    assert sent[0][0] == SLOT - HISTORY and len(sent) == HISTORY // MINUTE, "exactly the rules' window"
+    assert len(sent[0]) == 10 and len(sent[0][9]) == 64, "every bar carries its recorded identity"
 
     (c,) = found
-    assert c.id == f"SOLUSD-LONG-PULLBACK_RECLAIM-{slot - HOUR}"
-    assert (c.bar_time, c.signal_time, c.setup) == (slot - HOUR, slot, "PULLBACK_RECLAIM")
-    assert (c.ref_price, c.stop, c.take, c.timeout_minutes) == (80.0, 79.2, 81.6, 240)
-    assert c.atr == pytest.approx(0.8) and c.score == 0.4124 and "uptrend" in c.rationale
+    assert (c.instrument, c.intent.symbol, c.intent.venue) == ("SOLUSD", "SOLUSDT", "BINANCE_UM")
+    assert c.intent.decision_ts_ms == SLOT - 1 and c.signal_time == SLOT
+    assert (c.setup, c.reference_price, c.stop, c.take, c.timeout_minutes) == (
+        "PULLBACK_RECLAIM",
+        80.0,
+        79.2,
+        81.6,
+        240,
+    )
+    assert c.atr == pytest.approx(0.8) and c.strength == 0.41237
+    assert c.intent.provenance.input_bar_sha256s == tuple(row[9] for row in sent)
+    assert c.route.review_tier.value == "NORMAL" and c.route.source == routing.ROUTE_SOURCE
+    assert c.route.review_deadline_ms == SLOT - 1 + 45_000, "the configured review timeout is in the route"
     assert features[0].trend_ema20 == 79.0 and features[0].dist_ema20_atr == 0.3
 
+    routed_request = router_requests[0]
+    assert routed_request["symbols"] == ["SOLUSDT"] and routed_request["review_timeout_ms"] == 45_000
+    assert routed_request["intents"][0]["intent_id"] == c.id and routed_request["signals"] == []
+
     scan = journal_of(trader)[-1]
-    assert scan["event"] == "scan" and scan["bar"] == slot - HOUR, "the bar under review runs from :15 to :15"
-    assert scan["source"] == "strategy_engine"
+    assert scan["event"] == "scan" and scan["bar"] == SLOT - HOUR, "the bar under review runs from :15 to :15"
+    assert (scan["source"], scan["signal_venue"]) == ("strategy_engine", "BINANCE_UM")
     assert scan["engine"]["strategy_code_sha256"] == system_engine.HOURLY_TREND_CODE_SHA256
     assert scan["features"][0]["change_1h_pct"] == 0.123 and scan["features"][0]["change_7d_pct"] == 3.14
     assert scan["features"][0]["position_in_7d_range"] is None
-    assert scan["candidates"][0]["id"] == c.id
-    assert (trader.store.directory / "minute-cache" / "SOLUSD.1m.json").exists()
+    (recorded,) = scan["candidates"]
+    assert recorded["id"] == c.id and recorded["route_id"] == c.route.route_id
+    assert recorded["input_bars"] == HISTORY // MINUTE and scan["rejected"] == [] and scan["skipped"] == []
+    assert (trader.store.directory / "closed-bars" / "SOLUSDT.1m.json").exists()
+
+    # The next scan downloads only the newest minutes and five cached ones again.
+    feed.asked.clear()
+    feed.last_open_ms = SLOT + QUARTER
+    asyncio.run(trader.scan(SLOT + QUARTER + 12_000))
+    assert feed.asked == [("SOLUSDT", SLOT - 3 * MINUTE, SLOT + QUARTER)]
 
 
-def test_scan_skips_an_instrument_without_a_fresh_bar_and_follows_the_scan_interval(tmp_path, monkeypatch):
-    slot = 1_794_400_000_000 // HOUR * HOUR + QUARTER
+def test_scan_skips_an_instrument_without_complete_fresh_bars(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
     fake_engine(monkeypatch)
-    stale = scanning_trader(tmp_path / "stale", MinuteApi(last_open_ms=slot - 2 * MINUTE))
-    assert asyncio.run(stale.scan(slot + 12_000)) == ([], []), "the last minute of the bar is not there yet"
-    assert journal_of(stale)[-1]["skipped"] == ["SOLUSD: no fresh closed bar"]
+    fake_router(monkeypatch)
+    late = scanning_trader(tmp_path / "late", BarFeed(last_open_ms=SLOT - 2 * MINUTE))
+    assert asyncio.run(late.scan(SLOT + 12_000)) == ([], []), "the last minute of the bar is not there yet"
+    assert "page is incomplete" in journal_of(late)[-1]["skipped"][0]
 
-    holed = scanning_trader(tmp_path / "hole", MinuteApi(last_open_ms=slot - MINUTE, drop=slot - 5 * MINUTE))
-    features, _ = asyncio.run(holed.scan(slot + 12_000))
-    assert [f.symbol for f in features] == ["SOLUSD"], "one missing minute inside a traded quarter is bridged"
-    assert journal_of(holed)[-1]["filled_minutes"] == 1
+    holed = scanning_trader(tmp_path / "hole", BarFeed(last_open_ms=SLOT - MINUTE, drop=SLOT - 5 * MINUTE))
+    assert asyncio.run(holed.scan(SLOT + 12_000)) == ([], []), "a gap is never bridged with invented bars"
+    assert journal_of(holed)[-1]["skipped"][0].startswith("SOLUSD: ")
 
-    hourly = scanning_trader(tmp_path / "hourly", MinuteApi(last_open_ms=slot + 5 * MINUTE), scan_minutes=60)
-    asyncio.run(hourly.scan(slot + 12_000))
-    assert journal_of(hourly)[-1]["bar"] == slot - QUARTER - HOUR, (
+    hourly = scanning_trader(tmp_path / "hourly", BarFeed(last_open_ms=SLOT + 5 * MINUTE), scan_minutes=60)
+    asyncio.run(hourly.scan(SLOT + 12_000))
+    assert journal_of(hourly)[-1]["bar"] == SLOT - QUARTER - HOUR, (
         "with hourly scans the bar closes on the hour"
     )
+
+
+def test_a_changed_closed_bar_drops_the_cache_and_trades_nothing(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
+    fake_engine(monkeypatch)
+    fake_router(monkeypatch)
+    feed = BarFeed(last_open_ms=SLOT - MINUTE)
+    trader = scanning_trader(tmp_path, feed)
+    assert len(asyncio.run(trader.scan(SLOT + 12_000))[1]) == 1
+    feed.last_open_ms = SLOT + QUARTER - MINUTE
+    feed.revised = {SLOT - 2 * MINUTE}  # the venue now reports another close for a cached minute
+    assert asyncio.run(trader.scan(SLOT + QUARTER + 12_000)) == ([], [])
+    assert "changed a closed bar" in journal_of(trader)[-1]["skipped"][0]
+    assert json.loads((trader.store.directory / "closed-bars" / "SOLUSDT.1m.json").read_text()) == []
+    features, found = asyncio.run(trader.scan(SLOT + QUARTER + 20_000))
+    assert len(features) == 1 and len(found) == 1, "the cache is rebuilt from the venue's current bars"
 
 
 def test_scan_trades_nothing_when_the_engine_is_missing_fails_or_is_not_the_pinned_source(
     tmp_path, monkeypatch
 ):
-    slot = 1_794_400_000_000 // HOUR * HOUR
+    fake_parser(monkeypatch)
+    fake_router(monkeypatch)
+    feed = BarFeed(last_open_ms=SLOT - MINUTE)
     fake_engine(monkeypatch, code_sha256="0" * 64)
-    other = scanning_trader(tmp_path / "other", MinuteApi(last_open_ms=slot - MINUTE))
-    assert asyncio.run(other.scan(slot + 12_000)) == ([], [])
+    other = scanning_trader(tmp_path / "other", feed)
+    assert asyncio.run(other.scan(SLOT + 12_000)) == ([], [])
     error = journal_of(other)[-1]
     assert error["event"] == "scan_error" and "differs from the pinned one" in error["message"]
 
@@ -1168,14 +1142,86 @@ def test_scan_trades_nothing_when_the_engine_is_missing_fails_or_is_not_the_pinn
         raise system_engine.EngineError("Strategy Engine: worker failed")
 
     monkeypatch.setattr(system_engine, "_run_hourly_trend", broken)
-    failing = scanning_trader(tmp_path / "failing", MinuteApi(last_open_ms=slot - MINUTE))
-    assert asyncio.run(failing.scan(slot + 12_000)) == ([], [])
+    failing = scanning_trader(tmp_path / "failing", feed)
+    assert asyncio.run(failing.scan(SLOT + 12_000)) == ([], [])
     assert journal_of(failing)[-1]["event"] == "scan_error"
 
-    absent = scanning_trader(tmp_path / "absent", MinuteApi(last_open_ms=slot - MINUTE))
+    absent = scanning_trader(tmp_path / "absent", feed)
     absent.engine = None
-    assert asyncio.run(absent.scan(slot + 12_000)) == ([], [])
-    assert journal_of(absent)[-1]["message"] == "Strategy Engine is not available"
+    assert asyncio.run(absent.scan(SLOT + 12_000)) == ([], [])
+    assert journal_of(absent)[-1]["message"] == "the signal chain is not available"
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lambda f: {**f, "bar_hashes": f["bar_hashes"][1:]}, "exactly the cached closed bars"),
+        (lambda f: {**f, "decision_ts_ms": f["decision_ts_ms"] - QUARTER}, "another decision"),
+        (lambda f: {**f, "symbol": "ETHUSDT"}, "another strategy or symbol"),
+        (lambda f: {**f, "strategy_id": "other_rules_v1"}, "another strategy or symbol"),
+        (lambda f: {**f, "config_sha256": "9" * 64}, "pinned engine identity"),
+    ],
+)
+def test_an_intent_that_does_not_match_the_cache_or_the_pin_is_not_a_candidate(
+    tmp_path, monkeypatch, change, reason
+):
+    fake_parser(monkeypatch)
+    fake_router(monkeypatch)
+    fake_engine(monkeypatch, tamper=change)
+    trader = scanning_trader(tmp_path, BarFeed(last_open_ms=SLOT - MINUTE))
+    assert asyncio.run(trader.scan(SLOT + 12_000)) == ([], [])
+    scan = journal_of(trader)[-1]
+    assert scan["candidates"] == [] and reason in scan["skipped"][0]
+
+
+def test_a_candidate_the_router_rejects_or_cannot_route_is_never_offered(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
+    fake_engine(monkeypatch)
+    feed = BarFeed(last_open_ms=SLOT - MINUTE)
+
+    fake_router(monkeypatch, reject="stale candidate")
+    stale = scanning_trader(tmp_path / "stale", feed)
+    features, found = asyncio.run(stale.scan(SLOT + 12_000))
+    assert len(features) == 1 and found == []
+    scan = journal_of(stale)[-1]
+    assert scan["candidates"] == [] and scan["rejected"][0]["reason"] == "stale candidate"
+    assert scan["rejected"][0]["symbol"] == "SOLUSD"
+
+    def other_intent(intent):
+        return strict_intent(
+            symbol="SOLUSDT", decision_ts_ms=intent.decision_ts_ms, side="SHORT", stop=83.0, take=81.0
+        )
+
+    fake_router(monkeypatch, swap=other_intent)
+    swapped = scanning_trader(tmp_path / "swapped", feed)
+    features, found = asyncio.run(swapped.scan(SLOT + 12_000))
+    assert len(features) == 1 and found == [], "a route around another intent is refused"
+    assert "another intent" in journal_of(swapped)[-1]["message"]
+
+    def down(config, request):
+        raise routing.RouterError("Router: worker failed")
+
+    monkeypatch.setattr(routing, "_run_worker", down)
+    silent = scanning_trader(tmp_path / "silent", feed)
+    assert asyncio.run(silent.scan(SLOT + 12_000))[1] == []
+    assert journal_of(silent)[-1]["event"] == "scan_error"
+
+
+def test_conflicting_text_evidence_reaches_the_route(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
+    fake_engine(monkeypatch)
+    requests = fake_router(monkeypatch, tier="CONFLICT")
+    trader = scanning_trader(tmp_path, BarFeed(last_open_ms=SLOT - MINUTE))
+
+    class Desk:
+        def raw_signals(self):
+            return [{"id": "news-1", "topic": "Probe", "event_time": "2026-11-12T00:00:00+00:00"}]
+
+    trader.news = Desk()
+    _, (c,) = asyncio.run(trader.scan(SLOT + 12_000))
+    assert requests[0]["signals"][0]["id"] == "news-1"
+    assert c.route.review_tier.value == "CONFLICT" and c.route.evidence_ids == ("news-1",)
+    assert c.record()["text_evidence_ids"] == ["news-1"]
 
 
 def test_one_scan_per_quarter_hour_slot(tmp_path):

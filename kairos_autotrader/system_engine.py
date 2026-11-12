@@ -1,15 +1,16 @@
 """Bridge to the real Kairos Strategy Engine (repository ``kairos-strategy-engine``).
 
-The engine's generators are run unchanged, in the engine's own Python environment, by
-``system_engine_worker.py``. This module feeds it closed 1m bars from EVEDEX, keeps a
-local cache of those bars and turns the engine's output into the feature and candidate
-types the rest of the runner understands.
+The engine's code is run unchanged, in the engine's own Python environment, by
+``system_engine_worker.py``.
 
 Two things come from the engine:
 
-- the live rules, ``kairos_strategy.hourly_trend`` (``hourly_trend_scan``), pinned by the
-  engine's own source identity of that package;
-- the registered research sleeves, for the shadow recorder and the replay (``collect``).
+- the live rules, ``kairos_strategy.hourly_trend``, through the engine's strict adapter:
+  closed Binance USD-M bars in, a ``StrategyIntentV1`` out (``hourly_trend_scan``). The
+  package is pinned by the engine's own source identity, and every intent is checked to
+  declare exactly the bars of the runner's cache;
+- the registered research sleeves on EVEDEX minute bars, for the shadow recorder and the
+  replay (``collect``). Their output stays the engine's research ``SleeveIntent``.
 
 Nothing here places orders or needs a key.
 """
@@ -23,9 +24,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .candidates import Candidate, Features
+from kairos_core.contracts import StrategyIntentV1
+from pydantic import ValidationError
+
 from .evedex import Candle, Evedex, EvedexError
 from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
+from .signals import Features, signal_symbol
 
 MINUTE_MS = 60_000
 QUARTER_MS = 15 * MINUTE_MS
@@ -55,19 +59,8 @@ EXCLUDED_SLEEVES = {
 # The live rules. The pin is the engine's own fingerprint of the package's source closure
 # (kairos_strategy/hourly_trend/provenance.py): a different engine source is refused, not traded.
 HOURLY_TREND_ID = "hourly_trend_candidates_v1"
-HOURLY_TREND_CODE_SHA256 = "5600f453953b2404b64e9a20445d9736240b02bee6fce6d0a7a6b161f52c8045"
+HOURLY_TREND_CODE_SHA256 = "466c95ae8a5418036fe2c30b117fbe37274c3dc9bae9c49ca94807d9095d5f80"
 HOURLY_TREND_HISTORY_MS = 504 * HOUR_MS  # how far back from a decision the rules read
-HOURLY_TREND_CACHE_DAYS = 22
-_RATIONALE = {
-    ("LONG", "PULLBACK_RECLAIM"): (
-        "higher-timeframe uptrend; price dipped to the EMA20 and closed back above it"
-    ),
-    ("LONG", "BREAKOUT"): "higher-timeframe uptrend; close above the 20-bar high",
-    ("SHORT", "PULLBACK_RECLAIM"): (
-        "higher-timeframe downtrend; price rallied to the EMA20 and closed back below it"
-    ),
-    ("SHORT", "BREAKOUT"): "higher-timeframe downtrend; close below the 20-bar low",
-}
 
 
 class EngineError(RuntimeError):
@@ -94,9 +87,9 @@ class EngineConfig:
     def check_hourly_trend(self) -> None:
         if not self.python.exists():
             raise EngineError(f"Strategy Engine Python not found: {self.python}")
-        if not (self.source / "kairos_strategy" / "hourly_trend" / "rules.py").exists():
+        if not (self.source / "kairos_strategy" / "hourly_trend" / "adapter.py").exists():
             raise EngineError(
-                f"Strategy Engine checkout {self.source} has no kairos_strategy.hourly_trend package"
+                f"Strategy Engine checkout {self.source} has no strict kairos_strategy.hourly_trend adapter"
             )
 
 
@@ -174,12 +167,12 @@ async def run_engine(
     return await asyncio.to_thread(runner, config, request)
 
 
-def intent_to_candidate(intent: dict[str, Any], *, revision: str, status: str) -> Candidate:
-    """An engine intent as an autotrader candidate. Side, stop, target and hold time are kept as is.
+def sleeve_record(intent: dict[str, Any], *, instrument: str | None = None, note: str = "") -> dict[str, Any]:
+    """A research ``SleeveIntent`` of the engine as a signal record for reports and the replay.
 
-    The engine closes its bars at an inclusive last millisecond, so the signal time is one
-    millisecond later. A trailing stop in the intent is not carried: the autotrader has
-    fixed exits only, and that difference is written into the rationale.
+    Side, prices and hold time are kept as they are. The engine closes its bars at an
+    inclusive last millisecond, so the signal time is one millisecond later. A trailing
+    stop is not applied by the replay; that difference is written into the record.
     """
     side = str(intent["side"]).upper()
     if side not in ("LONG", "SHORT"):
@@ -189,50 +182,51 @@ def intent_to_candidate(intent: dict[str, Any], *, revision: str, status: str) -
         float(intent["stop_price"]),
         float(intent["target_price"]),
     )
-    ordered = stop < ref < take if side == "LONG" else take < ref < stop
-    if not ordered:
+    if not (stop < ref < take if side == "LONG" else take < ref < stop):
         raise EngineError("intent prices are not ordered stop / reference / target")
     decision = int(intent["decision_ts_ms"])
     sleeve = str(intent["sleeve_id"])
-    note = "; engine trailing stop not applied" if intent.get("trailing_distance") else ""
-    return Candidate(
-        id=f"{intent['symbol']}-{side}-{sleeve}-{decision}",
-        symbol=str(intent["symbol"]),
-        side=side,
-        setup=sleeve,
-        bar_time=decision + 1 - MINUTE_MS,
-        signal_time=decision + 1,
-        ref_price=ref,
-        stop=stop,
-        take=take,
-        timeout_minutes=max(1, int(intent["max_holding_ms"]) // MINUTE_MS),
-        atr=abs(ref - stop),  # the stop distance stands in for ATR in the entry drift check
-        score=round(float(intent["signal_strength"]), 4),
-        rationale=f"Kairos Strategy Engine {sleeve} rev {revision}, engine status {status}{note}",
-    )
+    metadata = intent.get("metadata") or {}
+    setup = str(metadata.get("setup") or sleeve)
+    symbol = instrument or str(intent["symbol"])
+    if intent.get("trailing_distance"):
+        note = (note + "; " if note else "") + "engine trailing stop not applied"
+    return {
+        "id": f"{symbol}-{side}-{setup}-{decision}",
+        "symbol": symbol,
+        "side": side,
+        "setup": setup,
+        "signal_time": decision + 1,
+        "ref_price": ref,
+        "stop": stop,
+        "take": take,
+        "timeout_minutes": max(1, int(intent["max_holding_ms"]) // MINUTE_MS),
+        # Without an ATR in the metadata the stop distance stands in for it.
+        "atr": float(metadata["atr"]) if "atr" in metadata else abs(ref - stop),
+        "score": round(float(intent["signal_strength"]), 4),
+        "strategy_id": sleeve,
+        "note": note,
+    }
 
 
-def candidates_from(results: dict[str, Any], *, since_ms: int = 0) -> tuple[list[Candidate], list[str]]:
-    """Candidates decided after ``since_ms`` and a list of sleeve problems, if any."""
-    candidates: list[Candidate] = []
+def records_from(results: dict[str, Any], *, since_ms: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
+    """Signal records decided after ``since_ms`` and a list of sleeve problems, if any."""
+    records: list[dict[str, Any]] = []
     problems: list[str] = []
     for sleeve, result in results.items():
         if "error" in result:
             problems.append(f"{sleeve}: {result['error'][:200]}")
             continue
+        note = f"Kairos Strategy Engine rev {result.get('revision')}, engine status {result.get('status')}"
         for intent in result.get("intents", []):
             if int(intent["decision_ts_ms"]) < since_ms:
                 continue
             try:
-                candidates.append(
-                    intent_to_candidate(
-                        intent, revision=str(result.get("revision")), status=str(result.get("status"))
-                    )
-                )
+                records.append(sleeve_record(intent, note=note))
             except (EngineError, KeyError, TypeError, ValueError) as exc:
                 problems.append(f"{sleeve}: bad intent ({exc})")
-    candidates.sort(key=lambda c: (c.signal_time, c.id))
-    return candidates, problems
+    records.sort(key=lambda r: (r["signal_time"], r["id"]))
+    return records, problems
 
 
 async def collect(
@@ -244,8 +238,11 @@ async def collect(
     *,
     since_ms: int = 0,
     runner=_run_worker,
-) -> tuple[list[Candidate], list[str], dict[str, list]]:
-    """Update bars and run the engine for every instrument. Returns candidates, problems and the bars."""
+) -> tuple[list[dict[str, Any]], list[str], dict[str, list]]:
+    """Update EVEDEX bars and run the registered sleeves for every instrument.
+
+    Returns signal records, problems and the bars.
+    """
     gate = asyncio.Semaphore(3)
     bars: dict[str, list] = {}
 
@@ -256,14 +253,14 @@ async def collect(
         if len(rows) < 2:
             return [], [f"{symbol}: no minute history"]
         results = await run_engine(config, symbol, rows, runner)
-        found, problems = candidates_from(results, since_ms=since_ms)
+        found, problems = records_from(results, since_ms=since_ms)
         missing = gaps(rows)
         if missing:
             problems.append(f"{symbol}: {missing} gaps in minute history")
         return found, [f"{symbol} {p}" if not p.startswith(symbol) else p for p in problems]
 
     outcomes = await asyncio.gather(*(one(s) for s in symbols), return_exceptions=True)
-    candidates: list[Candidate] = []
+    records: list[dict[str, Any]] = []
     problems: list[str] = []
     for symbol, outcome in zip(symbols, outcomes, strict=False):
         if isinstance(outcome, (EvedexError, EngineError, OSError)):
@@ -271,46 +268,13 @@ async def collect(
         elif isinstance(outcome, BaseException):
             raise outcome
         else:
-            candidates.extend(outcome[0])
+            records.extend(outcome[0])
             problems.extend(outcome[1])
-    candidates.sort(key=lambda c: (c.signal_time, c.id))
-    return candidates, problems, bars
+    records.sort(key=lambda r: (r["signal_time"], r["id"]))
+    return records, problems, bars
 
 
 # ---- the live rules: kairos_strategy.hourly_trend -----------------------------------
-
-
-def fill_quiet_minutes(rows: list[list[float]]) -> tuple[list[list[float]], int]:
-    """Give the engine the complete minute series its bar builder requires.
-
-    EVEDEX history has no row for a minute without trades, while a minute polled live comes
-    back as a zero-volume row with transient prices. Both are treated the same way, so the
-    series does not depend on how it was collected: a minute without trades inside a
-    quarter hour that traded becomes a flat zero-volume bar at the previous close, the way
-    Binance publishes it. A quarter hour without a single trade stays missing (the venue
-    has no 15-minute candle for it either), and the rules skip the decisions it touches.
-    """
-    rows = [row for row in rows if row[5] > 0]
-    present = {int(row[0]) // QUARTER_MS for row in rows}
-    out: list[list[float]] = []
-    added = 0
-    for row in rows:
-        if out:
-            minute = int(out[-1][0]) + MINUTE_MS
-            while minute < int(row[0]):
-                if minute // QUARTER_MS in present:
-                    close = out[-1][4]
-                    out.append([minute, close, close, close, close, 0.0, 0.0])
-                    added += 1
-                minute += MINUTE_MS
-        out.append(row)
-    return out, added
-
-
-def decision_window(rows: list[list[float]], boundary_ms: int) -> tuple[list[list[float]], int]:
-    """The closed minutes the rules read for the decision at ``boundary_ms``, gaps filled."""
-    first = boundary_ms - HOURLY_TREND_HISTORY_MS
-    return fill_quiet_minutes([row for row in rows if first <= row[0] < boundary_ms])
 
 
 def _run_hourly_trend(config: EngineConfig, request: dict[str, Any]) -> dict[str, Any]:
@@ -320,19 +284,13 @@ def _run_hourly_trend(config: EngineConfig, request: dict[str, Any]) -> dict[str
         raise EngineError(f"Strategy Engine: {exc}") from exc
 
 
-def hourly_trend_request(
-    series: dict[str, list[list[float]]], *, reward_risk: float, timeout_minutes: int, every: bool = False
-) -> dict[str, Any]:
-    return {
-        "op": "hourly_trend",
-        "series": series,
-        "all": every,
-        "config": {"target_reward_to_risk": float(reward_risk), "max_hold_minutes": int(timeout_minutes)},
-    }
+def hourly_trend_config(*, reward_risk: float, timeout_minutes: int) -> dict[str, Any]:
+    """The two controls the runner sets; the engine validates and fingerprints them."""
+    return {"target_reward_to_risk": float(reward_risk), "max_hold_minutes": int(timeout_minutes)}
 
 
 def checked_hourly_answer(answer: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
-    """Identity and per-instrument results, refused unless the engine source is the pinned one."""
+    """Identity and per-symbol results, refused unless the engine source is the pinned one."""
     identity, results = answer.get("identity"), answer.get("results")
     if not isinstance(identity, dict) or not isinstance(results, dict):
         raise EngineError("Strategy Engine worker returned malformed output")
@@ -346,14 +304,14 @@ def checked_hourly_answer(answer: dict[str, Any]) -> tuple[dict[str, str], dict[
     return {key: str(value) for key, value in identity.items()}, results
 
 
-def state_to_features(state: dict[str, Any]) -> tuple[Features, dict[str, Any]]:
-    """The engine's state as the runner's features, plus the descriptive context for the reviewer."""
+def state_to_features(state: dict[str, Any], instrument: str) -> tuple[Features, dict[str, Any]]:
+    """The engine's state as the reviewer's features, plus its descriptive context."""
 
     def rounded(name: str, digits: int) -> float | None:
         return None if state[name] is None else round(float(state[name]), digits)
 
     features = Features(
-        symbol=str(state["symbol"]),
+        symbol=instrument,
         price=float(state["price"]),
         trend=str(state["trend"]),
         trend_ema20=float(state["trend_ema_fast"]),
@@ -377,125 +335,156 @@ def state_to_features(state: dict[str, Any]) -> tuple[Features, dict[str, Any]]:
     return features, context
 
 
-def hourly_intent_to_candidate(intent: dict[str, Any]) -> Candidate:
-    """An intent of the live rules as a runner candidate; prices and hold time are kept as is.
-
-    The candidate keeps the setup name (``PULLBACK_RECLAIM`` or ``BREAKOUT``) that Macro,
-    Risk and the reports know. The engine's inclusive close becomes the next millisecond.
-    """
-    side, setup = str(intent["side"]).upper(), str(intent["metadata"]["setup"])
-    if (side, setup) not in _RATIONALE:
-        raise EngineError(f"unexpected intent {side} {setup}")
-    ref, stop, take = (
-        float(intent["reference_price"]),
-        float(intent["stop_price"]),
-        float(intent["target_price"]),
-    )
-    if not (stop < ref < take if side == "LONG" else take < ref < stop):
-        raise EngineError("intent prices are not ordered stop / reference / target")
-    boundary = int(intent["decision_ts_ms"]) + 1
-    bar_time = boundary - HOUR_MS
-    return Candidate(
-        id=f"{intent['symbol']}-{side}-{setup}-{bar_time}",
-        symbol=str(intent["symbol"]),
-        side=side,
-        setup=setup,
-        bar_time=bar_time,
-        signal_time=boundary,
-        ref_price=ref,
-        stop=stop,
-        take=take,
-        timeout_minutes=max(1, int(intent["max_holding_ms"]) // MINUTE_MS),
-        atr=float(intent["metadata"]["atr"]),
-        score=round(float(intent["signal_strength"]), 4),
-        rationale=_RATIONALE[(side, setup)],
-    )
+def checked_intent(
+    raw: Any, *, symbol: str, boundary_ms: int, window: list[list[Any]], identity: dict[str, str]
+) -> StrategyIntentV1:
+    """The engine's strict intent, validated by the contract and tied to the cached bars."""
+    intent = StrategyIntentV1.model_validate(raw)
+    if intent.strategy_id != HOURLY_TREND_ID or intent.symbol != symbol:
+        raise EngineError("intent belongs to another strategy or symbol")
+    if intent.decision_ts_ms != boundary_ms - 1:
+        raise EngineError("intent belongs to another decision")
+    provenance = intent.provenance
+    if (
+        provenance.strategy_code_sha256 != HOURLY_TREND_CODE_SHA256
+        or provenance.config_sha256 != identity.get("config_sha256")
+    ):
+        raise EngineError("intent provenance differs from the pinned engine identity")
+    if provenance.input_bar_sha256s != tuple(row[9] for row in window):
+        raise EngineError("intent does not declare exactly the cached closed bars")
+    return intent
 
 
 @dataclass(frozen=True, slots=True)
 class TrendScan:
-    """What the live rules said at one decision, for every instrument that had fresh bars."""
+    """What the live rules said at one decision, per EVEDEX instrument that had fresh bars."""
 
     identity: dict[str, str]
     features: dict[str, Features]
     context: dict[str, dict[str, Any]]
-    candidates: list[Candidate]
+    intents: dict[str, StrategyIntentV1]
     skipped: list[str]
 
 
 async def hourly_trend_scan(
     config: EngineConfig,
-    series: dict[str, list[list[float]]],
+    series: dict[str, list[list[Any]]],
     boundary_ms: int,
     *,
     reward_risk: float,
     timeout_minutes: int,
     runner=None,
+    processes: int = 4,
 ) -> TrendScan:
-    """Run the live rules for the decision at ``boundary_ms``.
+    """Run the live rules for the decision at ``boundary_ms`` on closed Binance bars.
 
-    An instrument whose newest closed quarter hour is not the one ending at the boundary is
-    skipped: its history is late or has a hole next to the decision.
+    ``series`` maps an EVEDEX instrument to the cached bars of its Binance signal symbol.
+    An instrument whose newest closed bar does not end at the boundary is skipped: its
+    history is late. Building some 30 000 strict bars per symbol takes about a second,
+    so the symbols are spread over a few engine processes.
     """
-    request = hourly_trend_request(series, reward_risk=reward_risk, timeout_minutes=timeout_minutes)
-    answer = await asyncio.to_thread(runner or _run_hourly_trend, config, request)
-    identity, results = checked_hourly_answer(answer)
+    first_ms = boundary_ms - HOURLY_TREND_HISTORY_MS
+    windows: dict[str, list[list[Any]]] = {}
+    skipped: list[str] = []
+    for instrument, bars in series.items():
+        window = [row for row in bars if first_ms <= row[0] < boundary_ms]
+        if not window or int(window[-1][0]) != boundary_ms - MINUTE_MS:
+            skipped.append(f"{instrument}: no fresh closed bar")
+        elif int(window[0][0]) != first_ms:
+            # A shorter window would still be declared exactly, but it is not the rules' window.
+            skipped.append(f"{instrument}: closed bars do not reach back the whole history window")
+        else:
+            windows[instrument] = window
+    run = runner or _run_hourly_trend
+    names = list(windows)
+    groups = [names[index::processes] for index in range(max(1, min(processes, len(names))))]
+    tuning = hourly_trend_config(reward_risk=reward_risk, timeout_minutes=timeout_minutes)
+
+    def request(group: list[str]) -> dict[str, Any]:
+        return {
+            "op": "hourly_trend_bars",
+            "series": {signal_symbol(instrument): windows[instrument] for instrument in group},
+            "config": tuning,
+        }
+
+    answers = await asyncio.gather(*(asyncio.to_thread(run, config, request(group)) for group in groups))
+    identity: dict[str, str] = {}
+    results: dict[str, Any] = {}
+    for answer in answers:
+        found_identity, found = checked_hourly_answer(answer)
+        if identity and found_identity != identity:
+            raise EngineError("engine processes reported different identities")
+        identity = found_identity
+        results.update(found)
     features: dict[str, Features] = {}
     context: dict[str, dict[str, Any]] = {}
-    candidates: list[Candidate] = []
-    skipped: list[str] = []
-    for symbol in series:
+    intents: dict[str, StrategyIntentV1] = {}
+    for instrument in names:
+        symbol = signal_symbol(instrument)
         result = results.get(symbol)
         if not isinstance(result, dict) or "error" in result:
             reason = str(result.get("error"))[:200] if isinstance(result, dict) else "no answer"
-            skipped.append(f"{symbol}: {reason}")
+            skipped.append(f"{instrument}: {reason}")
             continue
         state = result.get("state")
-        if not isinstance(state, dict) or state.get("decision_ts_ms") != boundary_ms - 1:
-            skipped.append(f"{symbol}: no fresh closed bar")
+        if result.get("decision_ts_ms") != boundary_ms - 1:
+            skipped.append(f"{instrument}: the engine decided on another clock")
+            continue
+        if not isinstance(state, dict):
+            skipped.append(f"{instrument}: history is too short for the rules")
             continue
         try:
-            found_features, found_context = state_to_features(state)
-            intent = result.get("intent")
-            candidate = None
-            if intent is not None:
-                if int(intent["decision_ts_ms"]) != boundary_ms - 1:
-                    raise EngineError("intent belongs to another decision")
-                candidate = hourly_intent_to_candidate(intent)
-        except (EngineError, KeyError, TypeError, ValueError) as exc:
-            skipped.append(f"{symbol}: bad engine output ({type(exc).__name__}: {str(exc)[:120]})")
+            found_features, found_context = state_to_features(state, instrument)
+            intent = None
+            if result.get("intent") is not None:
+                intent = checked_intent(
+                    result["intent"],
+                    symbol=symbol,
+                    boundary_ms=boundary_ms,
+                    window=windows[instrument],
+                    identity=identity,
+                )
+        except (EngineError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            skipped.append(f"{instrument}: bad engine output ({type(exc).__name__}: {str(exc)[:120]})")
             continue
-        features[symbol], context[symbol] = found_features, found_context
-        if candidate is not None:
-            candidates.append(candidate)
-    return TrendScan(identity, features, context, candidates, skipped)
+        features[instrument], context[instrument] = found_features, found_context
+        if intent is not None:
+            intents[instrument] = intent
+    return TrendScan(identity, features, context, intents, skipped)
 
 
 def hourly_trend_history(
     config: EngineConfig,
-    series: dict[str, list[list[float]]],
+    series: dict[str, list[list[Any]]],
     *,
     reward_risk: float,
     timeout_minutes: int,
     runner=None,
-) -> tuple[list[Candidate], list[str]]:
-    """Every candidate the live rules produce over a whole minute history, for the replay."""
-    filled = {symbol: fill_quiet_minutes(rows)[0] for symbol, rows in series.items()}
-    request = hourly_trend_request(
-        filled, reward_risk=reward_risk, timeout_minutes=timeout_minutes, every=True
-    )
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Every candidate the live rules produce over a whole bar history, for the replay.
+
+    ``series`` maps an EVEDEX instrument to the bars of its Binance signal symbol. The
+    replay reads the engine's research ``SleeveIntent``: a strict intent per candidate
+    would hash the whole window thousands of times and add nothing to a report.
+    """
+    request = {
+        "op": "hourly_trend_history",
+        "series": {signal_symbol(instrument): bars for instrument, bars in series.items()},
+        "config": hourly_trend_config(reward_risk=reward_risk, timeout_minutes=timeout_minutes),
+    }
     _, results = checked_hourly_answer((runner or _run_hourly_trend)(config, request))
-    candidates: list[Candidate] = []
+    records: list[dict[str, Any]] = []
     problems: list[str] = []
-    for symbol in series:
-        result = results.get(symbol)
+    for instrument in series:
+        result = results.get(signal_symbol(instrument))
         if not isinstance(result, dict) or "error" in result:
-            problems.append(f"{symbol}: {result.get('error') if isinstance(result, dict) else 'no answer'}")
+            reason = result.get("error") if isinstance(result, dict) else "no answer"
+            problems.append(f"{instrument}: {reason}")
             continue
         for intent in result.get("intents", []):
             try:
-                candidates.append(hourly_intent_to_candidate(intent))
+                records.append(sleeve_record(intent, instrument=instrument))
             except (EngineError, KeyError, TypeError, ValueError) as exc:
-                problems.append(f"{symbol}: bad intent ({exc})")
-    candidates.sort(key=lambda c: (c.signal_time, c.id))
-    return candidates, problems
+                problems.append(f"{instrument}: bad intent ({exc})")
+    records.sort(key=lambda r: (r["signal_time"], r["id"]))
+    return records, problems

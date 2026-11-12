@@ -5,4 +5,4 @@ together with typed news evidence, and the engine sizes, enters, protects and ex
 position at a time inside hard limits. There is no withdraw or transfer code.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

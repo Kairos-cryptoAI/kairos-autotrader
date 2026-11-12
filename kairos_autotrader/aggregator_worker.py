@@ -1,22 +1,20 @@
-"""Runs the real Kairos Router classification and Aggregator candidate-review rules.
+"""Runs the Kairos Aggregator's candidate-review rules for already routed candidates.
 
 Executed as a script by the Aggregator repository's own Python environment. It uses the
-repositories' unchanged code:
+repository's unchanged code: the candidate-review system prompt, the
+``CandidateReviewOutput`` schema (decision ALLOW / VETO / DEFER, priority, reason codes)
+and the guard that turns an ALLOW into DEFER when strongly adverse news caused a conflict
+route. The route itself (tier, deadline, evidence ids) comes from the real Router policy
+and is only read here.
 
-* Router: ``SignalWindow`` (confidence-calibrated text aggregation with the Router's own
-  time-to-live, dead band and evidence cap) and ``classify_candidate`` (NORMAL or CONFLICT).
-* Aggregator: the candidate-review system prompt, the ``CandidateReviewOutput`` schema
-  (decision ALLOW / VETO / DEFER, priority, reason codes) and the guard that turns an
-  ALLOW into DEFER when strongly adverse news caused a conflict route.
+Still a stand-in: the review payload below is assembled here and is not
+``DecisionContextV1``, and the model call is made by the runner, not by ``LLMGateway``
+through ``CandidateReviewBrain``. See docs/ALIGNMENT.md, step 2.
 
-The strict ``StrategyIntentV1`` / ``DecisionContextV1`` contracts are not used: they are
-bound to Binance minute bars and code fingerprints that an EVEDEX candidate does not have,
-and filling them in would be a false claim. The review payload below carries the same
-kinds of information and says what it is.
-
-argv: <aggregator source> <router source> <kairos-core source>
-stdin (prepare):  {"op": "prepare", "now_ms": ..., "candidates": [...], "signals": [...],
-                   "market": {"<symbol>": {...}}, "portfolio": {...}, "context": {...}}
+argv: <aggregator source> <kairos-core source>
+stdin (prepare):  {"op": "prepare", "now_ms": ..., "candidates": [<signal record with
+                   "conflict_rationale" and "routing_text">, ...], "signals": [...],
+                   "market": {"<instrument>": {...}}, "portfolio": {...}, "context": {...}}
 stdin (validate): {"op": "validate", "signals": [...], "reviews": [{"id", "side", "tier",
                    "routing_ids": [...], "model_output": {...} | null}]}
 stdout: a marker line followed by JSON.
@@ -26,13 +24,12 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import datetime
 from types import SimpleNamespace
 
 MARKER = "@@KAIROS-WORKER@@"
 EVIDENCE_LOOKBACK_MS = 6 * 3_600_000
 MAX_EVIDENCE = 8
-TEXT_BUCKET = "MARKET"  # Text Scouts evidence is market-wide, not per instrument
 
 
 def _sentiment(raw: dict):
@@ -68,34 +65,11 @@ def _sentiments(rows: list) -> list:
 def prepare(request: dict) -> dict:
     from kairos_aggregator.candidate_review import CAUSAL_CANDIDATE_REVIEW_SYSTEM
     from kairos_aggregator.compiler import calibrated_sentiment
-    from kairos_core.enums import CandidateReviewTier, Side
-    from kairos_router.aggregation import SignalWindow
-    from kairos_router.candidate import classify_candidate
-    from kairos_router.config import RouterSettings
+    from kairos_core.enums import CandidateReviewTier
 
-    defaults = {name: field.default for name, field in RouterSettings.model_fields.items()}
-    candidate_ttl_ms = int(defaults["candidate_ttl_s"] * 1000)
     now_ms = int(request["now_ms"])
-    as_of = datetime.fromtimestamp(now_ms / 1000, UTC)
     origins = {str(raw["id"]): raw.get("origin", "llm") for raw in request.get("signals", [])}
     sentiments = _sentiments(request.get("signals", []))
-    window = SignalWindow(
-        sentiment_ttl_s=defaults["sentiment_ttl_s"],
-        deadband=defaults["sentiment_deadband"],
-        min_confidence=defaults["sentiment_min_confidence"],
-        max_evidence=defaults["max_sentiment_evidence"],
-    )
-    for signal in sentiments:
-        window.add_sentiment(
-            TEXT_BUCKET,
-            message_id=signal.message_id,
-            produced_at=signal.produced_at,
-            sentiment=signal.sentiment,
-            impact=signal.impact,
-            confidence=signal.confidence,
-        )
-    text = window.aggregate(TEXT_BUCKET, as_of=as_of)
-
     recent = sorted(
         (
             s
@@ -122,27 +96,30 @@ def prepare(request: dict) -> dict:
     market = request.get("market", {})
     prepared = []
     for candidate in request["candidates"]:
-        side = Side(candidate["side"])
-        tier = classify_candidate(side, text.bias)
-        rationale = None
-        if tier is CandidateReviewTier.CONFLICT:
-            rationale = (
-                f"strategy_side={side.value} text_side={text.bias.value} "
-                f"text_score={text.score:.6f} text_confidence={text.confidence:.6f}"
-            )
-        symbol = candidate["symbol"]
+        tier = CandidateReviewTier(candidate["review_tier"])
+        instrument = candidate["symbol"]
+        routing_text = dict(candidate.get("routing_text") or {})
         context = {
-            "contract": "autotrader-review-context.v1 for EVEDEX; "
-            "same kinds of content as DecisionContextV1, "
-            "not that contract",
-            "route": {"review_tier": tier.value, "conflict_rationale": rationale, "routed_at_ms": now_ms},
+            "contract": "autotrader-review-context.v1; same kinds of content as "
+            "DecisionContextV1, not that contract",
+            "route": {
+                "route_id": candidate["route_id"],
+                "review_tier": tier.value,
+                "conflict_rationale": candidate.get("conflict_rationale"),
+                "routed_at_ms": int(candidate["signal_time"]) - 1,
+                "review_deadline_ms": candidate["review_deadline_ms"],
+            },
             "immutable_intent": {
                 "intent_id": candidate["id"],
-                "strategy_id": candidate["setup"],
-                "symbol": symbol,
-                "venue": "EVEDEX",
-                "side": side.value,
-                "decision_ts_ms": candidate["signal_time"],
+                "strategy_id": candidate["strategy_id"],
+                "strategy_revision": candidate["strategy_revision"],
+                "setup": candidate["setup"],
+                "symbol": candidate["signal_symbol"],
+                "venue": candidate["signal_venue"],
+                "execution_venue": "EVEDEX",
+                "execution_instrument": instrument,
+                "side": candidate["side"],
+                "decision_ts_ms": int(candidate["signal_time"]) - 1,
                 "reference_price": candidate["ref_price"],
                 "signal_strength": candidate["score"],
                 "exit_plan": {
@@ -150,19 +127,14 @@ def prepare(request: dict) -> dict:
                     "target_price": candidate["take"],
                     "max_holding_minutes": candidate["timeout_minutes"],
                 },
-                "rationale": candidate.get("rationale", ""),
             },
-            "market": market.get(symbol, "UNAVAILABLE"),
-            "market_leader": market.get("BTCUSD", "UNAVAILABLE") if symbol != "BTCUSD" else "same instrument",
+            "market": market.get(instrument, "UNAVAILABLE"),
+            "market_leader": market.get("BTCUSD", "UNAVAILABLE")
+            if instrument != "BTCUSD"
+            else "same instrument",
             "text": {
                 "availability": "AVAILABLE" if evidence else "UNAVAILABLE",
-                "routing_window_seconds": defaults["sentiment_ttl_s"],
-                "routing": {
-                    "bias": text.bias.value,
-                    "calibrated_score": round(text.score, 6),
-                    "confidence": round(text.confidence, 6),
-                    "evidence_ids": list(text.sentiment_ids),
-                },
+                "routing": {**routing_text, "evidence_ids": list(candidate["text_evidence_ids"])},
                 "evidence": evidence,
             },
             "macro": request.get("macro") or "UNAVAILABLE",
@@ -172,14 +144,12 @@ def prepare(request: dict) -> dict:
         prepared.append(
             {
                 "id": candidate["id"],
-                "side": side.value,
+                "side": candidate["side"],
                 "tier": tier.value,
                 "effort": "high" if tier is CandidateReviewTier.CONFLICT else "medium",
-                "routing_ids": list(text.sentiment_ids),
-                "text_score": round(text.score, 6),
-                # The Router drops a candidate older than its time-to-live before any review.
-                "expired": now_ms - int(candidate["signal_time"]) > candidate_ttl_ms,
-                "age_s": round((now_ms - int(candidate["signal_time"])) / 1000, 1),
+                "routing_ids": list(candidate["text_evidence_ids"]),
+                "text_score": routing_text.get("score"),
+                "review_deadline_ms": candidate["review_deadline_ms"],
                 "user": json.dumps(
                     {"authority": "review_only", "decision_context": context},
                     sort_keys=True,
@@ -189,13 +159,7 @@ def prepare(request: dict) -> dict:
                 ),
             }
         )
-    return {
-        "system": CAUSAL_CANDIDATE_REVIEW_SYSTEM,
-        "prepared": prepared,
-        "candidate_ttl_s": defaults["candidate_ttl_s"],
-        "review_timeout_ms": defaults["candidate_review_timeout_ms"],
-        "text": {"bias": text.bias.value, "score": round(text.score, 6), "evidence": len(evidence)},
-    }
+    return {"system": CAUSAL_CANDIDATE_REVIEW_SYSTEM, "prepared": prepared, "evidence": len(evidence)}
 
 
 def validate(request: dict) -> dict:
@@ -246,7 +210,6 @@ def validate(request: dict) -> dict:
 def main() -> int:
     sys.path[0] = sys.argv[1]
     sys.path.insert(1, sys.argv[2])
-    sys.path.insert(2, sys.argv[3])
     request = json.load(sys.stdin)
     try:
         result = prepare(request) if request.get("op") == "prepare" else validate(request)

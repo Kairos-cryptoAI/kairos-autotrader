@@ -1,7 +1,8 @@
-"""Offline tests of the bridge to the real Kairos Router and Aggregator review rules.
+"""Offline tests of the bridge to the Kairos Aggregator review rules.
 
 ``test_real_*`` start the real repository code (no network, no model); they are skipped
-where the checkouts or the Aggregator environment are absent.
+where the checkout or the Aggregator environment is absent. The Router's classification
+is tested in ``test_routing.py``.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from support import routed
 
-from kairos_autotrader import aggregator_review, brain, candidates, engine
+from kairos_autotrader import aggregator_review, brain, engine, signals
 from kairos_autotrader.aggregator_review import (
     AggregatorConfig,
     AggregatorError,
@@ -23,28 +25,10 @@ from kairos_autotrader.aggregator_review import (
 from kairos_autotrader.engine import Config, PaperBroker, Store, Trader
 
 
-def candidate(
-    cid: str = "SOLUSD-SHORT-PULLBACK_RECLAIM-1",
-    symbol: str = "SOLUSD",
-    side: str = "SHORT",
-    score: float = 0.4,
-) -> candidates.Candidate:
-    ref = 83.0
+def candidate(symbol: str = "SOLUSD", side: str = "SHORT", score: float = 0.4, **route) -> signals.Routed:
     stop, take = (83.9, 81.65) if side == "SHORT" else (82.1, 84.35)
-    return candidates.Candidate(
-        id=cid,
-        symbol=symbol,
-        side=side,
-        setup="PULLBACK_RECLAIM",
-        bar_time=0,
-        signal_time=1_794_400_000_000,
-        ref_price=ref,
-        stop=stop,
-        take=take,
-        timeout_minutes=720,
-        atr=1.1,
-        score=score,
-        rationale="test",
+    return routed(
+        symbol=symbol, side=side, ref_price=83.0, stop=stop, take=take, atr=1.1, score=score, **route
     )
 
 
@@ -71,51 +55,72 @@ def real_config() -> AggregatorConfig:
     return config
 
 
-def prepare(config, candidates, signals):
+def prepare(config, candidates, signals, routing_text=None, macro=None):
     return aggregator_review._run_worker(
         config,
         {
             "op": "prepare",
             "now_ms": int(time.time() * 1000),
-            "candidates": [c.as_dict() for c in candidates],
+            "candidates": [
+                {
+                    **c.record(),
+                    "conflict_rationale": c.route.conflict_rationale,
+                    "routing_text": (routing_text or {}).get(c.instrument, {}),
+                }
+                for c in candidates
+            ],
             "signals": signals,
             "market": {"SOLUSD": {"rsi": 41.0, "trend": "DOWN"}},
             "portfolio": {"open_positions": [], "free_slots": 3},
             "context": {},
+            "macro": macro,
         },
     )
 
 
-def test_real_router_marks_a_conflict_only_for_fresh_confident_opposing_news():
+def test_real_review_context_is_built_around_the_route_it_was_given():
     config = real_config()
     fresh_bullish = news("n1", impact="bullish", sentiment=0.9, confidence=0.6, minutes_ago=3)
-    stale_bullish = news("n2", impact="bullish", sentiment=0.9, confidence=0.6, minutes_ago=45)
-    conflict = prepare(config, [candidate()], [fresh_bullish])
+    conflicted = candidate(tier="CONFLICT", evidence_ids=("n1",))
+    text = {"SOLUSD": {"bias": "LONG", "score": 0.54, "confidence": 0.6}}
+    conflict = prepare(config, [conflicted], [fresh_bullish], text, macro={"regime": "BEAR"})
     item = conflict["prepared"][0]
-    assert (item["tier"], item["effort"], item["routing_ids"]) == ("CONFLICT", "high", ["n1"])
+    assert (item["id"], item["tier"], item["effort"]) == (conflicted.id, "CONFLICT", "high")
+    assert item["routing_ids"] == ["n1"] and item["text_score"] == 0.54
+    assert item["review_deadline_ms"] == conflicted.route.review_deadline_ms
     assert "ALLOW|VETO|DEFER" in conflict["system"] and "Never propose" in conflict["system"]
     context = json.loads(item["user"])
     assert context["authority"] == "review_only"
     review = context["decision_context"]
-    assert review["route"]["conflict_rationale"].startswith("strategy_side=SHORT text_side=LONG")
-    assert review["immutable_intent"]["venue"] == "EVEDEX" and review["immutable_intent"]["side"] == "SHORT"
-    assert review["immutable_intent"]["exit_plan"] == {
-        "stop_price": 83.9,
-        "target_price": 81.65,
-        "max_holding_minutes": 720,
+    assert review["route"] == {
+        "route_id": conflicted.route.route_id,
+        "review_tier": "CONFLICT",
+        "conflict_rationale": conflicted.route.conflict_rationale,
+        "routed_at_ms": conflicted.intent.decision_ts_ms,
+        "review_deadline_ms": conflicted.route.review_deadline_ms,
     }
-    assert review["market"] == {"rsi": 41.0, "trend": "DOWN"} and review["macro"] == "UNAVAILABLE"
+    intent = review["immutable_intent"]
+    assert (intent["intent_id"], intent["symbol"], intent["venue"]) == (
+        conflicted.id,
+        "SOLUSDT",
+        "BINANCE_UM",
+    )
+    assert (intent["execution_venue"], intent["execution_instrument"]) == ("EVEDEX", "SOLUSD")
+    assert intent["side"] == "SHORT" and intent["strategy_id"] == conflicted.intent.strategy_id
+    assert intent["exit_plan"] == {"stop_price": 83.9, "target_price": 81.65, "max_holding_minutes": 720}
+    assert review["market"] == {"rsi": 41.0, "trend": "DOWN"} and review["macro"] == {"regime": "BEAR"}
+    assert review["text"]["routing"] == {**text["SOLUSD"], "evidence_ids": ["n1"]}
     assert review["text"]["evidence"][0]["sentiment"] == pytest.approx(0.54), "calibrated by confidence"
+    assert len(item["user"]) < 6_000, "the prompt carries no megabyte of input bar hashes"
 
-    calm = prepare(config, [candidate(), candidate("SOLUSD-LONG-X-1", side="LONG")], [stale_bullish])
-    assert [p["tier"] for p in calm["prepared"]] == ["NORMAL", "NORMAL"], (
-        "news older than the Router's window"
-    )
-    assert json.loads(calm["prepared"][0]["user"])["decision_context"]["text"]["availability"] == "AVAILABLE"
-    none = prepare(config, [candidate()], [])
-    assert (
-        json.loads(none["prepared"][0]["user"])["decision_context"]["text"]["availability"] == "UNAVAILABLE"
-    )
+    calm = prepare(config, [candidate(), candidate(side="LONG")], [])
+    assert [(p["tier"], p["effort"], p["routing_ids"]) for p in calm["prepared"]] == [
+        ("NORMAL", "medium", []),
+        ("NORMAL", "medium", []),
+    ]
+    quiet = json.loads(calm["prepared"][0]["user"])["decision_context"]
+    assert quiet["text"]["availability"] == "UNAVAILABLE" and quiet["macro"] == "UNAVAILABLE"
+    assert quiet["route"]["conflict_rationale"] is None
 
 
 def test_real_aggregator_validation_fails_closed_and_applies_its_conflict_guard():
@@ -170,12 +175,17 @@ def test_real_aggregator_validation_fails_closed_and_applies_its_conflict_guard(
 
 
 def test_each_candidate_is_reviewed_once_with_its_own_effort():
-    sol, link = candidate(), candidate("LINKUSD-SHORT-X-1", symbol="LINKUSD")
+    sol, link = candidate(tier="CONFLICT", evidence_ids=("n1",)), candidate(symbol="LINKUSD")
     asked = []
+    clock = iter([sol.route.review_deadline_ms - 1, link.route.review_deadline_ms + 1])
 
     def runner(config, request):
         if request["op"] == "prepare":
-            assert [c["id"] for c in request["candidates"]] == [sol.id, link.id]
+            sent = request["candidates"]
+            assert [c["id"] for c in sent] == [sol.id, link.id]
+            assert sent[0]["conflict_rationale"] == sol.route.conflict_rationale
+            assert sent[0]["routing_text"] == {"score": 0.5} and sent[1]["routing_text"] == {}
+            assert sent[0]["route_id"] == sol.route.route_id and sent[0]["text_evidence_ids"] == ["n1"]
             return {
                 "system": "SYS",
                 "prepared": [
@@ -186,6 +196,7 @@ def test_each_candidate_is_reviewed_once_with_its_own_effort():
                         "effort": "high",
                         "routing_ids": ["n1"],
                         "text_score": 0.5,
+                        "review_deadline_ms": sol.route.review_deadline_ms,
                         "user": "U-SOL",
                     },
                     {
@@ -194,7 +205,8 @@ def test_each_candidate_is_reviewed_once_with_its_own_effort():
                         "tier": "NORMAL",
                         "effort": "medium",
                         "routing_ids": [],
-                        "text_score": 0.0,
+                        "text_score": None,
+                        "review_deadline_ms": link.route.review_deadline_ms,
                         "user": "U-LINK",
                     },
                 ],
@@ -234,6 +246,7 @@ def test_each_candidate_is_reviewed_once_with_its_own_effort():
             api_key="k",
             model="m",
             candidates=[sol, link],
+            routing_text={"SOLUSD": {"score": 0.5}},
             signals=[],
             market={},
             portfolio={},
@@ -241,6 +254,7 @@ def test_each_candidate_is_reviewed_once_with_its_own_effort():
             now_ms=1,
             runner=runner,
             extract=extract,
+            clock_ms=lambda: next(clock),
         )
     )
     assert sorted(asked) == [("SYS", "U-LINK", "medium"), ("SYS", "U-SOL", "high")]
@@ -248,24 +262,30 @@ def test_each_candidate_is_reviewed_once_with_its_own_effort():
         (sol.id, "VETO", "CONFLICT", ""),
         (link.id, "DEFER", "NORMAL", "HTTP 500"),
     ]
+    assert [r["route_deadline_missed"] for r in reviews] == [False, True], "recorded against the route"
 
 
 def test_allowed_candidates_are_ranked_by_priority_one_per_instrument():
     a, b, c, d = (
-        candidate("A"),
-        candidate("B"),
-        candidate("C", symbol="LINKUSD"),
-        candidate("D", symbol="XRPUSD"),
+        candidate(score=0.3),
+        candidate(score=0.5),
+        candidate(symbol="LINKUSD"),
+        candidate(symbol="XRPUSD"),
     )
     reviews = [
-        {"id": "A", "decision": "ALLOW", "priority": 60},
-        {"id": "B", "decision": "ALLOW", "priority": 80},
-        {"id": "C", "decision": "ALLOW", "priority": 70},
-        {"id": "D", "decision": "VETO", "priority": 99},
+        {"id": a.id, "decision": "ALLOW", "priority": 60},
+        {"id": b.id, "decision": "ALLOW", "priority": 80},
+        {"id": c.id, "decision": "ALLOW", "priority": 70},
+        {"id": d.id, "decision": "VETO", "priority": 99},
         {"id": "GHOST", "decision": "ALLOW", "priority": 100},
     ]
-    assert allowed_in_order(reviews, [a, b, c, d], 3) == ["B", "C"]
-    assert allowed_in_order(reviews, [a, b, c, d], 1) == ["B"]
+    assert allowed_in_order(reviews, [a, b, c, d], 3) == [b.id, c.id]
+    assert allowed_in_order(reviews, [a, b, c, d], 1) == [b.id]
+    tie = [
+        {"id": a.id, "decision": "ALLOW", "priority": 50},
+        {"id": b.id, "decision": "ALLOW", "priority": 50},
+    ]
+    assert allowed_in_order(tie, [a, b], 1) == [b.id], "equal priority: the stronger signal first"
 
 
 def trader_with_reviews(tmp_path, monkeypatch, *, mode: str, shadow: bool = True, reviews=None, fail=False):
@@ -282,7 +302,7 @@ def trader_with_reviews(tmp_path, monkeypatch, *, mode: str, shadow: bool = True
         instruments={},
         openai_key="sk-test",
     )
-    trader.aggregator, trader._aggregator_revisions = AggregatorConfig(), {"aggregator": "x", "router": "y"}
+    trader.aggregator, trader._aggregator_revisions = AggregatorConfig(), {"aggregator": "x"}
     calls = {"probability": 0, "aggregator": 0}
 
     async def fear_greed(session):
@@ -325,7 +345,7 @@ def events(trader) -> list[dict]:
 
 
 def test_shadow_mode_trades_on_the_probability_review_and_records_the_aggregator(tmp_path, monkeypatch):
-    sol, link = candidate(), candidate("LINKUSD-SHORT-X-1", symbol="LINKUSD")
+    sol, link = candidate(), candidate(symbol="LINKUSD")
     trader, calls = trader_with_reviews(
         tmp_path,
         monkeypatch,
@@ -344,8 +364,8 @@ def test_shadow_mode_trades_on_the_probability_review_and_records_the_aggregator
 def test_aggregator_mode_trades_allowed_candidates_by_priority(tmp_path, monkeypatch):
     sol, link, xrp = (
         candidate(),
-        candidate("LINKUSD-SHORT-X-1", symbol="LINKUSD"),
-        candidate("XRPUSD-SHORT-X-1", symbol="XRPUSD"),
+        candidate(symbol="LINKUSD"),
+        candidate(symbol="XRPUSD"),
     )
     trader, calls = trader_with_reviews(
         tmp_path,

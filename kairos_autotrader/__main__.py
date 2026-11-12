@@ -19,10 +19,10 @@ from pathlib import Path
 
 import aiohttp
 
-from . import candidates as candidate_types
 from . import system_cli
 from .engine import Config, ConfigError, LiveBroker, PaperBroker, Store, Trader, say
 from .evedex import Evedex, EvedexError, OrderSigner, Rejected, new_order_id
+from .signals import outcome
 from .system_engine import EngineError
 from .text_scouts import TextScoutsError
 
@@ -239,8 +239,8 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             return 0
         for c in candidates:
             say(
-                f"СИГНАЛ {c.symbol} {c.side} {c.setup}: цена {c.ref_price:g}, "
-                f"стоп {c.stop:g}, тейк {c.take:g}"
+                f"СИГНАЛ {c.instrument} {c.side} {c.setup}: цена Binance {c.reference_price:g}, "
+                f"стоп {c.stop:g}, тейк {c.take:g}, обзор {c.route.review_tier.value}"
             )
         decision = await trader.decide(features, candidates, trader.config.max_open_positions)
         say(
@@ -305,11 +305,11 @@ async def cmd_report(args: argparse.Namespace) -> int:
         return 0
 
     # What would every signal have done, whether or not it was traded.
-    candidates: dict[str, candidate_types.Candidate] = {}
+    candidates: dict[str, dict] = {}
     for record in records:
         if record["event"] == "scan":
             for raw in record.get("candidates", []):
-                candidates[raw["id"]] = candidate_types.Candidate(**raw)
+                candidates[raw["id"]] = raw
 
     def picks(decision: dict) -> list[str]:
         return decision.get("picks") or ([decision["candidate_id"]] if decision.get("candidate_id") else [])
@@ -333,9 +333,10 @@ async def cmd_report(args: argparse.Namespace) -> int:
         fee = float(await api.taker_fee())
         results: dict[str, float] = {}
         for cid, candidate in candidates.items():
-            end = candidate.signal_time + (candidate.timeout_minutes + 10) * 60_000
-            bars = await api.candles(candidate.symbol, "5m", candidate.signal_time, end)
-            result = candidate_types.outcome(candidate, bars, cost_fraction=2 * (fee + 0.0002))
+            start = int(candidate["signal_time"])
+            end = start + (int(candidate["timeout_minutes"]) + 10) * 60_000
+            bars = await api.candles(candidate["symbol"], "5m", start, end)
+            result = outcome(candidate, bars, cost_fraction=2 * (fee + 0.0002))
             if result["r"] is not None:
                 results[cid] = result["r"]
 
@@ -386,10 +387,10 @@ async def cmd_report(args: argparse.Namespace) -> int:
             f"резерв {last['stable_reserve_pct']:.0%}, доли {last['strategy_weights']}, "
             f"источник: {last.get('origin')}"
         )
-    setups = sorted({c.setup for c in candidates.values()})
+    setups = sorted({c["setup"] for c in candidates.values()})
     if len(setups) > 1:
         for setup in setups:
-            line(f"правило {setup}", {cid for cid, c in candidates.items() if c.setup == setup})
+            line(f"правило {setup}", {cid for cid, c in candidates.items() if c["setup"] == setup})
     traded = {r.get("candidate_id") for r in closed}
     line("реально сторгованные", {cid for cid in traded if cid})
     return 0

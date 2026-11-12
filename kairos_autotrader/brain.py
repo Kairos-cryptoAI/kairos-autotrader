@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from .candidates import Candidate, Features
+from .signals import Features, Routed
 
 # RSS feeds handed to Text Scouts as its configured backstop sources. This module does
 # not read them itself: raw headlines never reach a model, only Text Scouts' typed signals.
@@ -41,6 +41,32 @@ BASE_RATES = {
     "meaning": "the filter adds value only by removing the weaker candidates; "
     "allowing everything is break-even at best",
 }
+
+# What each setup of the Strategy Engine's hourly_trend rules means, in the reviewer's words.
+SETUP_NOTES = {
+    ("LONG", "PULLBACK_RECLAIM"): (
+        "higher-timeframe uptrend; price dipped to the EMA20 and closed back above it"
+    ),
+    ("LONG", "BREAKOUT"): "higher-timeframe uptrend; close above the 20-bar high",
+    ("SHORT", "PULLBACK_RECLAIM"): (
+        "higher-timeframe downtrend; price rallied to the EMA20 and closed back below it"
+    ),
+    ("SHORT", "BREAKOUT"): "higher-timeframe downtrend; close below the 20-bar low",
+}
+_PROMPT_FIELDS = (
+    "id",
+    "symbol",
+    "side",
+    "setup",
+    "signal_time",
+    "ref_price",
+    "stop",
+    "take",
+    "timeout_minutes",
+    "atr",
+    "score",
+    "review_tier",
+)
 
 SYSTEM = """You are the reviewing trader of an automated crypto perpetuals system.
 Rule-based algorithms have already proposed trade candidates with fixed entry reference,
@@ -128,23 +154,23 @@ class Decision:
         }
 
 
-def _one_per_symbol(ordered: list[Candidate], max_picks: int) -> list[str]:
+def _one_per_symbol(ordered: list[Routed], max_picks: int) -> list[str]:
     picks, symbols = [], set()
     for candidate in ordered:
-        if candidate.symbol in symbols:
+        if candidate.instrument in symbols:
             continue
-        symbols.add(candidate.symbol)
+        symbols.add(candidate.instrument)
         picks.append(candidate.id)
         if len(picks) >= max_picks:
             break
     return picks
 
 
-def control_decision(candidates: list[Candidate], max_picks: int = 1) -> Decision:
+def control_decision(candidates: list[Routed], max_picks: int = 1) -> Decision:
     """What the algorithms alone would do: take the highest scored candidates."""
     if not candidates or max_picks < 1:
         return Decision("WAIT", None, 0.0, "no candidates", "CONTROL")
-    ordered = sorted(candidates, key=lambda c: (c.score, c.id), reverse=True)
+    ordered = sorted(candidates, key=lambda c: (c.strength, c.id), reverse=True)
     picks = _one_per_symbol(ordered, max_picks)
     return Decision("TRADE", picks[0], 0.0, "highest algorithmic score", "CONTROL", picks=picks)
 
@@ -165,9 +191,18 @@ async def fetch_fear_greed(session: aiohttp.ClientSession) -> dict[str, Any] | N
         return None
 
 
+def candidate_view(candidate: Routed) -> dict[str, Any]:
+    """A candidate as the reviewer sees it: the record without its fingerprints."""
+    record = candidate.record()
+    return {
+        **{name: record[name] for name in _PROMPT_FIELDS},
+        "rationale": SETUP_NOTES.get((candidate.side, candidate.setup), candidate.setup),
+    }
+
+
 def build_payload(
     features: list[Features],
-    candidates: list[Candidate],
+    candidates: list[Routed],
     *,
     trades_today: int,
     free_slots: int = 1,
@@ -187,10 +222,12 @@ def build_payload(
             "trades_today": trades_today,
         },
         "timeframes": {"signal_bars": "1h", "trend_bars": "4h"},
+        "price_source": "features and candidate prices are Binance USD-M closes; "
+        "orders are placed on EVEDEX with the same stop and take",
         "base_rates": BASE_RATES,
         "market_features": [{**f.as_dict(), **extras.get(f.symbol, {})} for f in features],
         "crypto_fear_greed_index": fear_greed or "unavailable",
-        "candidates": [c.as_dict() for c in candidates],
+        "candidates": [candidate_view(c) for c in candidates],
         "own_recent_closed_trades": recent_trades or [],
         "text_scouts_signals": text_signals if text_signals is not None else "news layer is off",
         "macro_allocation": macro or "UNAVAILABLE",
@@ -198,7 +235,7 @@ def build_payload(
 
 
 def validate_reply(
-    reply: Any, candidates: list[Candidate], min_confidence: float, max_picks: int = 1
+    reply: Any, candidates: list[Routed], min_confidence: float, max_picks: int = 1
 ) -> Decision:
     """Turn a model reply into a decision; anything inconsistent becomes WAIT."""
     problems: list[str] = []
@@ -290,7 +327,7 @@ async def ask_llm(
     model: str,
     effort: str,
     payload: dict[str, Any],
-    candidates: list[Candidate],
+    candidates: list[Routed],
     min_confidence: float,
     timeout_s: float,
     max_picks: int = 1,
