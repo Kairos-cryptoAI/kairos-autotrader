@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state and local operator files
+config.json
+*.jsonl
+state.json
+
+# Local operator launchers (they carry machine-specific paths)
+*.cmd

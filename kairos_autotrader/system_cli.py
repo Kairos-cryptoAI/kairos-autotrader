@@ -1,0 +1,330 @@
+"""Commands that run the real Kairos Strategy Engine next to the trader, without orders or keys.
+
+``engine-replay``  measures the engine's sleeves on EVEDEX minute history, with costs.
+``shadow``         records the engine's new intents as they appear, for later evaluation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import time
+from bisect import bisect_left
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+from . import strategy
+from .engine import BAR_MS, TREND_MS, Config, ConfigError, Store, say
+from .evedex import Evedex
+from .system_engine import (
+    DAY_MS,
+    EXCLUDED_SLEEVES,
+    MINUTE_MS,
+    EngineConfig,
+    MinuteStore,
+    collect,
+    engine_revision,
+    to_candles,
+)
+from .text_scouts import NewsDesk
+
+SHADOW_MODE = "engine-shadow"
+OWN_RULES = "правила запускателя, скан раз в час"
+OWN_RULES_QUARTER = "правила запускателя, скан каждые 15 минут"
+
+
+def _day(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, UTC).strftime("%d.%m")
+
+
+def evaluate(
+    candidates: list[strategy.Candidate], candles: list, cost_fraction: float
+) -> list[dict[str, Any]]:
+    """Outcome of each candidate on the minute bars that followed it. Unfinished ones are left out."""
+    times = [c.t for c in candles]
+    rows = []
+    for candidate in candidates:
+        start = bisect_left(times, candidate.signal_time)
+        later = candles[start : start + candidate.timeout_minutes + 2]
+        result = strategy.outcome(candidate, later, cost_fraction=cost_fraction)
+        if result["r"] is None:
+            continue
+        risk = abs(candidate.ref_price - candidate.stop)
+        rows.append(
+            {
+                "id": candidate.id,
+                "setup": candidate.setup,
+                "symbol": candidate.symbol,
+                "side": candidate.side,
+                "signal_time": candidate.signal_time,
+                "reason": result["reason"],
+                "r": result["r"],
+                "cost_r": cost_fraction * candidate.ref_price / risk,
+                "stop_pct": 100 * risk / candidate.ref_price,
+            }
+        )
+    return rows
+
+
+def own_rule_candidates(
+    symbol: str, candles: list, config: Config, phases_minutes: tuple[int, ...] = (0,)
+) -> list[strategy.Candidate]:
+    """The runner's own hourly rules on the same minute history, for a like-for-like comparison.
+
+    ``phases_minutes`` lists where the hourly bars close: ``(0,)`` is one scan an hour,
+    ``(0, 15, 30, 45)`` is the four scans an hour of ``scan_minutes=15``.
+    """
+    found: list[strategy.Candidate] = []
+    for phase in phases_minutes:
+        hourly = strategy.aggregate(candles, MINUTE_MS, BAR_MS, offset_ms=phase * MINUTE_MS)
+        for i in range(300, len(hourly)):
+            window = hourly[: i + 1]
+            trend = [
+                b
+                for b in strategy.aggregate(window, BAR_MS, TREND_MS)
+                if b.t + TREND_MS <= window[-1].t + BAR_MS
+            ]
+            _, candidates = strategy.analyse(
+                symbol,
+                window[-300:],
+                trend,
+                reward_risk=config.reward_risk,
+                timeout_minutes=config.timeout_minutes,
+            )
+            found.extend(candidates)
+    return found
+
+
+def summarise(name: str, rows: list[dict[str, Any]], days: float) -> dict[str, Any] | None:
+    if not rows:
+        say(f"  {name}: завершённых сигналов нет")
+        return None
+    values = [r["r"] for r in rows]
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / max(1, len(values) - 1)
+    error = (variance / len(values)) ** 0.5
+    exits = Counter(r["reason"] for r in rows)
+    cost = sum(r["cost_r"] for r in rows) / len(rows)
+    stop = sorted(r["stop_pct"] for r in rows)[len(rows) // 2]
+    first, last = min(r["signal_time"] for r in rows), max(r["signal_time"] for r in rows)
+    say(
+        f"  {name}: {len(rows)} сигналов ({len(rows) / days:.1f} в день, {_day(first)}–{_day(last)}), "
+        f"средний результат {mean:+.3f} R ± {error:.3f}, в плюс {sum(v > 0 for v in values)}, "
+        f"комиссии {cost:.2f} R на сделку, стоп {stop:.2f}%, "
+        f"выходы: тейк {exits.get('TAKE', 0)} / стоп {exits.get('STOP', 0)} / срок {exits.get('TIMEOUT', 0)}"
+    )
+    return {
+        "name": name,
+        "signals": len(rows),
+        "per_day": round(len(rows) / days, 2),
+        "mean_r": round(mean, 4),
+        "standard_error": round(error, 4),
+        "wins": sum(v > 0 for v in values),
+        "mean_cost_r": round(cost, 4),
+        "median_stop_pct": round(stop, 3),
+        "exits": dict(exits),
+    }
+
+
+async def cmd_engine_replay(args: argparse.Namespace) -> int:
+    config = Config.load(args.config)
+    engine = EngineConfig(window_days=args.days)
+    engine.check()
+    revision = engine_revision(engine.source)
+    symbols = args.symbols or config.symbols
+    args.runtime_dir.mkdir(parents=True, exist_ok=True)
+    store = MinuteStore(args.runtime_dir / "minute-cache")
+    say(
+        f"Strategy Engine: {engine.source}, ревизия {revision[:12]}. "
+        f"История: {args.days} дней минутных свечей EVEDEX, "
+        f"{len(symbols)} инструментов."
+    )
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        api = Evedex(session)
+        fee = float(await api.taker_fee())
+        cost_fraction = 2 * (fee + config.slippage_fraction)
+        now_ms = int(time.time() * 1000)
+        candidates, problems, bars = await collect(api, store, engine, symbols, now_ms)
+    for problem in problems:
+        say(f"  замечание: {problem}")
+    rows: list[dict[str, Any]] = []
+    own: list[dict[str, Any]] = []
+    own_quarter: list[dict[str, Any]] = []
+    for symbol in symbols:
+        candles = to_candles(bars.get(symbol, []))
+        if not candles:
+            continue
+        rows.extend(evaluate([c for c in candidates if c.symbol == symbol], candles, cost_fraction))
+        own.extend(evaluate(own_rule_candidates(symbol, candles, config), candles, cost_fraction))
+        quarter = own_rule_candidates(symbol, candles, config, (0, 15, 30, 45))
+        own_quarter.extend(evaluate(quarter, candles, cost_fraction))
+    say(
+        f"Результат каждого сигнала по минутным свечам, с комиссиями и проскальзыванием "
+        f"({cost_fraction * 100:.3f}% на круг). R = один риск на сделку."
+    )
+    summary = []
+    for sleeve in engine.sleeves:
+        warmup = 34.0 if sleeve == "regime_aligned_right_tail_v1" else 3.0
+        summary.append(
+            summarise(sleeve, [r for r in rows if r["setup"] == sleeve], max(1.0, args.days - warmup))
+        )
+    summary.append(summarise(OWN_RULES, own, max(1.0, args.days - 12.5)))
+    summary.append(summarise(OWN_RULES_QUARTER, own_quarter, max(1.0, args.days - 12.5)))
+    say("Не запускались: " + "; ".join(f"{name} ({reason})" for name, reason in EXCLUDED_SLEEVES.items()))
+    say(
+        "Это условный результат по истории, не сделки. "
+        "Погрешность ± показывает, отличим ли результат от нуля."
+    )
+    report = {
+        "generated_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "engine_revision": revision,
+        "days": args.days,
+        "symbols": symbols,
+        "cost_fraction": cost_fraction,
+        "summary": [s for s in summary if s],
+        "problems": problems,
+        "signals": rows,
+    }
+    path = args.runtime_dir / "engine-replay.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    say(f"Подробности записаны в {path}.")
+    return 0
+
+
+async def cmd_shadow(args: argparse.Namespace) -> int:
+    config = Config.load(args.config)
+    engine = EngineConfig()
+    engine.check()
+    store = Store(args.runtime_dir)
+    state = store.state
+    if state.get("mode") not in (None, SHADOW_MODE):
+        raise ConfigError("this runtime directory belongs to another mode; use a separate directory")
+    revision = engine_revision(engine.source)
+    now_ms = int(time.time() * 1000)
+    state["mode"] = SHADOW_MODE
+    state.setdefault("started_ms", now_ms)
+    state.setdefault("seen", {})
+    if state.get("engine_revision") != revision:
+        state["engine_revision"] = revision
+        store.journal(
+            "shadow_start",
+            engine_revision=revision,
+            sleeves=list(engine.sleeves),
+            symbols=config.symbols,
+            excluded=EXCLUDED_SLEEVES,
+        )
+    store.save()
+    minute = MinuteStore(args.runtime_dir / "minute-cache")
+    say(
+        f"Теневой режим Strategy Engine (ревизия {revision[:12]}). Заявок нет, ключи не нужны. "
+        f"Сигналы пишутся в {args.runtime_dir}. Остановить: Ctrl+C или файл STOP."
+    )
+    cycles = 0
+    reported: list[str] = []
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        api = Evedex(session)
+        while args.max_cycles is None or cycles < args.max_cycles:
+            cycles += 1
+            now_ms = int(time.time() * 1000)
+            try:
+                candidates, problems, _ = await collect(
+                    api, minute, engine, config.symbols, now_ms, since_ms=state["started_ms"]
+                )
+            except (TimeoutError, aiohttp.ClientError) as exc:
+                store.journal("error", kind=type(exc).__name__, message=str(exc)[:300])
+                say(f"Ошибка связи ({type(exc).__name__}); повтор в следующем цикле.")
+                candidates, problems = [], []
+            seen = state["seen"]
+            fresh = [c for c in candidates if c.id not in seen]
+            for candidate in fresh:
+                seen[candidate.id] = candidate.signal_time
+            for key in [
+                k for k, moment in seen.items() if moment < now_ms - (engine.window_days + 1) * DAY_MS
+            ]:
+                del seen[key]
+            if fresh or problems != reported:
+                reported = problems  # a standing remark is written once, not every cycle
+                store.journal(
+                    "scan",
+                    bar=now_ms // MINUTE_MS * MINUTE_MS,
+                    source="strategy_engine",
+                    engine_revision=revision,
+                    features=[],
+                    candidates=[c.as_dict() for c in fresh],
+                    skipped=problems,
+                )
+            store.save()
+            if fresh:
+                say("Новые сигналы движка: " + ", ".join(f"{c.symbol} {c.side} {c.setup}" for c in fresh))
+            elif cycles == 1 or cycles % 12 == 0:
+                say(
+                    f"Новых сигналов нет. Всего записано: {len(seen)}."
+                    + (f" Замечания: {'; '.join(problems)[:200]}" if problems else "")
+                )
+            if store.flag("STOP"):
+                say("Найден файл STOP. Останавливаюсь.")
+                return 0
+            if args.max_cycles is not None and cycles >= args.max_cycles:
+                break
+            # Wake shortly after the next five-minute boundary, when the engine's 5m bars close.
+            pause = args.interval - (time.time() % args.interval) + 20
+            await asyncio.sleep(pause)
+    return 0
+
+
+async def cmd_news(args: argparse.Namespace) -> int:
+    """One Text Scouts poll without a model key: shows what the news layer sees right now."""
+    import tempfile
+
+    store = Store(args.runtime_dir or Path(tempfile.mkdtemp(prefix="kairos-news-")))
+    desk = NewsDesk(store)
+    desk.config.check()
+    say(
+        f"Text Scouts: {desk.config.source}, ревизия {desk.revision[:12]}. "
+        f"Источники: GDELT и {len(desk.config.feeds)} RSS-лент."
+    )
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        summary = await desk.poll(session, openai_key=None, model="", max_llm_calls=0)
+    counts = summary["counts"]
+    say(
+        f"Получено {counts['fetched']}, свежих (до 30 минут) {counts['timely']}, "
+        f"без повторов {counts['unique']}, "
+        f"значимых {counts['kept']}. По источникам: {summary['sources']}."
+    )
+    for title in summary["kept"]:
+        say(f"  значимая новость: {title}")
+    for signal in summary["signals"]:
+        say(
+            f"  сигнал: {signal['topic']} — {signal['impact']}, уверенность {signal['confidence']:.2f} "
+            f"({'модель' if signal['origin'] == 'llm' else 'грубая оценка без модели'})"
+        )
+    if not summary["signals"]:
+        say(
+            "Сигналов нет. Без ключа модели работает только грубая оценка по ключевым словам; "
+            "в боевом режиме значимые новости разбирает модель."
+        )
+    return 0
+
+
+def add_parsers(sub: argparse._SubParsersAction) -> dict[str, Any]:
+    replay = sub.add_parser(
+        "engine-replay", help="measure the real Strategy Engine on EVEDEX history; no orders"
+    )
+    replay.add_argument("--runtime-dir", type=Path, required=True)
+    replay.add_argument("--config", type=Path)
+    replay.add_argument("--days", type=int, default=45)
+    replay.add_argument("--symbols", nargs="*")
+
+    shadow = sub.add_parser("shadow", help="record the Strategy Engine's new intents; no orders, no keys")
+    shadow.add_argument("--runtime-dir", type=Path, required=True)
+    shadow.add_argument("--config", type=Path)
+    shadow.add_argument("--interval", type=int, default=300)
+    shadow.add_argument("--max-cycles", type=int, help=argparse.SUPPRESS)
+    news = sub.add_parser("news", help="one Text Scouts poll without a model key; no orders")
+    news.add_argument("--runtime-dir", type=Path)
+    return {"engine-replay": cmd_engine_replay, "shadow": cmd_shadow, "news": cmd_news}
