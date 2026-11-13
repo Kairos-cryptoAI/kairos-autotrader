@@ -113,7 +113,7 @@ class ClosedBarStore:
             path = self._path(symbol)
             try:
                 bars = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
-            except ValueError:
+            except (ValueError, OSError):
                 bars = []
             usable = isinstance(bars, list) and all(isinstance(b, list) and len(b) == 10 for b in bars)
             self._bars[symbol] = bars if usable and contiguous(bars) else []
@@ -240,12 +240,20 @@ class ClosedBarStore:
                 problems[symbol] = str(exc)
                 if "changed a closed bar" in str(exc):
                     self._bars[symbol] = []
-                    await asyncio.to_thread(self._save, symbol, [])
+                    try:
+                        await asyncio.to_thread(self._save, symbol, [])
+                    except OSError:
+                        problems[symbol] += "; the cache file could not be cleared"
                 continue
             if not merged or int(merged[0][0]) != first_ms or int(merged[-1][0]) != end_ms - MINUTE_MS:
                 problems[symbol] = "closed bars do not cover the whole window"
                 continue
+            try:
+                await asyncio.to_thread(self._save, symbol, merged)
+            except OSError as exc:
+                # Without a durable cache the next update could not compare its overlap.
+                problems[symbol] = f"closed-bar cache could not be written: {type(exc).__name__}"
+                continue
             self._bars[symbol] = merged
-            await asyncio.to_thread(self._save, symbol, merged)
             result[symbol] = merged
         return result, problems

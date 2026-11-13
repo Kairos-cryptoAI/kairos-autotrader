@@ -126,6 +126,20 @@ def test_one_failing_symbol_does_not_stop_the_others(tmp_path):
     assert bars == {} and problems == {"SOLUSDT": "Quant Scouts: worker failed"}
 
 
+def test_a_cache_that_cannot_be_written_gives_no_bars_for_that_symbol(tmp_path, monkeypatch):
+    store = ClosedBarStore(tmp_path)
+
+    def full_disk(self, symbol, bars):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(ClosedBarStore, "_save", full_disk)
+    bars, problems = update(store, BarFeed(last_open_ms=T0), T0)
+    assert bars == {} and problems == {"SOLUSDT": "closed-bar cache could not be written: OSError"}
+    monkeypatch.undo()
+    bars, problems = update(store, BarFeed(last_open_ms=T0), T0)
+    assert problems == {} and len(bars["SOLUSDT"]) == 1_200
+
+
 def test_large_downloads_are_parsed_in_several_processes(tmp_path, monkeypatch):
     monkeypatch.setattr(binance_bars, "WORKER_BARS", 1_000)
     calls = []
