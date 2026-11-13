@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -1208,3 +1210,12 @@ def test_one_scan_per_quarter_hour_slot(tmp_path):
     assert len(scans) == (0 if waiting else 1), "a slot is scanned once"
     with pytest.raises(ConfigError):
         Config(scan_minutes=5).validate()
+
+
+def test_every_loop_replaces_the_heartbeat_for_the_alert_monitor(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.run(max_steps=2))
+    beat = json.loads((trader.store.directory / "heartbeat.json").read_text(encoding="utf-8"))
+    assert beat["pid"] == os.getpid() and set(beat) == {"pid", "started_at", "at"}
+    assert datetime.fromisoformat(beat["at"]) >= datetime.fromisoformat(beat["started_at"])

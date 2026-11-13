@@ -1830,8 +1830,24 @@ class Trader:
             if news_task is not None:
                 news_task.cancel()
 
+    def _heartbeat(self, started_at: str) -> None:
+        """Replace ``heartbeat.json`` on every loop for the single-host alert monitor.
+
+        The format is the one ``kairos_execution.production_alerts`` reads: the process
+        id, when this process started and when it last completed a loop.
+        """
+        path = self.store.directory / "heartbeat.json"
+        temporary = path.with_suffix(".tmp")
+        beat = {"pid": os.getpid(), "started_at": started_at, "at": datetime.now(UTC).isoformat()}
+        try:
+            temporary.write_text(json.dumps(beat), encoding="utf-8")
+            temporary.replace(path)
+        except OSError as exc:
+            self.store.journal("heartbeat_error", message=str(exc)[:200])
+
     async def _loop(self, max_steps: int | None) -> None:
         errors = steps = 0
+        started_at = datetime.now(UTC).isoformat()
         while max_steps is None or steps < max_steps:
             steps += 1
             try:
@@ -1851,6 +1867,7 @@ class Trader:
                 if errors >= 30:
                     self.halt("слишком много ошибок подряд")
                     errors = 0
+            self._heartbeat(started_at)
             if self.store.flag("STOP") and not self.trades():
                 say("Найден файл STOP, позиций нет. Останавливаюсь.")
                 return
