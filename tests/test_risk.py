@@ -249,8 +249,17 @@ def test_real_open_positions_use_up_the_risk_and_capital_room():
 
 
 def test_real_signal_outside_the_approved_prod_map_is_refused_before_any_measurement():
-    answer = decide(review_=review(symbol="ZECUSDT", ref=950.0, stop=962.0, take=932.0), refusal_only=True)
-    assert answer == {"refused": "ZECUSDT is outside Quant Scouts' approved PROD symbol map"}
+    answer = decide(review_=review(symbol="LTCUSDT", ref=80.0, stop=81.0, take=78.5), refusal_only=True)
+    assert answer == {"refused": "LTCUSDT is outside Quant Scouts' approved PROD symbol map"}
+
+
+def test_real_added_pair_is_decided_like_the_original_ones():
+    answer = decide(
+        review_=review(symbol="ZECUSDT", ref=950.0, stop=962.0, take=932.0),
+        books_=books(evedex="ZECUSD", binance="ZECUSDT", bid=949.9, ask=950.1),
+    )
+    decision = answer["evaluation"]["decision"]
+    assert decision["approved"] and decision["venue_symbol"] == "ZECUSD", decision["rejection_reasons"]
 
 
 # ---- how the trading loop uses the decision ---------------------------------------------

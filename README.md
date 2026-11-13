@@ -75,9 +75,10 @@ These are tracked, not hidden. See
   Binance prices and are not on EVEDEX's price tick, which the authenticated-rules mode
   rejects. The runner floors the quantity to the venue's lot and refuses a size below
   the minimum lot instead.
-- Only instruments in Quant Scouts' PROD symbol map (BTC, ETH, SOL, BNB, XRP) can be
-  measured for `VenueQualityV1`, so only they can be traded; signals on the other
-  configured instruments are recorded and refused.
+- Only instruments in Quant Scouts' PROD symbol map can be measured for
+  `VenueQualityV1`, so only they can be traded. Since `kairos-quant-scouts` `6bd59a3` the
+  map holds all ten configured instruments; a symbol added to `symbols` but not to the
+  map is recorded and refused.
 - State is two files, not the transactional inbox/outbox and execution journal.
 - The candidate rules are an isolated research package of the Strategy Engine, not a
   registered or promoted sleeve.
@@ -95,6 +96,9 @@ Layer workers need the sibling repositories checked out next to this one, each w
 own `uv sync --locked` environment. A missing sibling disables that layer with a message;
 tests that start real sibling code are skipped where it is absent.
 
+`kairos-quant-scouts` must contain the ten-pair PROD map (commit `6bd59a3`, branch
+`prod-symbol-map-ten-20261113`, until it is on `main`); with the original five pairs only
+BTC, ETH, SOL and XRP of the configured list can be traded.
 `kairos-aggregator` must contain the bounded review prompt (commit `34963c2`, branch
 `bounded-review-prompt-20261113`, until it is on `main`); without it every Aggregator
 review of an hourly_trend candidate fails at the provider and ends as DEFER.

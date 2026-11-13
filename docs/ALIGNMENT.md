@@ -25,7 +25,7 @@ What rejects a real venue today is service configuration, not the contracts:
 | --- | --- | --- | --- |
 | `kairos-core` (`ff3af75`) | a pinned dependency of the runner: `StrategyIntentV1` and `CandidateRouteV1` are the objects passed between scan, review and entry (`signals.Routed`); every Aggregator review is a validated `CandidateReviewV1` on a `DecisionContextV1` with `MarketSnapshot`, `ClosedBarEventV1`, `SentimentSignal` and `StrategicAllocation` sources | no `RiskTradeDecisionV1`, `VenueQualityV1` | steps 3-4 |
 | `kairos-strategy-engine` (`7096bfc`, branch `hourly-trend-strict-adapter-20261112`) | `hourly_trend.evaluate_hourly_trend_closed_bars` produces every live candidate as a `StrategyIntentV1` on closed Binance bars, through the shared `_strict_intent`, pinned by `hourly_trend_source_identity`; `candle_to_closed_bar` rebuilds each cached bar and its hash is compared; `registry.generate_sleeve_intents` on EVEDEX bars in shadow | no rule code. The package is isolated, not registered | registration is a separate source-pinned step (it changes eleven fingerprints) |
-| `kairos-quant-scouts` (`647c8b5`) | `long_gap_recovery.parse_page` accepts every Binance kline page and gives each bar its `ClosedBarEventV1` identity; `BinanceFuturesCollector` reads funding and the open-interest hour, `SnapshotBuilder` builds the `MarketSnapshot` before every decision | pages and the order book come from public REST, not from the collector's streams: liquidation totals stay at zero; the entry drift check stands in for `VenueQualityV1` | the collector's stream and `VenueQualityV1` |
+| `kairos-quant-scouts` (`6bd59a3`, branch `prod-symbol-map-ten-20261113`) | `long_gap_recovery.parse_page` accepts every Binance kline page and gives each bar its `ClosedBarEventV1` identity; `BinanceFuturesCollector` reads funding and the open-interest hour, `SnapshotBuilder` builds the `MarketSnapshot` before every decision | pages and the order book come from public REST, not from the collector's streams: liquidation totals stay at zero; the entry drift check stands in for `VenueQualityV1` | the collector's stream and `VenueQualityV1` |
 | `kairos-text-scouts` (`a8dbd88`) | full pipeline except the provider call | the model call is made by `text_scouts.model_extract`, not `kairos-llm` | provider call through the gateway |
 | `kairos-router` (`a373e62`) | `SignalWindow` and `CandidateRouterPolicy.build` with `RouterSettings` defaults: every candidate is a real `CandidateRouteV1` | the symbol bucketing of text and the time checks of `RouterService._candidate_rejection` are restated in `router_worker.py` (the pinned service refuses LIVE by configuration) | the service path once LIVE routing exists upstream |
 | `kairos-aggregator` (`34963c2`, branch `bounded-review-prompt-20261113`) | `CandidateContextStore` freezes the `DecisionContextV1`, `CandidateReviewBrain.review_with_context` reviews it and returns the `CandidateReviewV1`; `compile_decision_context` bounds a long input declaration in the prompt | the review runs in a worker per scan, not in `CandidateReviewService` on the bus: receipt clocks of cached bars are the worker's, as after a service restart | the service once the runner publishes to the bus |
@@ -123,8 +123,11 @@ Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers af
    only an ALLOW `CandidateReviewV1`. Found on the way:
    - the scope's account id was first taken from the evidence, so a foreign account could
      not be told apart; it is now the runner's own account;
-   - Quant Scouts' PROD symbol map has five symbols; HYPE, DOGE, LINK, SUI, AAVE and ZEC
-     cannot get a venue measurement and so cannot be traded;
+   - Quant Scouts' PROD symbol map had five symbols, so HYPE, DOGE, LINK, SUI, AAVE and ZEC
+     could get no venue measurement and could not be traded. At the owner's decision the
+     map was extended in `kairos-quant-scouts` `6bd59a3` (branch
+     `prod-symbol-map-ten-20261113`) to all ten configured instruments; on live public
+     books all ten were allowed, basis within 2.1 bps, spread within 5.1 bps;
    - the exit prices of an intent are Binance prices, off the EVEDEX tick, so the
      authenticated instrument-rules mode cannot be used yet.
    Checked on live public data, paper ledger, local model stand-in and a stated test
@@ -142,8 +145,10 @@ Each step lands with its tests and removes the code it replaces in the same chan
 
 ## Instrument universe
 
-Kairos trades five symbols, signal `BTCUSDT`…`XRPUSDT` mapped to EVEDEX instruments. The
-runner's configured list has ten EVEDEX instruments chosen by spread; all ten have a
+Kairos was designed for five symbols, signal `BTCUSDT`…`XRPUSDT` mapped to EVEDEX
+instruments. The runner's configured list has ten EVEDEX instruments chosen by spread, and
+Quant Scouts' PROD map now approves all ten (`6bd59a3`); the DEV, PAPER and simulation
+universes of the other repositories keep the original five. All ten have a
 Binance USD-M contract, found by the rule `XXXUSD` → `XXXUSDT` (`signals.signal_symbol`).
 An instrument whose Binance bars cannot be completed is skipped for that scan and never
 traded on guessed data.
