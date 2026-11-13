@@ -244,3 +244,19 @@ def test_real_quant_scouts_parser_gives_every_kline_its_contract_identity():
             contract.taker_buy_quote_volume,
             contract.bar_sha256,
         ]
+
+
+def test_market_snapshots_keep_their_arrival_time_and_name_every_missing_symbol():
+    from kairos_autotrader.binance_bars import market_snapshots
+
+    def runner(config, bars):
+        assert set(bars) == {"SOLUSDT", "ETHUSDT", "XRPUSDT"}
+        return {"SOLUSDT": {"symbol": "SOLUSDT"}, "ETHUSDT": {"error": "ValueError: order book is stale"}}
+
+    items, problems = asyncio.run(
+        market_snapshots(
+            QuantConfig(), {"SOLUSDT": [], "ETHUSDT": [], "XRPUSDT": []}, runner=runner, clock=lambda: 123
+        )
+    )
+    assert items == {"SOLUSDT": {"payload": {"symbol": "SOLUSDT"}, "received_at_ms": 123}}
+    assert problems == {"ETHUSDT": "ValueError: order book is stale", "XRPUSDT": "no answer"}

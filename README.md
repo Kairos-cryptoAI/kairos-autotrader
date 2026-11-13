@@ -25,7 +25,7 @@ exchanges JSON with the runner ([`kairos_autotrader/sibling.py`](kairos_autotrad
 | 1B Text Scouts | `kairos-text-scouts` | sources, normaliser, freshness bound, deduplicator, relevance filter, sentiment prompt, schema and signal transform, local fallback | live: evidence for reviewers |
 | 1A Quant Scouts | `kairos-quant-scouts` | `long_gap_recovery.parse_page`: a Binance kline page becomes strict `ClosedBarEventV1` bars only if it is complete, ordered and gap-free | live: every signal bar passes it |
 | 2 Router | `kairos-router` | `SignalWindow` text aggregation, `CandidateRouterPolicy.build` → `CandidateRouteV1` (tier, review deadline, exact evidence ids) | live: every candidate is routed; a rejected one is dropped |
-| 3 Aggregator | `kairos-aggregator` | candidate-review prompt, `CandidateReviewOutput`, conflict guard | shadow by default (`review_mode`) |
+| 3 Aggregator | `kairos-aggregator` | `CandidateContextStore` → `DecisionContextV1`, `CandidateReviewBrain.review_with_context` → `CandidateReviewV1`, model calls through `kairos-llm`'s `BudgetedLLMGateway` | shadow by default (`review_mode`) |
 | 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: one allocation a day |
 | 5 Risk Manager | `kairos-risk-manager` | `RiskSettings` limits, allocation gate, loss-at-stop sizing, economics | shadow by default (`risk_mode`) |
 | Strategy Engine | `kairos-strategy-engine` | `kairos_strategy.hourly_trend` through its strict adapter: closed Binance bars in, `StrategyIntentV1` out, pinned by the package's own source identity; registered sleeve generators | live: every candidate comes from it; registered sleeves in shadow only (`shadow`, `engine-replay`) |
@@ -53,14 +53,17 @@ Owned by the runner itself:
 These are tracked, not hidden. See
 [`docs/ALIGNMENT.md`](docs/ALIGNMENT.md) for the file-level map and the order of removal.
 
-- The review context is a local JSON shape, not `DecisionContextV1`, and the model is
-  called directly, not through `CandidateReviewBrain` and `LLMGateway`. The default
-  reviewer (`brain.py`) is the runner's own and has no counterpart in the design.
+- The default reviewer (`brain.py`, `review_mode="probability"`) is the runner's own and
+  has no counterpart in the design; it, Text Scouts' extraction and the Macro call still
+  call the provider directly. The Aggregator review runs in a worker per scan, not in
+  `CandidateReviewService` on the bus, and its budget is a JSON ledger
+  (`<runtime-dir>/llm-budget.json`), not the Postgres ledger of `kairos-persistence`.
 - Routes come from the Router's pure policy. The time checks of
   `RouterService._candidate_rejection` are restated in `router_worker.py`, because the
   pinned service refuses LIVE routing by configuration.
 - Closed bars come from Binance's public REST klines through the Quant Scouts parser, not
-  from the Quant Scouts collector's durable stream. There is no `MarketSnapshot` and no
+  from the Quant Scouts collector's durable stream. The `MarketSnapshot` for a review is
+  built from REST data, so its liquidation totals stay at zero. There is no
   `VenueQualityV1`; the entry check bounds the distance between the EVEDEX price and the
   Binance reference instead.
 - The Risk Manager's account gate is re-stated with the same formulas and settings; the
@@ -85,6 +88,9 @@ Layer workers need the sibling repositories checked out next to this one, each w
 own `uv sync --locked` environment. A missing sibling disables that layer with a message;
 tests that start real sibling code are skipped where it is absent.
 
+`kairos-aggregator` must contain the bounded review prompt (commit `34963c2`, branch
+`bounded-review-prompt-20261113`, until it is on `main`); without it every Aggregator
+review of an hourly_trend candidate fails at the provider and ends as DEFER.
 `kairos-strategy-engine` must contain the strict `kairos_strategy.hourly_trend` adapter
 (commit `7096bfc`, branch `hourly-trend-strict-adapter-20261112`, until it is on `main`).
 Without it, with a different source of that package, or without the `kairos-quant-scouts`

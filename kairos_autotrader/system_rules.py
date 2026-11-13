@@ -113,6 +113,19 @@ class MacroDesk:
         """The stored allocation, or None. The Risk Manager applies its own age limit."""
         return self._state().get("allocation")
 
+    def allocation_message(self) -> dict[str, Any] | None:
+        """The stored allocation as a ``StrategicAllocation`` payload with its receipt clock.
+
+        An allocation stored before receipt clocks were kept has none and is not offered.
+        """
+        allocation, received = self.allocation(), self._state().get("allocation_received_ms")
+        if not allocation or not isinstance(received, int):
+            return None
+        return {
+            "payload": {key: value for key, value in allocation.items() if key != "origin"},
+            "received_at_ms": received,
+        }
+
     def summary(self) -> dict[str, Any] | str:
         allocation = self.allocation()
         if not allocation:
@@ -197,6 +210,7 @@ class MacroDesk:
         )
         allocation = checked["allocation"]
         state["allocation"] = allocation
+        state["allocation_received_ms"] = int(time.time() * 1000)
         self.store.save()
         self.store.journal(
             "macro_allocation",

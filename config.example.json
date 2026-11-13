@@ -19,6 +19,7 @@
   "review_mode": "probability",
   "review_shadow": true,
   "review_timeout_s": 60,
+  "review_budget_usd": 12,
   "use_macro": true,
   "macro_effort": "high",
   "risk_mode": "autotrader",

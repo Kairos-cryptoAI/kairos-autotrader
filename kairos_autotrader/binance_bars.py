@@ -73,6 +73,45 @@ def _run_parser(config: QuantConfig, pages: list[dict[str, Any]]) -> list[dict[s
     return parsed
 
 
+def _run_snapshots(config: QuantConfig, bars: dict[str, list[Bar]]) -> dict[str, Any]:
+    try:
+        answer = run_worker(
+            config.python, WORKER, [str(config.source)], {"op": "snapshot", "bars": bars}, timeout_s=60.0
+        )
+        snapshots = answer["snapshots"]
+    except SiblingError as exc:
+        raise BarsError(f"Quant Scouts: {exc}") from exc
+    except (KeyError, TypeError) as exc:
+        raise BarsError("Quant Scouts worker returned malformed output") from exc
+    if not isinstance(snapshots, dict):
+        raise BarsError("Quant Scouts worker returned malformed output")
+    return snapshots
+
+
+async def market_snapshots(
+    config: QuantConfig, bars: dict[str, list[Bar]], *, runner=None, clock=None
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """``MarketSnapshot`` payloads built by Quant Scouts' code, with the moment they arrived.
+
+    ``bars`` are the newest closed bars per Binance symbol; the snapshot's indicators are
+    computed from them. Returns ``{symbol: {"payload", "received_at_ms"}}`` and the reason
+    for every symbol without a snapshot.
+    """
+    import time
+
+    answer = await asyncio.to_thread(runner or _run_snapshots, config, bars)
+    received_at_ms = (clock or (lambda: int(time.time() * 1000)))()
+    snapshots: dict[str, dict[str, Any]] = {}
+    problems: dict[str, str] = {}
+    for symbol in bars:
+        item = answer.get(symbol)
+        if not isinstance(item, dict) or "error" in item:
+            problems[symbol] = str(item.get("error") if isinstance(item, dict) else "no answer")[:200]
+        else:
+            snapshots[symbol] = {"payload": item, "received_at_ms": received_at_ms}
+    return snapshots, problems
+
+
 def http_fetcher(session: aiohttp.ClientSession, *, timeout_s: float = 20.0) -> FetchPage:
     """Download one page of closed one-minute klines, ``[start_ms, end_ms)``."""
 

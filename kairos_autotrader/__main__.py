@@ -299,6 +299,19 @@ async def cmd_report(args: argparse.Namespace) -> int:
     tokens_out = sum(d["decision"].get("usage", {}).get("output_tokens", 0) for d in decisions)
     if tokens_in or tokens_out:
         say(f"Нейросеть: {tokens_in} входных и {tokens_out} выходных токенов.")
+    ledger = args.runtime_dir / "llm-budget.json"
+    if ledger.exists():
+        for month, providers in sorted(json.loads(ledger.read_text(encoding="utf-8")).items()):
+            for provider, entries in sorted(providers.items()):
+                spent = sum(
+                    e["actual"] if e["actual"] is not None else e["reserved"] for e in entries.values()
+                )
+                open_ = sum(1 for e in entries.values() if e["actual"] is None)
+                say(
+                    f"Обзор Aggregator, {month}, {provider}: {len(entries)} вызовов, учтено "
+                    f"{spent / 1e6:.4f} USD"
+                    + (f" (из них {open_} без ответа, учтены по резерву)" if open_ else "")
+                )
     if len(closed) < 30:
         say("Сделок меньше 30: по такому числу нельзя судить, зарабатывает система или ей везёт.")
     if not args.outcomes:

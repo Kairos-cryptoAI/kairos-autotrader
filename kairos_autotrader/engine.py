@@ -22,13 +22,22 @@ import aiohttp
 
 from . import brain
 from .aggregator_review import (
+    OPENAI_MONTHLY_CEILING_USD,
     AggregatorConfig,
     AggregatorError,
     allowed_in_order,
     review_candidates,
     revisions,
 )
-from .binance_bars import BarsError, ClosedBarStore, FetchPage, QuantConfig, http_fetcher, quant_revision
+from .binance_bars import (
+    BarsError,
+    ClosedBarStore,
+    FetchPage,
+    QuantConfig,
+    http_fetcher,
+    market_snapshots,
+    quant_revision,
+)
 from .evedex import (
     Book,
     Evedex,
@@ -65,6 +74,14 @@ HARD_MAX_OPEN_POSITIONS = 3
 HISTORY_LENGTH = 20
 HOUR_MS = 60 * 60_000
 BAR_MS = HOUR_MS  # signals come from closed 1h bars
+# The Aggregator's review context carries this many of the newest closed bars the rules read
+# (AggregatorSettings.candidate_context_max_bars).
+REVIEW_CONTEXT_BARS = 60
+SNAPSHOT_BARS = 200  # the indicator window of Quant Scouts' snapshot builder (price_window)
+# The market snapshot for a decision is taken in this window before its boundary: it must be
+# produced before the decision and stay within the snapshot's 120-second life until the
+# review has finished.
+SNAPSHOT_LEAD_MS = (10_000, 55_000)
 # The setups of the Strategy Engine's hourly_trend rules, as Macro and Risk know them.
 STRATEGY_IDS = ("BREAKOUT", "PULLBACK_RECLAIM")
 
@@ -130,6 +147,9 @@ class Config:
     # The review deadline the Router writes into every route, counted from the decision.
     # RouterSettings allows at most 60 seconds.
     review_timeout_s: float = 60.0
+    # The monthly ceiling of the Aggregator review's model calls, kept in llm-budget.json
+    # in the runtime directory. kairos-llm registers 12 USD for OpenAI as the maximum.
+    review_budget_usd: float = 12.0
     # The Kairos Macro Strategist: one strategic allocation a day, and after a price crash.
     use_macro: bool = True
     macro_effort: str = "high"
@@ -173,6 +193,8 @@ class Config:
             raise ConfigError("symbols must not repeat")
         if not 1 <= self.review_timeout_s * 1000 <= MAX_REVIEW_TIMEOUT_MS:
             raise ConfigError("review_timeout_s must be within 0.001..60")
+        if not 0 < self.review_budget_usd <= OPENAI_MONTHLY_CEILING_USD:
+            raise ConfigError(f"review_budget_usd must be within (0, {OPENAI_MONTHLY_CEILING_USD}]")
         if not 0 < Decimal(str(self.capital_basis_usd)) <= HARD_MAX_CAPITAL_USD:
             raise ConfigError(f"capital_basis_usd must be within (0, {HARD_MAX_CAPITAL_USD}]")
         if not 0 < Decimal(str(self.risk_per_trade_usd)) <= HARD_MAX_RISK_PER_TRADE_USD:
@@ -769,7 +791,11 @@ class Trader:
         self.engine: EngineConfig | None = EngineConfig()
         self.quant, self.router = QuantConfig(), RouterConfig()
         self._signal_revisions: dict[str, str] = {}
-        self._routing_text: dict[str, dict[str, Any]] = {}
+        # The Aggregator review's evidence: the market snapshots taken before a boundary and
+        # the newest closed bars of the last scan, keyed by the Binance signal symbol.
+        self._market: dict[str, Any] = {"boundary": None, "items": {}, "problems": {}}
+        self._market_task: asyncio.Task | None = None
+        self._review_bars: dict[str, list[Any]] = {}
         try:
             self.engine.check_hourly_trend()
             self.quant.check()
@@ -1172,6 +1198,46 @@ class Trader:
                 + "); повторю на скане."
             )
 
+    def _market_due(self, now_ms: int) -> int | None:
+        """The boundary whose snapshot should be taken now, if any."""
+        if self.engine is None or self.aggregator is None or not self.openai_key:
+            return None
+        boundary = self.scan_slot(now_ms) + int(self.config.scan_minutes) * 60_000
+        lead = boundary - now_ms
+        if not SNAPSHOT_LEAD_MS[0] <= lead <= SNAPSHOT_LEAD_MS[1] or self._market["boundary"] == boundary:
+            return None
+        if self._market_task is not None and not self._market_task.done():
+            return None
+        return boundary
+
+    async def capture_market(self, boundary_ms: int) -> None:
+        """Market snapshots for the decision at ``boundary_ms``, built by Quant Scouts' code.
+
+        Runs before the boundary, in the background. Its failures are recorded and only
+        leave the review without market evidence, which the Aggregator turns into DEFER.
+        """
+        self._market = {"boundary": boundary_ms, "items": {}, "problems": {}}
+        try:
+            series, problems = await self._update_bars(int(time.time() * 1000))
+            bars = {signal_symbol(i): rows[-SNAPSHOT_BARS:] for i, rows in series.items() if rows}
+            items, failed = await market_snapshots(self.quant, bars) if bars else ({}, {})
+        except (TimeoutError, BarsError, aiohttp.ClientError, OSError) as exc:
+            items, problems, failed = {}, {}, {"*": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        self._market = {
+            "boundary": boundary_ms,
+            "items": items,
+            "problems": {**{signal_symbol(i): r for i, r in problems.items()}, **failed},
+        }
+        produced = sorted(item["payload"]["produced_at"] for item in items.values())
+        self.store.journal(
+            "market_snapshots",
+            boundary=boundary_ms,
+            symbols=sorted(items),
+            produced_from=produced[0] if produced else None,
+            produced_to=produced[-1] if produced else None,
+            problems=self._market["problems"],
+        )
+
     async def scan(self, now_ms: int) -> tuple[list[Features], list[Routed]]:
         """Ask the Kairos signal chain about the hourly bar that has just closed.
 
@@ -1184,12 +1250,16 @@ class Trader:
         """
         slot = self.scan_slot(now_ms)
         last_closed = slot - BAR_MS
-        self._routing_text = {}
+        self._review_bars = {}
         if self.engine is None:
             self.store.journal("scan_error", bar=last_closed, message="the signal chain is not available")
             return [], []
         series, problems = await self._update_bars(now_ms)
         skipped = [f"{symbol}: {reason}" for symbol, reason in problems.items()]
+        self._review_bars = {
+            signal_symbol(instrument): [row for row in rows if row[0] < slot][-REVIEW_CONTEXT_BARS:]
+            for instrument, rows in series.items()
+        }
         found = None
         if series:
             try:
@@ -1231,7 +1301,6 @@ class Trader:
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
                 return features, []
             candidates, rejected, router = routing.routed, routing.rejected, routing.settings
-            self._routing_text = routing.text
         self.store.journal(
             "scan",
             bar=last_closed,
@@ -1308,7 +1377,7 @@ class Trader:
             async def aggregator() -> brain.Decision | None:
                 if not ask_aggregator:
                     return None
-                return await self._aggregator_decision(features, candidates, payload, free_slots, now_ms)
+                return await self._aggregator_decision(candidates, free_slots)
 
             by_probability, by_review = await asyncio.gather(probability(), aggregator())
             chosen = by_review if by_aggregator else by_probability
@@ -1335,38 +1404,28 @@ class Trader:
         )
         return decision
 
-    async def _aggregator_decision(
-        self,
-        features: list[Features],
-        candidates: list[Routed],
-        payload: dict[str, Any],
-        free_slots: int,
-        now_ms: int,
-    ) -> brain.Decision:
-        """The Kairos Router + Aggregator review of every candidate, as one decision."""
+    async def _aggregator_decision(self, candidates: list[Routed], free_slots: int) -> brain.Decision:
+        """The Kairos Aggregator review of every routed candidate, as one decision."""
         if self.aggregator is None or self.openai_key is None:
             raise AggregatorError("the Aggregator review needs its checkout and a model key")
+        boundary = max(candidate.signal_time for candidate in candidates)
+        if self._market_task is not None and not self._market_task.done():
+            # A capture still running would deliver its snapshot after the decision anyway.
+            self._market_task.cancel()
+        market = self._market["items"] if self._market["boundary"] == boundary else {}
         try:
-            reviews = await review_candidates(
-                self.session,
+            result = await review_candidates(
                 self.aggregator,
-                api_key=self.openai_key,
-                model=self.config.llm_model,
                 candidates=candidates,
-                routing_text=self._routing_text,
+                market=market,
+                closed_bars=self._review_bars,
                 signals=self.news.raw_signals() if self.news else [],
-                market={f.symbol: {**f.as_dict(), **self._extras.get(f.symbol, {})} for f in features},
-                portfolio=payload["portfolio"],
-                context={
-                    "crypto_fear_greed_index": payload["crypto_fear_greed_index"],
-                    "own_recent_closed_trades": payload["own_recent_closed_trades"],
-                    "base_rates": payload["base_rates"],
-                },
-                macro=payload["macro_allocation"],
-                now_ms=now_ms,
-                timeout_s=self.config.llm_timeout_s,
+                macro=self.macro.allocation_message() if self.macro else None,
+                openai_key=self.openai_key,
+                ledger=self.store.directory / "llm-budget.json",
+                monthly_budget_usd=self.config.review_budget_usd,
             )
-        except (TimeoutError, AggregatorError, aiohttp.ClientError, OSError) as exc:
+        except (TimeoutError, AggregatorError, OSError) as exc:
             self.store.journal("aggregator_error", kind=type(exc).__name__, message=str(exc)[:300])
             return brain.Decision(
                 "WAIT",
@@ -1376,7 +1435,14 @@ class Trader:
                 "AGGREGATOR",
                 problems=[str(exc)[:200]],
             )
-        self.store.journal("aggregator_review", revisions=self._aggregator_revisions, reviews=reviews)
+        reviews = result.records
+        self.store.journal(
+            "aggregator_review",
+            revisions=self._aggregator_revisions,
+            reviews=reviews,
+            ingest_problems=result.ingest_problems[:20],
+            market_snapshots=sorted(market),
+        )
         picks = allowed_in_order(reviews, candidates, free_slots)
         counts = {name: sum(r["decision"] == name for r in reviews) for name in ("ALLOW", "VETO", "DEFER")}
         top = next((r for r in reviews if picks and r["id"] == picks[0]), None)
@@ -1397,7 +1463,6 @@ class Trader:
                 }
                 for r in reviews
             ],
-            usage={k: sum(r["usage"].get(k, 0) for r in reviews) for k in ("input_tokens", "output_tokens")},
         )
 
     async def try_enter(self, candidate: Routed, decision: brain.Decision) -> None:
@@ -1648,6 +1713,10 @@ class Trader:
         free = self.slot_limit() - len(trades)
         if free <= 0:
             return
+        boundary = self._market_due(now_ms)
+        if boundary is not None:
+            # In the background, so that positions are still managed while it runs.
+            self._market_task = asyncio.create_task(self.capture_market(boundary))
         slot = self.scan_slot(now_ms)
         if self.store.state.get("last_bar") == slot or now_ms - slot < 10_000:
             return
