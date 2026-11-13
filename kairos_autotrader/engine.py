@@ -44,6 +44,7 @@ from .evedex import (
     EvedexError,
     Instrument,
     OrderSigner,
+    Position,
     Rejected,
     Unknown,
     ceil_step,
@@ -53,16 +54,29 @@ from .evedex import (
     plain,
     round_step,
 )
+from .risk import (
+    AGGREGATE_OPEN_RISK_FRACTION,
+    LIVE_ACCOUNT_SOURCE,
+    MIN_NOTIONAL_USD,
+    PAPER_ACCOUNT_SOURCE,
+    PER_TRADE_RISK_FRACTION,
+    RiskConfig,
+    RiskError,
+    account_id_for,
+    evaluate_entry,
+    risk_revisions,
+)
 from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
 from .signals import SIGNAL_VENUE, Features, Routed, signal_symbol
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
+    HOURLY_TREND_ID,
     EngineConfig,
     EngineError,
     engine_revision,
     hourly_trend_scan,
 )
-from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of, risk_review
+from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of
 from .system_rules import revisions as rules_revisions
 from .text_scouts import NewsDesk, TextScoutsError
 
@@ -71,6 +85,8 @@ HARD_MAX_RISK_PER_TRADE_USD = Decimal(1)
 HARD_MAX_SESSION_LOSS_USD = Decimal(10)
 HARD_MAX_TRADES_PER_DAY = 12
 HARD_MAX_OPEN_POSITIONS = 3
+# The account equity above which the Risk Manager refuses every entry (LiveRiskLimitsV1).
+HARD_MAX_ACCOUNT_EQUITY_USD = Decimal(250)
 HISTORY_LENGTH = 20
 HOUR_MS = 60 * 60_000
 BAR_MS = HOUR_MS  # signals come from closed 1h bars
@@ -82,8 +98,14 @@ SNAPSHOT_BARS = 200  # the indicator window of Quant Scouts' snapshot builder (p
 # produced before the decision and stay within the snapshot's 120-second life until the
 # review has finished.
 SNAPSHOT_LEAD_MS = (10_000, 55_000)
-# The setups of the Strategy Engine's hourly_trend rules, as Macro and Risk know them.
-STRATEGY_IDS = ("BREAKOUT", "PULLBACK_RECLAIM")
+# The strategies the Macro Strategist allocates capital to; the Risk Manager gives an entry
+# capital only through the weight of its intent's strategy id.
+STRATEGY_IDS = (HOURLY_TREND_ID,)
+# Config keys of earlier versions that no longer select anything.
+RETIRED_CONFIG_KEYS = {
+    "risk_mode": "every entry is decided by the Kairos Risk Manager",
+    "risk_shadow": "every entry is decided by the Kairos Risk Manager",
+}
 
 
 # The venue's refusals of a TP/SL whose price is on the wrong side of the market for the
@@ -142,7 +164,7 @@ class Config:
     # threshold; "aggregator" is the Kairos Router + Aggregator review, one call per
     # candidate, ALLOW / VETO / DEFER. With review_shadow the other one runs too and is
     # only recorded, so the two can be compared in the report.
-    review_mode: str = "probability"
+    review_mode: str = "aggregator"
     review_shadow: bool = True
     # The review deadline the Router writes into every route, counted from the decision.
     # RouterSettings allows at most 60 seconds.
@@ -153,11 +175,8 @@ class Config:
     # The Kairos Macro Strategist: one strategic allocation a day, and after a price crash.
     use_macro: bool = True
     macro_effort: str = "high"
-    # Who admits and sizes an entry: "autotrader" is this program's own sizing; "kairos"
-    # additionally requires the Kairos Risk Manager's approval and takes the smaller size.
-    # With risk_shadow the Risk Manager judges every candidate and is only recorded.
-    risk_mode: str = "autotrader"
-    risk_shadow: bool = True
+    # The Kairos Risk Manager refuses every entry while the account equity is above this.
+    max_account_equity_usd: float = 200.0
     use_text_scouts: bool = True  # the Kairos Text Scouts news layer
     news_poll_minutes: float = 5.0
     max_news_llm_calls_per_day: int = 150
@@ -175,6 +194,9 @@ class Config:
                 raise ConfigError("config file must contain a JSON object")
             for key, value in raw.items():
                 if key.startswith("_"):
+                    continue
+                if key in RETIRED_CONFIG_KEYS:
+                    say(f"Настройка {key} больше не действует: {RETIRED_CONFIG_KEYS[key]}.")
                     continue
                 if key not in cls.__dataclass_fields__:
                     raise ConfigError(f"unknown config key: {key}")
@@ -211,12 +233,10 @@ class Config:
             raise ConfigError("scan_minutes must be 15, 30 or 60")
         if not 1 <= int(self.exit_confirm_polls) <= 20:
             raise ConfigError("exit_confirm_polls must be within 1..20")
-        if self.risk_mode not in ("autotrader", "kairos") or self.macro_effort not in (
-            "low",
-            "medium",
-            "high",
-        ):
-            raise ConfigError("risk_mode must be autotrader or kairos and macro_effort low/medium/high")
+        if self.macro_effort not in ("low", "medium", "high"):
+            raise ConfigError("macro_effort must be low, medium or high")
+        if not 0 < Decimal(str(self.max_account_equity_usd)) <= HARD_MAX_ACCOUNT_EQUITY_USD:
+            raise ConfigError(f"max_account_equity_usd must be within (0, {HARD_MAX_ACCOUNT_EQUITY_USD}]")
         if self.review_mode not in ("probability", "aggregator"):
             raise ConfigError("review_mode must be probability or aggregator")
         if not 1 <= self.news_poll_minutes <= 60 or not 0 <= int(self.max_news_llm_calls_per_day) <= 400:
@@ -229,34 +249,6 @@ class Config:
             raise ConfigError("chain_ids must be positive integers")
         if self.poll_seconds < 2 or self.llm_effort not in ("low", "medium", "high"):
             raise ConfigError("poll_seconds must be at least 2 and llm_effort low/medium/high")
-
-
-def size_position(
-    *,
-    side: str,
-    book: Book,
-    stop: Decimal,
-    instrument: Instrument,
-    risk_usd: Decimal,
-    max_notional: Decimal,
-    available: Decimal,
-    fee: Decimal,
-    slippage: Decimal,
-) -> tuple[Decimal | None, str]:
-    """Quantity whose stop-out, with round trip costs, loses at most ``risk_usd``."""
-    ref = book.ask if side == "LONG" else book.bid
-    distance = ref - stop if side == "LONG" else stop - ref
-    if distance <= 0:
-        return None, "stop is on the wrong side of the market"
-    per_unit = distance + ref * 2 * (fee + slippage)
-    step = instrument.quantity_step
-    quantity = floor_step(risk_usd / per_unit, step)
-    cap = min(max_notional, available * Decimal("0.9"))
-    quantity = min(quantity, floor_step(cap / ref, step))
-    minimum = max(instrument.min_quantity, ceil_step(instrument.min_volume * Decimal("1.03") / ref, step))
-    if quantity < minimum:
-        return None, f"minimum lot {minimum} would risk more than {risk_usd} USD or exceed the capital"
-    return quantity, "ok"
 
 
 def software_exit(trade: dict[str, Any], book: Book, now_ms: int) -> str | None:
@@ -322,11 +314,29 @@ class PaperBroker:
     """Simulated fills at the top of the real book, with taker fee and slippage."""
 
     mode = "paper"
+    account_source = PAPER_ACCOUNT_SOURCE
+    account_id = "evedex-prod-paper-ledger"
 
     def __init__(self, store: Store, config: Config, fee: Decimal) -> None:
         self._store, self._fee = store, fee
         self._slip = Decimal(str(config.slippage_fraction))
         store.state.setdefault("paper_equity", str(config.capital_basis_usd))
+
+    async def account_reads(self) -> tuple[Decimal, Decimal, list[Position], list[dict[str, Any]]]:
+        """Balance, available balance, positions and resting orders of the simulated ledger."""
+        equity = await self.equity()
+        positions = [
+            Position(
+                t["symbol"],
+                "BUY" if t["side"] == "LONG" else "SELL",
+                dec(t["quantity"]),
+                dec(t["entry_price"]),
+                True,
+                f"paper-stop-{t['id']}",
+            )
+            for t in self._store.state.get("open_trades", [])
+        ]
+        return equity, equity, positions, []
 
     async def equity(self) -> Decimal:
         return dec(self._store.state["paper_equity"])
@@ -374,6 +384,7 @@ class LiveBroker:
     """Real orders on EVEDEX. Entry by market IOC, then stop-loss and take-profit."""
 
     mode = "live"
+    account_source = LIVE_ACCOUNT_SOURCE
 
     def __init__(
         self,
@@ -384,7 +395,10 @@ class LiveBroker:
         settle_seconds: float = 1.0,
         cache_seconds: float = 3.0,
     ) -> None:
+        from eth_account import Account
+
         self._api, self._store, self._config, self._key = api, store, config, wallet_key
+        self.account_id = account_id_for(Account.from_key(wallet_key).address)
         self._settle_seconds = settle_seconds  # pause between reconciliation reads
         self._cache_seconds = cache_seconds  # routine "is it still open" checks share one read
         self._positions: list[Any] = []
@@ -402,6 +416,12 @@ class LiveBroker:
 
     async def available(self) -> Decimal:
         return (await self._api.balance())[1]
+
+    async def account_reads(self) -> tuple[Decimal, Decimal, list[Position], list[dict[str, Any]]]:
+        """Balance, available balance, positions and resting orders, each read fresh."""
+        balance, available = await self._api.balance()
+        positions = await self._read_positions()
+        return balance, available, positions, await self._api.open_orders()
 
     async def _read_positions(self, max_age: float = 0.0) -> list[Any]:
         fresh = self._positions_at is not None and time.monotonic() - self._positions_at <= max_age
@@ -826,17 +846,17 @@ class Trader:
                 self.macro = MacroDesk(store, rules, STRATEGY_IDS)
             except RulesError as exc:
                 say(f"Macro Strategist отключён: {exc}")
-        self.risk_rules: RulesConfig | None = None
-        if config.risk_mode == "kairos" or config.risk_shadow:
-            try:
-                rules.check_risk()
-                self.risk_rules = rules
-            except RulesError as exc:
-                say(
-                    f"Risk Manager недоступен: {exc}"
-                    + (" Входы в режиме kairos будут пропускаться." if config.risk_mode == "kairos" else "")
-                )
-        self._rules_revisions = rules_revisions(rules) if (self.macro or self.risk_rules) else {}
+        self._rules_revisions = rules_revisions(rules) if self.macro else {}
+        # Every entry is decided by the Kairos Risk Manager; without it nothing is opened.
+        self.risk: RiskConfig | None = RiskConfig()
+        self._risk_revisions: dict[str, str] = {}
+        try:
+            self.risk.check()
+            self._risk_revisions = risk_revisions(self.risk)
+        except RiskError as exc:
+            self.risk = None
+            say(f"Risk Manager недоступен, новых входов не будет: {exc}")
+        self._reviews: dict[str, Any] = {}
         self.news: NewsDesk | None = None
         if config.use_text_scouts:
             desk = NewsDesk(store)
@@ -924,17 +944,21 @@ class Trader:
             }
         return view
 
-    async def _risk_account(self) -> dict[str, Any]:
-        equity, available = await self.broker.equity(), await self.broker.available()
+    def _day_equity(self, equity: Decimal) -> dict[str, Any]:
+        """Today's start and peak equity, kept in the state file."""
         day = self._day()
         if not day.get("start_equity"):
             day["start_equity"] = str(equity)
         day["peak_equity"] = str(max(equity, dec(day.get("peak_equity") or equity)))
+        return day
+
+    async def _account_view(self) -> dict[str, Any]:
+        """The account as the Macro Strategist's prompt sees it."""
+        equity, available = await self.broker.equity(), await self.broker.available()
+        day = self._day_equity(equity)
         return {
             "equity_usd": float(equity),
             "available_usd": float(available),
-            "day_start_equity_usd": float(dec(day["start_equity"])),
-            "peak_equity_usd": float(dec(day["peak_equity"])),
             "daily_realized_pnl_usd": float(dec(day.get("realized_usd", "0"))),
             "positions": [
                 {
@@ -943,82 +967,107 @@ class Trader:
                     "quantity": float(dec(t["quantity"])),
                     "entry_price": float(dec(t["entry_price"])),
                     "stop": float(dec(t["stop"])),
-                    "strategy_id": t["candidate"].get("setup"),
+                    "strategy_id": t.get("strategy_id"),
                 }
                 for t in self.trades()
             ],
         }
 
-    def _risk_item(self, candidate: Routed, book: Book, stop: Any = None, take: Any = None) -> dict:
-        depth = book.ask_qty * book.ask if candidate.side == "LONG" else book.bid_qty * book.bid
+    @staticmethod
+    def _lineage(trade: dict[str, Any] | None) -> dict[str, Any] | None:
+        """What the Risk Manager needs to know about the trade behind a position, if it has it."""
+        if not trade or not trade.get("risk_decision_id"):
+            return None  # opened before entries were decided by the Risk Manager
         return {
-            "id": candidate.id,
-            "symbol": candidate.instrument,
-            "side": candidate.side,
-            "strategy_id": candidate.setup,
-            "stop": float(stop if stop is not None else candidate.stop),
-            "take": float(take if take is not None else candidate.take),
-            "bid": float(book.bid),
-            "ask": float(book.ask),
-            "depth_usd": float(depth),
-            "slippage_bps": self.config.slippage_fraction * 1e4,
-            "taker_fee_bps": float(self.fee) * 1e4,
+            key: trade[key]
+            for key in (
+                "stop",
+                "take",
+                "max_holding_ms",
+                "strategy_id",
+                "strategy_revision",
+                "intent_id",
+                "risk_decision_id",
+                "risk_trade_id",
+                "first_fill_ms",
+            )
+        } | {"entry_order_id": trade["id"]}
+
+    async def _account_evidence(self) -> dict[str, Any]:
+        """The account as the venue and the runner's ledger show it now, for the Risk Manager."""
+        captured = int(time.time() * 1000)
+        balance, available, positions, orders = await self.broker.account_reads()
+        books = {p.instrument: await self.api.book(p.instrument) for p in positions}
+        trades = {t["symbol"]: t for t in self.trades()}
+        day = self._day_equity(balance)
+        state = self.store.state
+        state["reconciliation_seq"] = int(state.get("reconciliation_seq", 0)) + 1
+        return {
+            "source_id": self.broker.account_source,
+            "account_id": self.broker.account_id,
+            "captured_at_ms": captured,
+            "balance_usd": float(balance),
+            "available_usd": float(available),
+            "day_start_equity_usd": float(dec(day["start_equity"])),
+            "peak_equity_usd": float(dec(day["peak_equity"])),
+            "daily_realized_pnl_usd": float(dec(day.get("realized_usd", "0"))),
+            "reconciliation_seq": state["reconciliation_seq"],
+            "pending_entry": bool(state.get("pending_entry")),
+            "open_orders": [{"instrument": o.get("instrument"), "id": o.get("id")} for o in orders],
+            "positions": [
+                {
+                    "venue_symbol": p.instrument,
+                    "side": "LONG" if p.side == "BUY" else "SHORT",
+                    "quantity": float(p.quantity),
+                    "entry_price": float(p.avg_price),
+                    "mark_price": float((books[p.instrument].bid + books[p.instrument].ask) / 2),
+                    "stop_order_id": p.stop_id,
+                    "trade": self._lineage(trades.get(p.instrument)),
+                }
+                for p in positions
+            ],
         }
 
-    async def _risk_decisions(self, items: list[dict[str, Any]], now_ms: int) -> dict[str, dict[str, Any]]:
-        """The Risk Manager's verdict per candidate id. Raises ``RulesError`` when it cannot be asked."""
-        if self.risk_rules is None:
-            raise RulesError("Risk Manager is not available")
-        now_ms = int(time.time() * 1000)  # judged at this moment, never before the allocation it uses
-        result = await risk_review(
-            self.risk_rules,
-            candidates=items,
-            account=await self._risk_account(),
-            allocation=self.macro.allocation() if self.macro else None,
-            now_ms=now_ms,
-        )
-        decisions = {d["id"]: d for d in result["decisions"]}
-        self.store.journal(
-            "risk_review",
-            revisions=self._rules_revisions,
-            limits=result.get("limits"),
-            regime=(self.macro.allocation() or {}).get("regime") if self.macro else None,
-            decisions=[
-                {
-                    k: d.get(k)
-                    for k in (
-                        "id",
-                        "approved",
-                        "rejection_reasons",
-                        "quantity",
-                        "notional_usd",
-                        "loss_budget_usd",
-                        "worst_case_loss_usd",
-                    )
-                }
-                for d in decisions.values()
-            ],
-        )
-        return decisions
-
-    async def risk_shadow(self, candidates: list[Routed], now_ms: int) -> None:
-        """Record what the Risk Manager says about every candidate. Never affects trading."""
-        if self.risk_rules is None or not self.config.risk_shadow or not candidates:
-            return
-        try:
-            books = await asyncio.gather(*(self.api.book(c.instrument) for c in candidates))
-            await self._risk_decisions(
-                [self._risk_item(c, b) for c, b in zip(candidates, books, strict=False)], now_ms
-            )
-        except (TimeoutError, RulesError, EvedexError, aiohttp.ClientError, OSError) as exc:
-            self.store.journal("risk_error", kind=type(exc).__name__, message=str(exc)[:300])
+    def _risk_scope(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The frozen scope inputs and limits of LiveRiskEvaluator, from this configuration."""
+        config = self.config
+        capital = float(config.capital_basis_usd)
+        position_cap = capital / int(config.max_open_positions)
+        limits = {
+            "per_trade_risk_fraction": PER_TRADE_RISK_FRACTION,
+            "aggregate_open_risk_fraction": AGGREGATE_OPEN_RISK_FRACTION,
+            "max_leverage": 1.0,
+            "per_trade_dollar_cap_usd": float(config.risk_per_trade_usd),
+            "aggregate_dollar_cap_usd": capital,
+            "daily_loss_cap_usd": float(config.session_loss_stop_usd),
+            "max_account_equity_usd": float(config.max_account_equity_usd),
+            "max_position_notional_usd": round(position_cap, 2),
+            "min_notional_usd": MIN_NOTIONAL_USD,
+        }
+        scope = {
+            "instruments": list(config.symbols),
+            "account_id": self.broker.account_id,
+            "context": {
+                "composer": "kairos-autotrader",
+                "venue": "EVEDEX",
+                "profile": "PROD",
+                "mode": self.broker.mode,
+            },
+            "sources": {
+                **self._signal_revisions,
+                **self._risk_revisions,
+                **getattr(self, "_aggregator_revisions", {}),
+            },
+            "policy": {"limits": limits, "symbols": list(config.symbols), "reward_risk": config.reward_risk},
+        }
+        return scope, limits
 
     async def macro_tick(self, features: list[Features], now_ms: int) -> None:
         """Ask the Macro Strategist if an allocation is due. Its failures never reach the trading loop."""
         if self.macro is None or not features:
             return
         try:
-            account = await self._risk_account()
+            account = await self._account_view()
             allocation = await self.macro.refresh(
                 self.session,
                 openai_key=self.openai_key,
@@ -1436,6 +1485,7 @@ class Trader:
                 problems=[str(exc)[:200]],
             )
         reviews = result.records
+        self._reviews = dict(result.contracts)
         self.store.journal(
             "aggregator_review",
             revisions=self._aggregator_revisions,
@@ -1464,6 +1514,10 @@ class Trader:
                 for r in reviews
             ],
         )
+
+    def _review_of(self, candidate: Routed) -> Any:
+        """The Aggregator's CandidateReviewV1 of this candidate in the current scan, or None."""
+        return self._reviews.get(candidate.id)
 
     async def try_enter(self, candidate: Routed, decision: brain.Decision) -> None:
         trades = self.trades()
@@ -1495,43 +1549,51 @@ class Trader:
             reason = f"price moved {drift:.6g} since the signal bar, more than allowed"
         elif not (stop < ref < take if candidate.side == "LONG" else take < ref < stop):
             reason = "market is already beyond the stop or the take"
-        quantity = None
-        if reason is None:
-            capital = Decimal(str(self.config.capital_basis_usd))
-            quantity, reason = size_position(
-                side=candidate.side,
-                book=book,
-                stop=stop,
-                instrument=instrument,
-                risk_usd=Decimal(str(self.config.risk_per_trade_usd)),
-                max_notional=capital / int(self.config.max_open_positions),
-                available=await self.broker.available(),
-                fee=self.fee,
-                slippage=Decimal(str(self.config.slippage_fraction)),
-            )
-        if quantity is not None and self.config.risk_mode == "kairos":
-            # The Kairos Risk Manager must approve, and it can only make the position smaller.
+        quantity: Decimal | None = None
+        risk_decision = None
+        review = self._review_of(candidate)
+        if reason is None and review is None:
+            reason = "the Aggregator has not reviewed this candidate"
+        elif reason is None and self.risk is None:
+            reason = "the Risk Manager is not available"
+        if reason is None and self.risk is not None:
+            scope, limits = self._risk_scope()
+            allocation = self.macro.allocation() if self.macro else None
             try:
-                verdict = (
-                    await self._risk_decisions([self._risk_item(candidate, book, stop, take)], now_ms)
-                )[candidate.id]
-            except (RulesError, OSError) as exc:
-                verdict = {
-                    "approved": False,
-                    "rejection_reasons": [f"risk_manager_unavailable: {str(exc)[:80]}"],
-                }
-            if not verdict["approved"]:
-                quantity, reason = None, "Risk Manager: " + ", ".join(verdict["rejection_reasons"])
-            else:
-                allowed = floor_step(dec(repr(verdict["quantity"])), instrument.quantity_step)
-                quantity = min(quantity, allowed)
-                minimum = max(
-                    instrument.min_quantity,
-                    ceil_step(instrument.min_volume * Decimal("1.03") / ref, instrument.quantity_step),
+                outcome = await evaluate_entry(
+                    self.risk,
+                    review=review,
+                    allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
+                    account=await self._account_evidence(),
+                    scope=scope,
+                    limits=limits,
+                    taker_fee_bps=float(self.fee) * 1e4,
+                    assessed_notional_usd=limits["max_position_notional_usd"],
                 )
-                if quantity < minimum:
-                    quantity, reason = None, "Risk Manager size is below the instrument's minimum lot"
-        if quantity is None:
+            except (RiskError, EvedexError, TimeoutError, aiohttp.ClientError, OSError) as exc:
+                reason = f"the Risk Manager could not decide ({type(exc).__name__}: {str(exc)[:120]})"
+            else:
+                self.store.journal("risk_decision", candidate=candidate.id, **outcome.record)
+                if not outcome.approved:
+                    reason = "Risk Manager: " + ", ".join(outcome.reasons)
+                else:
+                    risk_decision = outcome.decision
+                    # The Risk Manager's quantity, down to the venue's lot: never more.
+                    book = await self.api.book(candidate.instrument)
+                    ref = book.ask if candidate.side == "LONG" else book.bid
+                    quantity = floor_step(outcome.quantity, instrument.quantity_step)
+                    step = instrument.quantity_step
+                    minimum = max(
+                        instrument.min_quantity,
+                        ceil_step(instrument.min_volume * Decimal("1.03") / ref, step),
+                    )
+                    if quantity < minimum:
+                        reason = (
+                            f"the Risk Manager's size {outcome.quantity} is below "
+                            f"the instrument's minimum lot {minimum}"
+                        )
+                        quantity = None
+        if quantity is None or risk_decision is None:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=reason)
             say(f"Вход пропущен ({candidate.instrument} {candidate.side}): {reason}")
             return
@@ -1560,6 +1622,14 @@ class Trader:
             "decision": decision.as_dict(),
             # Alone for its whole life: the balance change is exactly this trade's result.
             "solo": not trades,
+            # Lineage for the Risk Manager's account evidence while the position is open.
+            "intent_id": candidate.id,
+            "strategy_id": candidate.intent.strategy_id,
+            "strategy_revision": candidate.intent.strategy_revision,
+            "risk_decision_id": risk_decision.decision_id,
+            "risk_trade_id": risk_decision.trade_id,
+            "first_fill_ms": now_ms,
+            "max_holding_ms": candidate.intent.exit_plan.max_holding_ms,
         }
         for other in trades:
             other["solo"] = False
@@ -1735,9 +1805,8 @@ class Trader:
             say(f"Скан: {len(features)} инструментов, новых сигналов нет. Открыто позиций: {len(trades)}.")
             return
         say("Скан: сигналы — " + ", ".join(f"{c.instrument} {c.side} {c.setup}" for c in eligible))
-        decision, _ = await asyncio.gather(
-            self.decide(features, eligible, free), self.risk_shadow(eligible, now_ms)
-        )
+        self._reviews = {}
+        decision = await self.decide(features, eligible, free)
         say(
             f"Решение ({decision.source}): {decision.action} {', '.join(decision.picks)} "
             f"— {decision.reason[:200]}"

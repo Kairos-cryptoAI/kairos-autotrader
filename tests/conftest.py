@@ -21,3 +21,11 @@ def no_signal_chain_by_default(monkeypatch):
             raise system_engine.EngineError("tests do not start sibling processes by default")
 
     monkeypatch.setattr(engine, "EngineConfig", Absent)
+
+
+@pytest.fixture
+def risk_approves(monkeypatch):
+    """The Risk Manager approves every reviewed entry with a loss-at-stop size."""
+    from support import approve_entries
+
+    return approve_entries(monkeypatch)

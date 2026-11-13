@@ -380,10 +380,15 @@ async def cmd_report(args: argparse.Namespace) -> int:
     by_risk: dict[bool, set[str]] = {True: set(), False: set()}
     refusals: Counter = Counter()
     for record in records:
-        if record["event"] == "risk_review":
+        if record["event"] == "risk_review":  # versions before 0.7.0: shadow verdicts
             for verdict in record.get("decisions", []):
                 by_risk[bool(verdict.get("approved"))].add(verdict["id"])
                 refusals.update(verdict.get("rejection_reasons") or [])
+        elif record["event"] == "risk_decision":  # the Risk Manager's decision on an entry
+            by_risk[bool(record.get("approved"))].add(record["candidate"])
+            refusals.update(
+                record.get("rejection_reasons") or ([record["refused"]] if "refused" in record else [])
+            )
     if by_risk[True] or by_risk[False]:
         line("Risk Manager одобрил", by_risk[True] - by_risk[False])
         line("Risk Manager отклонил", by_risk[False])

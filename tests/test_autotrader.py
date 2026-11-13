@@ -30,7 +30,6 @@ from kairos_autotrader.engine import (
     PaperBroker,
     Store,
     Trader,
-    size_position,
     software_exit,
 )
 from kairos_autotrader.evedex import (
@@ -54,6 +53,9 @@ LINK = Instrument("LINKUSD", Decimal("0.1"), Decimal("0.1"), Decimal("0.001"), D
 SOL = Instrument("SOLUSD", Decimal("0.1"), Decimal("0.1"), Decimal("0.01"), Decimal("5"), True)
 BTC = Instrument("BTCUSD", Decimal("0.001"), Decimal("0.001"), Decimal("0.1"), Decimal("5"), True)
 FEE = Decimal("0.00045")
+
+# Entries are decided by the Risk Manager; here a stand-in approves with a loss-at-stop size.
+pytestmark = pytest.mark.usefixtures("risk_approves")
 
 
 def now_ms() -> int:
@@ -118,59 +120,7 @@ def test_hard_ceilings_cannot_be_configured_away(field, value):
         config.validate()
 
 
-# ---- sizing and exits ---------------------------------------------------------
-
-
-def test_sizing_keeps_stop_loss_within_risk():
-    book = Book(now_ms(), Decimal("82.33"), Decimal("82.35"))
-    quantity, why = size_position(
-        side="LONG",
-        book=book,
-        stop=Decimal("81.50"),
-        instrument=SOL,
-        risk_usd=Decimal("0.25"),
-        max_notional=Decimal(100),
-        available=Decimal(109),
-        fee=FEE,
-        slippage=Decimal("0.0002"),
-    )
-    assert why == "ok" and quantity == Decimal("0.2")
-    worst = quantity * (Decimal("82.35") - Decimal("81.50")) + quantity * Decimal("82.35") * 2 * (
-        FEE + Decimal("0.0002")
-    )
-    assert worst <= Decimal("0.25")
-
-
-def test_sizing_refuses_when_minimum_lot_is_too_risky():
-    book = Book(now_ms(), Decimal("73340"), Decimal("73344"))
-    quantity, why = size_position(
-        side="LONG",
-        book=book,
-        stop=Decimal("72600"),
-        instrument=BTC,
-        risk_usd=Decimal("0.25"),
-        max_notional=Decimal(100),
-        available=Decimal(109),
-        fee=FEE,
-        slippage=Decimal("0.0002"),
-    )
-    assert quantity is None and "minimum lot" in why
-
-
-def test_sizing_refuses_stop_on_wrong_side():
-    book = Book(now_ms(), Decimal("82.33"), Decimal("82.35"))
-    quantity, _ = size_position(
-        side="SHORT",
-        book=book,
-        stop=Decimal("81.50"),
-        instrument=SOL,
-        risk_usd=Decimal("0.25"),
-        max_notional=Decimal(100),
-        available=Decimal(109),
-        fee=FEE,
-        slippage=Decimal("0.0002"),
-    )
-    assert quantity is None
+# ---- exits ---------------------------------------------------------
 
 
 def test_software_exit_rules():

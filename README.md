@@ -27,7 +27,7 @@ exchanges JSON with the runner ([`kairos_autotrader/sibling.py`](kairos_autotrad
 | 2 Router | `kairos-router` | `SignalWindow` text aggregation, `CandidateRouterPolicy.build` → `CandidateRouteV1` (tier, review deadline, exact evidence ids) | live: every candidate is routed; a rejected one is dropped |
 | 3 Aggregator | `kairos-aggregator` | `CandidateContextStore` → `DecisionContextV1`, `CandidateReviewBrain.review_with_context` → `CandidateReviewV1`, model calls through `kairos-llm`'s `BudgetedLLMGateway` | shadow by default (`review_mode`) |
 | 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: one allocation a day |
-| 5 Risk Manager | `kairos-risk-manager` | `RiskSettings` limits, allocation gate, loss-at-stop sizing, economics | shadow by default (`risk_mode`) |
+| 5 Risk Manager | `kairos-risk-manager` | `LiveRiskEvaluator`: every admission gate, the sizing and the `RiskTradeDecisionV1`, on a PROD `VenueQualityV1` measured by Quant Scouts' `build_venue_quality` just before the decision | live: decides every entry; the runner trades its quantity or less |
 | Strategy Engine | `kairos-strategy-engine` | `kairos_strategy.hourly_trend` through its strict adapter: closed Binance bars in, `StrategyIntentV1` out, pinned by the package's own source identity; registered sleeve generators | live: every candidate comes from it; registered sleeves in shadow only (`shadow`, `engine-replay`) |
 
 Owned by the runner itself:
@@ -66,11 +66,18 @@ These are tracked, not hidden. See
   built from REST data, so its liquidation totals stay at zero. There is no
   `VenueQualityV1`; the entry check bounds the distance between the EVEDEX price and the
   Binance reference instead.
-- The Risk Manager's account gate is re-stated with the same formulas and settings; the
-  original needs an `AccountSnapshotV2` that only a PAPER DEV account produces.
-- With the default `risk_mode="autotrader"` an entry does not require Risk Manager
-  approval. `CONTRIBUTING.md` in the meta-repository forbids bypassing Risk validation;
-  `risk_mode="kairos"` restores it and is the intended end state.
+- `LiveRiskEvaluator` needs a registered account verifier and input verifier; the
+  Risk Manager ships none. The runner registers its own (`risk_worker.py`): the account
+  evidence is what it read from EVEDEX with its session plus its trade ledger, and the
+  trust boundary is the runner process. In paper mode the evidence is the paper ledger,
+  so the decision's LIVE/PROD labels describe the evaluated policy, not a real account.
+- The evaluator runs with `require_instrument_rules=False`: the intent's exit prices are
+  Binance prices and are not on EVEDEX's price tick, which the authenticated-rules mode
+  rejects. The runner floors the quantity to the venue's lot and refuses a size below
+  the minimum lot instead.
+- Only instruments in Quant Scouts' PROD symbol map (BTC, ETH, SOL, BNB, XRP) can be
+  measured for `VenueQualityV1`, so only they can be traded; signals on the other
+  configured instruments are recorded and refused.
 - State is two files, not the transactional inbox/outbox and execution journal.
 - The candidate rules are an isolated research package of the Strategy Engine, not a
   registered or promoted sleeve.

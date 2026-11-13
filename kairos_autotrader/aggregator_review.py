@@ -97,6 +97,8 @@ def _record(candidate: Routed, review: CandidateReviewV1, context: dict[str, Any
 class Reviews:
     records: list[dict[str, Any]]
     ingest_problems: list[str]
+    # The validated CandidateReviewV1 per intent id; the Risk Manager decides on it.
+    contracts: dict[str, CandidateReviewV1] = field(default_factory=dict)
 
 
 async def review_candidates(
@@ -141,7 +143,7 @@ async def review_candidates(
     by_id = {candidate.id: candidate for candidate in candidates}
     if not isinstance(rows, list) or sorted(str(r.get("intent_id")) for r in rows) != sorted(by_id):
         raise AggregatorError("Aggregator worker did not answer for exactly the candidates it was given")
-    records = []
+    records, contracts = [], {}
     for row in rows:
         candidate = by_id[str(row["intent_id"])]
         try:
@@ -151,7 +153,8 @@ async def review_candidates(
         if review.route.route_id != candidate.route.route_id or review.intent.intent_id != candidate.id:
             raise AggregatorError("a review belongs to another route than the one that was sent")
         records.append(_record(candidate, review, row.get("context")))
-    return Reviews(records, [str(problem) for problem in answer.get("ingest_problems", [])])
+        contracts[candidate.id] = review
+    return Reviews(records, [str(problem) for problem in answer.get("ingest_problems", [])], contracts)
 
 
 def allowed_in_order(reviews: list[dict[str, Any]], candidates: list[Routed], max_picks: int) -> list[str]:

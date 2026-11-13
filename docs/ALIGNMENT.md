@@ -30,7 +30,7 @@ What rejects a real venue today is service configuration, not the contracts:
 | `kairos-router` (`a373e62`) | `SignalWindow` and `CandidateRouterPolicy.build` with `RouterSettings` defaults: every candidate is a real `CandidateRouteV1` | the symbol bucketing of text and the time checks of `RouterService._candidate_rejection` are restated in `router_worker.py` (the pinned service refuses LIVE by configuration) | the service path once LIVE routing exists upstream |
 | `kairos-aggregator` (`34963c2`, branch `bounded-review-prompt-20261113`) | `CandidateContextStore` freezes the `DecisionContextV1`, `CandidateReviewBrain.review_with_context` reviews it and returns the `CandidateReviewV1`; `compile_decision_context` bounds a long input declaration in the prompt | the review runs in a worker per scan, not in `CandidateReviewService` on the bus: receipt clocks of cached bars are the worker's, as after a service restart | the service once the runner publishes to the bus |
 | `kairos-macro-strategist` (`1f0d262`) | prompt, `build_macro_context`, `AllocationOutput`, defensive fallback, `ShockDetector` | regime hint re-stated (bound method of the service); scheduling is the runner's | unchanged apart from the gateway |
-| `kairos-risk-manager` (`d8c031e`) | `RiskSettings`, `_allocation_gate`, `_size_quantity`, `_economics`, `_position_stop_risk` of the PAPER pipeline | account gate re-stated; `kairos_risk/live.py` (`LiveRiskEvaluator`, the pure LIVE evaluation with injected account and input verifiers) is **not used** | `LiveRiskEvaluator.evaluate` with verifiers backed by the runner's account reads |
+| `kairos-risk-manager` (`d8c031e`) | `LiveRiskEvaluator.evaluate` decides every entry: review, Macro allocation, venue quality, account and daily limits, sizing, `RiskTradeDecisionV1` | the account and input verifiers are the runner's (`risk_worker.py`); `require_instrument_rules=False` because the intent's exit prices are not on the EVEDEX tick | a verifier owned by the system, and exit prices on the execution venue's tick |
 | `kairos-llm` (`d91566b`) | the Aggregator review calls `BudgetedLLMGateway.complete` with the architecture-owned workload routes (`gpt-6-luna` medium, `gpt-6.1-sol` high on CONFLICT) and the registered price table | the budget is `FileUsageBudget` in `aggregator_worker.py`, a JSON ledger per runtime directory in place of the Postgres ledger; `brain.ask_llm`, `text_scouts.model_extract` and the Macro call still call the provider directly | the other three calls through the gateway |
 | `kairos-execution-engine` (`1e8afe6`) | nothing; `evedex.py` signing is fixture-tested against the same pinned SDK | whole order path: `evedex.py`, `engine.LiveBroker`, file state | API-key order transport contributed as an adapter; the runner keeps only orchestration |
 | `kairos-persistence` (`506628f`) | nothing | `engine.Store` (state file and journal) | durable journal for venue effects |
@@ -40,12 +40,10 @@ What rejects a real venue today is service configuration, not the contracts:
 
 ## Rules of `CONTRIBUTING.md` the runner does not meet yet
 
-1. *Do not bypass Risk Manager validation.* With `risk_mode="autotrader"` (the default) an
-   entry is sized by `engine.size_position` alone. `risk_mode="kairos"` requires Risk
-   approval; it becomes the default once `LiveRiskEvaluator` replaces the re-stated gate.
+1. *Do not bypass Risk Manager validation.* Met from 0.7.0: no entry without an approved
+   `RiskTradeDecisionV1`, and the runner trades its quantity or less.
 2. *Do not copy a `kairos-core` message definition into a service.* Nothing is copied.
-   Intent, route, context and review are the contracts themselves; a local shape still
-   stands in for the risk decision (see the table).
+   Intent, route, context, review and risk decision are the contracts themselves.
 3. *External venue mutations must be prepared in the execution journal before submission.*
    `LiveBroker.enter` records `pending_entry` in the state file first, which serves the
    same purpose for one process but is not the execution journal.
@@ -114,8 +112,28 @@ Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers af
      the bus; three other model calls do not use the gateway; in 30 live scans before 2b
      the Aggregator's prompt answered ALLOW 3, VETO 15 and DEFER 90 times, so making it
      the deciding reviewer (`review_mode="aggregator"`) would cut the number of trades.
-3. **Risk.** `LiveRiskEvaluator` with account and instrument verifiers; the re-stated
-   account gate in `system_rules_worker.py` and `engine.size_position` are deleted.
+3. **Risk.** Done 2026-11-13: every entry is `LiveRiskEvaluator.evaluate` on the
+   Aggregator's `CandidateReviewV1`, the Macro allocation, a PROD `VenueQualityV1` measured
+   by Quant Scouts' code just before the decision, and account evidence; the runner trades
+   the decision's quantity floored to the venue lot, or nothing. Deleted:
+   `engine.size_position`, the re-stated account gate and sizing in
+   `system_rules_worker.py`, the shadow risk review, `risk_mode` and `risk_shadow`. The
+   Macro Strategist now allocates to `hourly_trend_candidates_v1` itself, and the
+   Aggregator review is the deciding reviewer by default, because the evaluator admits
+   only an ALLOW `CandidateReviewV1`. Found on the way:
+   - the scope's account id was first taken from the evidence, so a foreign account could
+     not be told apart; it is now the runner's own account;
+   - Quant Scouts' PROD symbol map has five symbols; HYPE, DOGE, LINK, SUI, AAVE and ZEC
+     cannot get a venue measurement and so cannot be traded;
+   - the exit prices of an intent are Binance prices, off the EVEDEX tick, so the
+     authenticated instrument-rules mode cannot be used yet.
+   Checked on live public data, paper ledger, local model stand-in and a stated test
+   allocation (BEAR, weight for the strategy): at the 2026-11-13 15:45 UTC decision four
+   candidates were ALLOWed by the stand-in; the Risk Manager refused AAVE and ZEC (outside
+   the PROD map) and approved XRP short with 7.264 XRP, worst-case loss 0.25 USD, on a
+   venue measurement with basis -3.0 bps and a book 0.5 s old; the runner entered 7.2 XRP
+   (lot step 0.1) 43 s after the boundary. Each decision took 1.3-2.6 s. Tests run the real
+   evaluator offline on synthetic books for the approval and sixteen refusal cases.
 4. **Execution.** The runner executes a `RiskTradeDecisionV1`; the API-key transport is
    proposed to `kairos-execution-engine`.
 5. **State.** The execution journal replaces `pending_entry`.

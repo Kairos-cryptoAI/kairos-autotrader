@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kairos-autotrader"
-version = "0.6.0"
+version = "0.7.0"
 description = "Kairos live runner — one process that runs the Kairos layers on EVEDEX with real orders."
 readme = "README.md"
 license = { text = "MIT" }

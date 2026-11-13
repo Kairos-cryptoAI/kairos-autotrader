@@ -1,4 +1,4 @@
-"""Bridge to the real Kairos Macro Strategist and Risk Manager.
+"""Bridge to the real Kairos Macro Strategist.
 
 Macro: once a day, and again after a price crash, a model is asked with the Macro
 Strategist's own prompt for a strategic allocation: market regime (BULL, BEAR or CHOP),
@@ -6,10 +6,8 @@ the share of capital kept in reserve, a weight per strategy and a leverage ceili
 answer is checked by the Macro Strategist's own schema; anything broken becomes its
 defensive allocation (CHOP, everything in reserve), which permits no new trades.
 
-Risk: every candidate is put through the Risk Manager's rules: regime vetoes and strategy
-weight from the allocation, total open risk, daily drawdown, loss-at-stop sizing.
-
-Neither can change a candidate's side or exits, and neither places orders.
+The allocation cannot change a candidate's side or exits and places no orders; the Risk
+Manager (``risk.py``) applies it to every entry.
 """
 
 from __future__ import annotations
@@ -51,8 +49,6 @@ class RulesConfig:
     macro_source: Path = field(default_factory=lambda: sibling_checkout("kairos-macro-strategist"))
     llm_source: Path = field(default_factory=lambda: sibling_checkout("kairos-llm"))
     core_source: Path = field(default_factory=lambda: sibling_checkout("kairos-core"))
-    risk_python: Path = field(default_factory=lambda: sibling_python("kairos-risk-manager"))
-    risk_source: Path = field(default_factory=lambda: sibling_checkout("kairos-risk-manager"))
     timeout_s: float = 60.0
 
     def check_macro(self) -> None:
@@ -65,24 +61,17 @@ class RulesConfig:
             if not path.exists():
                 raise RulesError(f"Macro Strategist part not found: {path}")
 
-    def check_risk(self) -> None:
-        for path in (self.risk_python, self.risk_source / "kairos_risk" / "paper.py"):
-            if not path.exists():
-                raise RulesError(f"Risk Manager part not found: {path}")
-
 
 def revisions(config: RulesConfig) -> dict[str, str]:
-    return {"macro": git_revision(config.macro_source), "risk": git_revision(config.risk_source)}
+    return {"macro": git_revision(config.macro_source)}
 
 
 def _run_worker(config: RulesConfig, kind: str, request: dict[str, Any]) -> dict[str, Any]:
-    if kind == "macro":
-        python = config.macro_python
-        arguments = ["macro", str(config.macro_source), str(config.core_source), str(config.llm_source)]
-    else:
-        python, arguments = config.risk_python, ["risk", str(config.risk_source)]
+    if kind != "macro":
+        raise RulesError(f"unknown rules worker {kind!r}")
+    arguments = ["macro", str(config.macro_source), str(config.core_source), str(config.llm_source)]
     try:
-        return run_worker(python, WORKER, arguments, request, timeout_s=config.timeout_s)
+        return run_worker(config.macro_python, WORKER, arguments, request, timeout_s=config.timeout_s)
     except SiblingError as exc:
         raise RulesError(f"{kind}: {exc}") from exc
 
@@ -172,7 +161,12 @@ class MacroDesk:
             "market_values": market,
             "changes_1h_pct": {s: v["change_1h_pct"] for s, v in market.items() if "change_1h_pct" in v},
         }
-        due = not state.get("allocation") or now_ms - state.get("last_run_ms", 0) >= DAY_MS
+        due = (
+            not state.get("allocation")
+            or now_ms - state.get("last_run_ms", 0) >= DAY_MS
+            # An allocation made for other strategy ids gives the current one no capital.
+            or state.get("allocation_strategy_ids") != list(self.strategy_ids)
+        )
         trigger = {"kind": "schedule"} if due else None
         # The shock check needs the detector, so the prepare call is made either way; it is local and cheap.
         request["trigger"] = trigger or {}
@@ -211,6 +205,7 @@ class MacroDesk:
         allocation = checked["allocation"]
         state["allocation"] = allocation
         state["allocation_received_ms"] = int(time.time() * 1000)
+        state["allocation_strategy_ids"] = list(self.strategy_ids)
         self.store.save()
         self.store.journal(
             "macro_allocation",
@@ -222,29 +217,3 @@ class MacroDesk:
             problem=problem,
         )
         return allocation
-
-
-async def risk_review(
-    config: RulesConfig,
-    *,
-    candidates: list[dict[str, Any]],
-    account: dict[str, Any],
-    allocation: dict[str, Any] | None,
-    now_ms: int,
-    runner=_run_worker,
-) -> dict[str, Any]:
-    """The Risk Manager's decision for each candidate. Raises ``RulesError`` if the worker fails."""
-    if not candidates:
-        return {"decisions": []}
-    return await asyncio.to_thread(
-        runner,
-        config,
-        "risk",
-        {
-            "op": "evaluate",
-            "now_ms": now_ms,
-            "candidates": candidates,
-            "account": account,
-            "allocation": allocation,
-        },
-    )

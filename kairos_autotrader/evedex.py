@@ -171,6 +171,7 @@ class Position:
     quantity: Decimal
     avg_price: Decimal
     has_stop: bool = False  # an active stop-loss is attached on the venue
+    stop_id: str | None = None  # the venue's identity of that stop-loss
 
 
 class OrderSigner:
@@ -459,12 +460,15 @@ class Evedex:
             if quantity != 0:
                 tpsl_rows = row.get("tpslList")
                 attached = tpsl_rows if isinstance(tpsl_rows, list) else []
-                has_stop = any(
-                    isinstance(item, dict)
+                stops = [
+                    item
+                    for item in attached
+                    if isinstance(item, dict)
                     and item.get("type") == "stop-loss"
                     and item.get("status") in ACTIVE_TPSL
-                    for item in attached
-                )
+                ]
+                has_stop = bool(stops)
+                stop_id = str(stops[0].get("id")) if stops and stops[0].get("id") else None
                 result.append(
                     Position(
                         str(row["instrument"]),
@@ -472,6 +476,7 @@ class Evedex:
                         abs(quantity),
                         dec(row.get("avgPrice", 0)),
                         has_stop,
+                        stop_id,
                     )
                 )
         return result

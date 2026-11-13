@@ -291,3 +291,57 @@ def fake_router(monkeypatch, *, tier: str = "NORMAL", reject: str | None = None,
 
 def fake_parser(monkeypatch) -> None:
     monkeypatch.setattr(binance_bars, "_run_parser", parse_pages)
+
+
+# ---- the Risk Manager in tests of the trading loop ---------------------------------------
+
+
+def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), error=None) -> list[dict]:
+    """Every candidate counts as reviewed, and the Risk Manager's answer is a stand-in.
+
+    Without ``quantity`` the stand-in sizes like a loss-at-stop rule: the per-trade risk
+    over the stop distance plus round-trip costs, capped by the position notional. Returns
+    the list of requests the stand-in received.
+    """
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from kairos_autotrader import engine
+    from kairos_autotrader.risk import RiskError, RiskOutcome
+
+    calls: list[dict] = []
+
+    async def evaluate(config, *, review, allocation, account, scope, limits, taker_fee_bps, **_):
+        calls.append({"review": review, "allocation": allocation, "account": account, "limits": limits})
+        if error is not None:
+            raise RiskError(error)
+        if not approve:
+            record = {"approved": False, "rejection_reasons": list(reasons)}
+            return RiskOutcome(False, Decimal(0), tuple(reasons), None, record)
+        size = quantity
+        if size is None:
+            ref, stop = review.reference_price, review.stop
+            per_unit = abs(ref - stop) + ref * 2 * (taker_fee_bps / 1e4 + 0.0002)
+            size = min(
+                limits["per_trade_dollar_cap_usd"] / per_unit, limits["max_position_notional_usd"] / ref
+            )
+        decision = SimpleNamespace(decision_id="d" * 64, trade_id="e" * 64)
+        record = {"approved": True, "quantity": float(size), "decision_id": "d" * 64}
+        return RiskOutcome(True, Decimal(repr(float(size))), (), decision, record)
+
+    monkeypatch.setattr(engine, "evaluate_entry", evaluate)
+    monkeypatch.setattr(engine.Trader, "_review_of", lambda self, candidate: candidate)
+    monkeypatch.setattr(engine.Trader, "__init__", _with_risk(engine.Trader.__init__))
+    return calls
+
+
+def _with_risk(init):
+    """Give every trader a Risk Manager configuration, as a complete workstation would."""
+
+    def wrapped(self, *args, **kwargs):
+        from kairos_autotrader.risk import RiskConfig
+
+        init(self, *args, **kwargs)
+        self.risk = RiskConfig()
+
+    return wrapped

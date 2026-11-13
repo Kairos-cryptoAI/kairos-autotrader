@@ -1,4 +1,4 @@
-"""Offline tests of the bridge to the real Kairos Macro Strategist and Risk Manager.
+"""Offline tests of the bridge to the real Kairos Macro Strategist.
 
 ``test_real_*`` start the real repository code (no network, no model); they are skipped
 where the checkouts or their environments are absent.
@@ -13,23 +13,16 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from test_autotrader import FakeVenue, candidate, enter, events, live_trader, only
+from test_autotrader import FakeVenue, enter, live_trader, only
 
-from kairos_autotrader import engine, system_rules
+from kairos_autotrader import system_rules
 from kairos_autotrader.engine import Store
 from kairos_autotrader.evedex import Evedex
 from kairos_autotrader.system_rules import MacroDesk, RulesConfig, RulesError
 
+# Entries are decided by the Risk Manager; here a stand-in approves with a loss-at-stop size.
+pytestmark = pytest.mark.usefixtures("risk_approves")
 EQUITY = 109.33
-
-
-def rules(kind: str) -> RulesConfig:
-    config = RulesConfig()
-    try:
-        config.check_macro() if kind == "macro" else config.check_risk()
-    except RulesError:
-        pytest.skip(f"{kind} checkout or environment is not present")
-    return config
 
 
 def allocation(regime="BEAR", *, weights=None, reserve=0.5, leverage=1.0, hours_ago=1.0) -> dict:
@@ -37,118 +30,21 @@ def allocation(regime="BEAR", *, weights=None, reserve=0.5, leverage=1.0, hours_
         "source": "macro-strategist",
         "regime": regime,
         "stable_reserve_pct": reserve,
-        "strategy_weights": {"PULLBACK_RECLAIM": 0.5} if weights is None else weights,
+        "strategy_weights": weights if weights is not None else {"hourly_trend_candidates_v1": 0.5},
         "max_gross_leverage": leverage,
         "triggered_by": "schedule",
         "rationale": "test",
-        "origin": "model",
         "produced_at": (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat(),
     }
 
 
-def item(cid="short", side="SHORT", *, strategy="PULLBACK_RECLAIM", depth=20_000.0, symbol="SOLUSD") -> dict:
-    stop, take = (83.9, 81.65) if side == "SHORT" else (82.1, 84.35)
-    return {
-        "id": cid,
-        "symbol": symbol,
-        "side": side,
-        "strategy_id": strategy,
-        "stop": stop,
-        "take": take,
-        "bid": 83.00,
-        "ask": 83.01,
-        "depth_usd": depth,
-        "slippage_bps": 2.0,
-        "taker_fee_bps": 4.5,
-    }
-
-
-def account(**over) -> dict:
-    base = {
-        "equity_usd": EQUITY,
-        "available_usd": EQUITY,
-        "day_start_equity_usd": EQUITY,
-        "peak_equity_usd": EQUITY,
-        "daily_realized_pnl_usd": 0.0,
-        "positions": [],
-    }
-    base.update(over)
-    return base
-
-
-def risk(config, candidates, alloc, acct=None) -> dict[str, dict]:
-    result = system_rules._run_worker(
-        config,
-        "risk",
-        {
-            "op": "evaluate",
-            "now_ms": int(time.time() * 1000),
-            "candidates": candidates,
-            "account": acct or account(),
-            "allocation": alloc,
-        },
-    )
-    assert result["limits"]["per_trade_risk_fraction"] == 0.0025
-    return {d["id"]: d for d in result["decisions"]}
-
-
-def test_real_risk_manager_sizes_by_loss_at_stop_within_a_quarter_percent_of_equity():
-    config = rules("risk")
-    decision = risk(config, [item()], allocation())["short"]
-    assert decision["approved"] and decision["rejection_reasons"] == []
-    budget = EQUITY * 0.0025
-    assert decision["loss_budget_usd"] == pytest.approx(budget)
-    assert decision["worst_case_loss_usd"] <= budget + 1e-6
-    per_unit = (83.9 - 83.0) + (83.0 + 83.9) * 4.5 / 10_000 + 83.005 * 2.0 / 10_000
-    assert decision["quantity"] == pytest.approx(budget / per_unit, rel=1e-6)
-    assert decision["leverage"] == 1.0 and decision["notional_usd"] < EQUITY * 0.5
-
-
-def test_real_risk_manager_applies_the_macro_regime_and_weight_vetoes():
-    config = rules("risk")
-    bear = risk(
-        config, [item(), item("long", "LONG"), item("orphan", strategy="BREAKOUT")], allocation("BEAR")
-    )
-    assert bear["short"]["approved"]
-    assert bear["long"]["rejection_reasons"] == ["macro_regime_forbids_long"]
-    assert bear["orphan"]["rejection_reasons"] == ["strategy_has_no_macro_allocation"]
-    assert risk(config, [item("long", "LONG")], allocation("BULL"))["long"]["approved"]
-    assert risk(config, [item()], allocation("BULL"))["short"]["rejection_reasons"] == [
-        "macro_regime_forbids_short"
-    ]
-    assert risk(config, [item()], allocation("CHOP"))["short"]["rejection_reasons"] == ["macro_regime_chop"]
-    assert risk(config, [item()], None)["short"]["rejection_reasons"] == ["strategic_allocation_missing"]
-    stale = risk(config, [item()], allocation(hours_ago=30))["short"]
-    assert stale["rejection_reasons"] == ["strategic_allocation_stale"] and stale["quantity"] == 0.0
-
-
-def test_real_risk_manager_account_limits():
-    config = rules("risk")
-    held = {
-        "symbol": "SOLUSD",
-        "side": "SHORT",
-        "quantity": 0.2,
-        "entry_price": 83.0,
-        "stop": 83.9,
-        "strategy_id": "PULLBACK_RECLAIM",
-    }
-    same_symbol = risk(config, [item()], allocation(), account(positions=[held]))["short"]
-    assert "symbol_has_active_position" in same_symbol["rejection_reasons"]
-    heavy = [
-        {**held, "symbol": f"X{i}USD", "quantity": 0.4} for i in range(4)
-    ]  # 4 x 0.36 = 1.44 > 1% of equity
-    assert (
-        "portfolio_open_risk_limit_exhausted"
-        in risk(config, [item()], allocation(), account(positions=heavy))["short"]["rejection_reasons"]
-    )
-    drawdown = risk(config, [item()], allocation(), account(day_start_equity_usd=113.0))["short"]
-    assert drawdown["rejection_reasons"] == ["daily_drawdown_limit_reached"]
-    realized = risk(config, [item()], allocation(), account(daily_realized_pnl_usd=-3.5))["short"]
-    assert realized["rejection_reasons"] == ["daily_drawdown_limit_reached"]
-    thin = risk(config, [item(depth=0.0)], allocation())["short"]
-    assert thin["rejection_reasons"] == ["position_capacity_exhausted"]
-    capped = risk(config, [item()], allocation(weights={"PULLBACK_RECLAIM": 0.05}, reserve=0.95))["short"]
-    assert capped["approved"] and capped["notional_usd"] == pytest.approx(EQUITY * 0.05, rel=1e-6)
+def rules(kind: str) -> RulesConfig:
+    config = RulesConfig()
+    try:
+        config.check_macro()
+    except RulesError:
+        pytest.skip(f"{kind} checkout or environment is not present")
+    return config
 
 
 def macro_request(**over) -> dict:
@@ -316,93 +212,6 @@ def test_macro_runs_once_a_day_and_again_after_a_shock_with_a_cooldown(tmp_path)
     assert journal.count("macro_allocation") == 3
 
 
-def kairos_trader(tmp_path, monkeypatch, verdict):
-    venue = FakeVenue()
-    trader = live_trader(tmp_path, venue, risk_mode="kairos")
-    trader.risk_rules = RulesConfig()
-    asked = []
-
-    async def fake_review(config, *, candidates, account, allocation, now_ms):
-        asked.append((candidates, account))
-        if isinstance(verdict, Exception):
-            raise verdict
-        return {"decisions": [{"id": candidates[0]["id"], **verdict}], "limits": {}}
-
-    monkeypatch.setattr(engine, "risk_review", fake_review)
-    asyncio.run(trader.start())
-    return trader, venue, asked
-
-
-def test_kairos_risk_mode_can_only_shrink_or_refuse_an_entry(tmp_path, monkeypatch):
-    smaller, venue, asked = kairos_trader(
-        tmp_path / "a", monkeypatch, {"approved": True, "rejection_reasons": [], "quantity": 0.1234}
-    )
-    enter(smaller)
-    assert only(smaller)["quantity"] == "0.1", "the Risk Manager's size, floored to the lot step"
-    sent, acct = asked[0]
-    assert sent[0]["strategy_id"] == "PULLBACK_RECLAIM" and sent[0]["stop"] == 81.5
-    assert acct["equity_usd"] == pytest.approx(109.42) and acct["positions"] == []
-    assert "risk_review" in events(smaller)
-
-    larger, venue, _ = kairos_trader(
-        tmp_path / "b", monkeypatch, {"approved": True, "rejection_reasons": [], "quantity": 5.0}
-    )
-    enter(larger)
-    assert only(larger)["quantity"] == "0.2", "never more than this program's own size"
-
-    refused, venue, _ = kairos_trader(
-        tmp_path / "c",
-        monkeypatch,
-        {"approved": False, "rejection_reasons": ["macro_regime_chop"], "quantity": 0.0},
-    )
-    enter(refused)
-    assert only(refused) is None and not venue.market_bodies and "entry_skipped" in events(refused)
-
-    broken, venue, _ = kairos_trader(tmp_path / "d", monkeypatch, RulesError("worker failed"))
-    enter(broken)
-    assert only(broken) is None and not venue.market_bodies, "no Risk Manager answer means no entry"
-
-    tiny, venue, _ = kairos_trader(
-        tmp_path / "e", monkeypatch, {"approved": True, "rejection_reasons": [], "quantity": 0.04}
-    )
-    enter(tiny)
-    assert only(tiny) is None and not venue.market_bodies, "below the instrument's minimum lot"
-
-
-def test_shadow_risk_review_is_recorded_and_never_blocks(tmp_path, monkeypatch):
-    venue = FakeVenue()
-    trader = live_trader(tmp_path, venue)
-    trader.risk_rules = RulesConfig()
-
-    async def refuse(config, *, candidates, account, allocation, now_ms):
-        return {
-            "decisions": [
-                {
-                    "id": c["id"],
-                    "approved": False,
-                    "rejection_reasons": ["strategic_allocation_missing"],
-                    "quantity": 0.0,
-                }
-                for c in candidates
-            ],
-            "limits": {},
-        }
-
-    monkeypatch.setattr(engine, "risk_review", refuse)
-    asyncio.run(trader.start())
-    asyncio.run(trader.risk_shadow([candidate()], int(time.time() * 1000)))
-    enter(trader)
-    assert only(trader) is not None, "in shadow mode the Risk Manager does not decide"
-    assert events(trader).count("risk_review") == 1
-
-    async def crash(config, **kwargs):
-        raise RulesError("worker failed")
-
-    monkeypatch.setattr(engine, "risk_review", crash)
-    asyncio.run(trader.risk_shadow([candidate()], int(time.time() * 1000)))
-    assert "risk_error" in events(trader)
-
-
 def test_day_realized_result_is_kept_for_the_drawdown_rule(tmp_path):
     venue = FakeVenue()
     trader = live_trader(tmp_path, venue)
@@ -410,9 +219,10 @@ def test_day_realized_result_is_kept_for_the_drawdown_rule(tmp_path):
     enter(trader)
     venue.venue_exit("-0.21")
     asyncio.run(trader.manage(only(trader), int(time.time() * 1000)))
-    account_view = asyncio.run(trader._risk_account())
-    assert account_view["daily_realized_pnl_usd"] == pytest.approx(-0.21)
-    assert account_view["day_start_equity_usd"] == pytest.approx(109.21) and account_view["positions"] == []
+    evidence = asyncio.run(trader._account_evidence())
+    assert evidence["daily_realized_pnl_usd"] == pytest.approx(-0.21)
+    assert evidence["day_start_equity_usd"] == pytest.approx(109.42), "the first observation of the day"
+    assert evidence["positions"] == [] and evidence["balance_usd"] == pytest.approx(109.21)
 
 
 def test_order_book_sizes_are_read_when_the_venue_sends_them():
