@@ -53,6 +53,7 @@ from .evedex import (
     new_order_id,
     plain,
 )
+from .execution_session import FINAL_OK, ExecutionSessions, ExecutionSettings
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
     LIVE_ACCOUNT_SOURCE,
@@ -183,6 +184,13 @@ class Config:
     poll_seconds: float = 5.0
     scan_minutes: int = 15  # how often the market is scanned: 15, 30 or 60
     exit_confirm_polls: int = 3  # polls in a row without the position before it counts as closed
+    # Who places a live order: "runner" (this program's broker) or "execution_engine" (the
+    # Kairos Execution Engine's production path, one automatically armed trade at a time;
+    # see execution_session.py). The two paths name the Execution Engine's Python and the
+    # owner's session configuration.
+    executor: str = "runner"
+    execution_python: str = ""
+    execution_session_config: str = ""
 
     @classmethod
     def load(cls, path: Path | None) -> Config:
@@ -238,6 +246,12 @@ class Config:
             raise ConfigError(f"max_account_equity_usd must be within (0, {HARD_MAX_ACCOUNT_EQUITY_USD}]")
         if self.review_mode not in ("probability", "aggregator"):
             raise ConfigError("review_mode must be probability or aggregator")
+        if self.executor not in ("runner", "execution_engine"):
+            raise ConfigError("executor must be runner or execution_engine")
+        if self.executor == "execution_engine" and not (
+            self.execution_python and self.execution_session_config
+        ):
+            raise ConfigError("executor execution_engine needs execution_python and execution_session_config")
         if not 1 <= self.news_poll_minutes <= 60 or not 0 <= int(self.max_news_llm_calls_per_day) <= 400:
             raise ConfigError("news_poll_minutes must be 1..60 and max_news_llm_calls_per_day 0..400")
         if not 1.0 <= self.reward_risk <= 5.0 or not 15 <= self.timeout_minutes <= 1440:
@@ -856,6 +870,17 @@ class Trader:
             self.risk = None
             say(f"Risk Manager недоступен, новых входов не будет: {exc}")
         self._reviews: dict[str, Any] = {}
+        self.executions: ExecutionSessions | None = None
+        if config.executor == "execution_engine" and broker.mode == "live":
+            self.executions = ExecutionSessions(
+                ExecutionSettings(
+                    python=Path(config.execution_python),
+                    session_config=Path(config.execution_session_config),
+                    # arm window + longest holding + terminal reconciliation, with margin
+                    max_session_s=config.timeout_minutes * 60 + 3_600,
+                ),
+                store,
+            )
         self.news: NewsDesk | None = None
         if config.use_text_scouts:
             desk = NewsDesk(store)
@@ -1102,6 +1127,19 @@ class Trader:
             self.store.save()
             self.store.journal("halt", reason=reason)
             say(f"НОВЫЕ ВХОДЫ ОСТАНОВЛЕНЫ: {reason}")
+
+    def _follow_execution(self) -> bool:
+        """Record a finished Execution Engine session; True while one still runs."""
+        if self.executions is None:
+            return False
+        answer = self.executions.poll()
+        if answer is not None:
+            self.store.journal("execution_session_finished", **answer)
+            outcome = str(answer.get("outcome"))
+            say(f"Execution Engine: {outcome} ({str(answer.get('detail', ''))[:160]})")
+            if outcome not in FINAL_OK:
+                self.halt("сделка Execution Engine не сверена: " + str(answer.get("detail", ""))[:200])
+        return self.executions.active() is not None
 
     def entries_blocked(self) -> str | None:
         state = self.store.state
@@ -1599,6 +1637,22 @@ class Trader:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=reason)
             say(f"Вход пропущен ({candidate.instrument} {candidate.side}): {reason}")
             return
+        if self.executions is not None:
+            # The Execution Engine decides again with its own Risk Manager and places the order.
+            allocation = self.macro.allocation() if self.macro else None
+            session = self.executions.start(
+                candidate_id=candidate.id,
+                review=review.model_dump(mode="json"),
+                allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
+            )
+            self._day()["trades"] += 1
+            self.store.save()
+            self.store.journal("execution_session_started", candidate=candidate.id, pid=session["pid"])
+            say(
+                f"Сделка {candidate.instrument} {candidate.side} передана Execution Engine "
+                f"(процесс {session['pid']})."
+            )
+            return
         foreign = await self.broker.foreign_exposure({t["symbol"] for t in trades})
         if foreign:
             self.halt("на счёте есть чужая позиция или заявка: " + "; ".join(foreign)[:300])
@@ -1780,6 +1834,8 @@ class Trader:
                 failure = failure or exc  # keep managing the other positions first
         if failure is not None:
             raise failure
+        if self.executions is not None and self._follow_execution():
+            return
         if self.entries_blocked():
             return
         free = self.slot_limit() - len(trades)
