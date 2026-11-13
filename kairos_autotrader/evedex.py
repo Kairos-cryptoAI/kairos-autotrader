@@ -107,10 +107,6 @@ def ceil_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_UP) * step
 
 
-def round_step(value: Decimal, step: Decimal) -> Decimal:
-    return (value / step).to_integral_value(rounding=ROUND_HALF_UP) * step
-
-
 class EvedexError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None, body: str = "") -> None:
         super().__init__(message)

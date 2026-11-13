@@ -59,7 +59,7 @@ EXCLUDED_SLEEVES = {
 # The live rules. The pin is the engine's own fingerprint of the package's source closure
 # (kairos_strategy/hourly_trend/provenance.py): a different engine source is refused, not traded.
 HOURLY_TREND_ID = "hourly_trend_candidates_v1"
-HOURLY_TREND_CODE_SHA256 = "466c95ae8a5418036fe2c30b117fbe37274c3dc9bae9c49ca94807d9095d5f80"
+HOURLY_TREND_CODE_SHA256 = "1390b94bcf38440efa2f3b8b466c10bc1044e60252ed7c9979b25453db9b59ad"
 HOURLY_TREND_HISTORY_MS = 504 * HOUR_MS  # how far back from a decision the rules read
 
 
@@ -375,13 +375,15 @@ async def hourly_trend_scan(
     timeout_minutes: int,
     runner=None,
     processes: int = 4,
+    price_increments: dict[str, Any] | None = None,
 ) -> TrendScan:
     """Run the live rules for the decision at ``boundary_ms`` on closed Binance bars.
 
     ``series`` maps an EVEDEX instrument to the cached bars of its Binance signal symbol.
     An instrument whose newest closed bar does not end at the boundary is skipped: its
     history is late. Building some 30 000 strict bars per symbol takes about a second,
-    so the symbols are spread over a few engine processes.
+    so the symbols are spread over a few engine processes. ``price_increments`` (EVEDEX
+    instrument to its price tick) makes the rules place stop and target on that tick.
     """
     first_ms = boundary_ms - HOURLY_TREND_HISTORY_MS
     windows: dict[str, list[list[Any]]] = {}
@@ -399,12 +401,18 @@ async def hourly_trend_scan(
     names = list(windows)
     groups = [names[index::processes] for index in range(max(1, min(processes, len(names))))]
     tuning = hourly_trend_config(reward_risk=reward_risk, timeout_minutes=timeout_minutes)
+    ticks = dict(price_increments or {})
 
     def request(group: list[str]) -> dict[str, Any]:
         return {
             "op": "hourly_trend_bars",
             "series": {signal_symbol(instrument): windows[instrument] for instrument in group},
             "config": tuning,
+            "price_increments": {
+                signal_symbol(instrument): str(ticks[instrument])
+                for instrument in group
+                if instrument in ticks
+            },
         }
 
     answers = await asyncio.gather(*(asyncio.to_thread(run, config, request(group)) for group in groups))

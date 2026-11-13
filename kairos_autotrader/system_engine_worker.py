@@ -39,6 +39,7 @@ import json
 import sys
 import time
 from dataclasses import asdict
+from decimal import Decimal
 from typing import Any
 
 MINUTE_MS = 60_000
@@ -116,6 +117,7 @@ def _hourly_trend_bars(request: dict, candle_type: Any) -> dict:
 
     # Only fields of the engine's own validated config are accepted; the identity reports it.
     config = HourlyTrendCandidatesConfig(**dict(request.get("config") or {}))
+    increments = dict(request.get("price_increments") or {})
     results: dict[str, dict] = {}
     for symbol, rows in request["series"].items():
         try:
@@ -140,7 +142,10 @@ def _hourly_trend_bars(request: dict, candle_type: Any) -> dict:
                 if bar.bar_sha256 != row[9]:
                     raise ValueError(f"cached bar {int(row[0])} does not hash to its recorded identity")
                 bars.append(bar)
-            evaluation = evaluate_hourly_trend_closed_bars(bars, config)
+            tick = increments.get(symbol)
+            evaluation = evaluate_hourly_trend_closed_bars(
+                bars, config, price_increment=None if tick is None else Decimal(str(tick))
+            )
             results[symbol] = {
                 "decision_ts_ms": evaluation.decision_ts_ms,
                 "input_first_open_time_ms": evaluation.input_first_open_time_ms,

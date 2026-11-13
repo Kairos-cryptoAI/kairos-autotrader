@@ -52,7 +52,6 @@ from .evedex import (
     floor_step,
     new_order_id,
     plain,
-    round_step,
 )
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
@@ -1318,6 +1317,7 @@ class Trader:
                     slot,
                     reward_risk=self.config.reward_risk,
                     timeout_minutes=self.config.timeout_minutes,
+                    price_increments={name: item.price_step for name, item in self.instruments.items()},
                 )
             except EngineError as exc:
                 say(f"Strategy Engine не дал ответа, скан пропущен: {str(exc)[:200]}")
@@ -1532,10 +1532,12 @@ class Trader:
         # price difference between the two venues.
         drift = abs(float(ref) - candidate.reference_price)
         spread_bps = float((book.ask - book.bid) / book.ask) * 1e4
-        stop = round_step(dec(repr(candidate.stop)), instrument.price_step)
-        take = round_step(dec(repr(candidate.take)), instrument.price_step)
+        # Strategy Engine places the barriers on this tick (``price_increments``).
+        stop, take = dec(repr(candidate.stop)), dec(repr(candidate.take))
         reason = None
-        if any(t["symbol"] == candidate.instrument for t in trades):
+        if stop % instrument.price_step or take % instrument.price_step:
+            reason = "the exit barriers are not on the instrument's price tick"
+        elif any(t["symbol"] == candidate.instrument for t in trades):
             reason = "there is already a position in this instrument"
         elif len(trades) >= self.slot_limit():
             reason = "no free position slot"

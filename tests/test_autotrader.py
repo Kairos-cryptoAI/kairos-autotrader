@@ -148,7 +148,7 @@ def test_a_routed_candidate_reads_everything_from_the_contracts():
     assert (c.instrument, intent.symbol, intent.venue) == ("SOLUSD", "SOLUSDT", "BINANCE_UM")
     assert c.id == intent.intent_id and len(c.id) == 64
     assert (c.side, c.setup, c.signal_time) == ("LONG", "PULLBACK_RECLAIM", 900_000)
-    assert (c.reference_price, c.stop, c.take, c.timeout_minutes) == (82.35, 81.5, 83.625, 720)
+    assert (c.reference_price, c.stop, c.take, c.timeout_minutes) == (82.35, 81.5, 83.62, 720)
     assert c.atr == 0.8 and c.strength == 0.41237
     record = c.record()
     assert record["id"] == c.id and record["symbol"] == "SOLUSD" and record["score"] == 0.4124
@@ -603,6 +603,17 @@ def test_entry_skipped_when_price_ran_away(tmp_path):
     assert not venue.market_bodies and "entry_skipped" in events(trader)
 
 
+def test_entry_skipped_when_the_barriers_are_off_the_venue_tick(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    off_tick = candidate(take=83.625)
+    asyncio.run(trader.try_enter(off_tick, brain.control_decision([off_tick])))
+    skipped = journal_of(trader)[-1]
+    assert not venue.market_bodies and skipped["event"] == "entry_skipped"
+    assert skipped["reason"] == "the exit barriers are not on the instrument's price tick"
+
+
 def test_entry_skipped_after_the_intent_entry_window(tmp_path):
     venue = FakeVenue()
     trader = live_trader(tmp_path, venue)
@@ -998,6 +1009,9 @@ def test_scan_runs_binance_bars_through_the_engine_and_the_router(tmp_path, monk
     request = engine_requests[0]
     assert request["op"] == "hourly_trend_bars"
     assert request["config"] == {"target_reward_to_risk": 2.0, "max_hold_minutes": 240}
+    assert request["price_increments"] == {"SOLUSDT": str(trader.instruments["SOLUSD"].price_step)}, (
+        "the rules place stop and target on the EVEDEX tick"
+    )
     sent = request["series"]["SOLUSDT"]
     assert sent[-1][0] == SLOT - MINUTE, "minutes after the boundary are not part of the decision"
     assert sent[0][0] == SLOT - HISTORY and len(sent) == HISTORY // MINUTE, "exactly the rules' window"

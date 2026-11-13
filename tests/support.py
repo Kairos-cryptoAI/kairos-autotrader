@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from kairos_core.contracts import (
@@ -32,7 +33,7 @@ def strict_intent(
     setup: str = "PULLBACK_RECLAIM",
     ref_price: float = 82.35,
     stop: float = 81.5,
-    take: float = 83.625,
+    take: float = 83.62,  # on the 0.01 EVEDEX tick, as Strategy Engine now places it
     timeout_minutes: int = 720,
     atr: float = 0.8,
     score: float = 0.4,
@@ -237,6 +238,16 @@ def fake_engine(
                     bar_hashes=tuple(row[9] for row in rows),
                     code_sha256=code_sha256,
                 )
+                tick = (request.get("price_increments") or {}).get(symbol)
+                if tick is not None:
+                    # Like Strategy Engine's on_venue_tick: both barriers toward the reference.
+                    step = Decimal(tick)
+                    fields["stop"] = float(
+                        (Decimal(repr(fields["stop"])) / step).to_integral_value(ROUND_CEILING) * step
+                    )
+                    fields["take"] = float(
+                        (Decimal(repr(fields["take"])) / step).to_integral_value(ROUND_FLOOR) * step
+                    )
                 if tamper is not None:
                     fields = tamper(fields)
                 intent = strict_intent(**fields).model_dump(mode="json")
@@ -303,7 +314,6 @@ def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), err
     over the stop distance plus round-trip costs, capped by the position notional. Returns
     the list of requests the stand-in received.
     """
-    from decimal import Decimal
     from types import SimpleNamespace
 
     from kairos_autotrader import engine
