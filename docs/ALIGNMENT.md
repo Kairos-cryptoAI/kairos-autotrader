@@ -3,6 +3,8 @@
 This file records, repository by repository, what the live runner uses unchanged, what
 it currently re-states or duplicates, and the order in which the duplicates are removed.
 It is a map of work, not a readiness claim. Revisions are the `main` heads on this date.
+Updated 2026-11-14: step 4, and the plan beyond the removal of duplicates, which follows
+the owner's end goal in `kairos/docs/PHILOSOPHY.md` (branch `docs/philosophy-20261114`).
 
 ## Correction of an earlier reading
 
@@ -24,15 +26,15 @@ What rejects a real venue today is service configuration, not the contracts:
 | repository (revision) | used unchanged today | re-stated or duplicated in the runner | target |
 | --- | --- | --- | --- |
 | `kairos-core` (`ff3af75`) | a pinned dependency of the runner: `StrategyIntentV1` and `CandidateRouteV1` are the objects passed between scan, review and entry (`signals.Routed`); every Aggregator review is a validated `CandidateReviewV1` on a `DecisionContextV1` with `MarketSnapshot`, `ClosedBarEventV1`, `SentimentSignal` and `StrategicAllocation` sources | no `RiskTradeDecisionV1`, `VenueQualityV1` | steps 3-4 |
-| `kairos-strategy-engine` (`7096bfc`, branch `hourly-trend-strict-adapter-20261112`) | `hourly_trend.evaluate_hourly_trend_closed_bars` produces every live candidate as a `StrategyIntentV1` on closed Binance bars, through the shared `_strict_intent`, pinned by `hourly_trend_source_identity`; `candle_to_closed_bar` rebuilds each cached bar and its hash is compared; `registry.generate_sleeve_intents` on EVEDEX bars in shadow | no rule code. The package is isolated, not registered | registration is a separate source-pinned step (it changes eleven fingerprints) |
-| `kairos-quant-scouts` (`6bd59a3`, branch `prod-symbol-map-ten-20261113`) | `long_gap_recovery.parse_page` accepts every Binance kline page and gives each bar its `ClosedBarEventV1` identity; `BinanceFuturesCollector` reads funding and the open-interest hour, `SnapshotBuilder` builds the `MarketSnapshot` before every decision | pages and the order book come from public REST, not from the collector's streams: liquidation totals stay at zero; the entry drift check stands in for `VenueQualityV1` | the collector's stream and `VenueQualityV1` |
+| `kairos-strategy-engine` (`dc46fde`, branch `hourly-trend-candidates-20261112`; exits on the venue tick since `dc46fde`) | `hourly_trend.evaluate_hourly_trend_closed_bars` produces every live candidate as a `StrategyIntentV1` on closed Binance bars, through the shared `_strict_intent`, pinned by `hourly_trend_source_identity`; `candle_to_closed_bar` rebuilds each cached bar and its hash is compared; `registry.generate_sleeve_intents` on EVEDEX bars in shadow | no rule code. The package is isolated, not registered | registration is a separate source-pinned step (it changes eleven fingerprints) |
+| `kairos-quant-scouts` (`38d0c91`, branch `prod-symbol-map-ten-20261113`; `venue_now` since `38d0c91`) | `long_gap_recovery.parse_page` accepts every Binance kline page and gives each bar its `ClosedBarEventV1` identity; `BinanceFuturesCollector` reads funding and the open-interest hour, `SnapshotBuilder` builds the `MarketSnapshot` before every decision | pages and the order book come from public REST, not from the collector's streams: liquidation totals stay at zero; the entry drift check stands in for `VenueQualityV1` | the collector's stream and `VenueQualityV1` |
 | `kairos-text-scouts` (`a8dbd88`) | full pipeline except the provider call | the model call is made by `text_scouts.model_extract`, not `kairos-llm` | provider call through the gateway |
 | `kairos-router` (`a373e62`) | `SignalWindow` and `CandidateRouterPolicy.build` with `RouterSettings` defaults: every candidate is a real `CandidateRouteV1` | the symbol bucketing of text and the time checks of `RouterService._candidate_rejection` are restated in `router_worker.py` (the pinned service refuses LIVE by configuration) | the service path once LIVE routing exists upstream |
 | `kairos-aggregator` (`34963c2`, branch `bounded-review-prompt-20261113`) | `CandidateContextStore` freezes the `DecisionContextV1`, `CandidateReviewBrain.review_with_context` reviews it and returns the `CandidateReviewV1`; `compile_decision_context` bounds a long input declaration in the prompt | the review runs in a worker per scan, not in `CandidateReviewService` on the bus: receipt clocks of cached bars are the worker's, as after a service restart | the service once the runner publishes to the bus |
 | `kairos-macro-strategist` (`1f0d262`) | prompt, `build_macro_context`, `AllocationOutput`, defensive fallback, `ShockDetector` | regime hint re-stated (bound method of the service); scheduling is the runner's | unchanged apart from the gateway |
-| `kairos-risk-manager` (`d8c031e`) | `LiveRiskEvaluator.evaluate` decides every entry: review, Macro allocation, venue quality, account and daily limits, sizing, `RiskTradeDecisionV1` | the account and input verifiers are the runner's (`risk_worker.py`); `require_instrument_rules=False` because the intent's exit prices are not on the EVEDEX tick | a verifier owned by the system, and exit prices on the execution venue's tick |
+| `kairos-risk-manager` (`d8c031e`) | `LiveRiskEvaluator.evaluate` decides every entry: review, Macro allocation, venue quality, account and daily limits, sizing, `RiskTradeDecisionV1` | in the runner's own path the account and input verifiers are the runner's (`risk_worker.py`) with `require_instrument_rules=False`; in the Execution Engine path the verifiers are the system's (`production_rest_sources`) with instrument rules required, now that exits are on the tick | the Execution Engine path only |
 | `kairos-llm` (`d91566b`) | the Aggregator review calls `BudgetedLLMGateway.complete` with the architecture-owned workload routes (`gpt-6-luna` medium, `gpt-6.1-sol` high on CONFLICT) and the registered price table | the budget is `FileUsageBudget` in `aggregator_worker.py`, a JSON ledger per runtime directory in place of the Postgres ledger; `brain.ask_llm`, `text_scouts.model_extract` and the Macro call still call the provider directly | the other three calls through the gateway |
-| `kairos-execution-engine` (`1e8afe6`) | nothing; `evedex.py` signing is fixture-tested against the same pinned SDK | whole order path: `evedex.py`, `engine.LiveBroker`, file state | API-key order transport contributed as an adapter; the runner keeps only orchestration |
+| `kairos-execution-engine` (`39cacba`, branch `live-runner-execution-20261113`) | with `executor="execution_engine"`: the one-trade session (`production_session_cli`) runs the whole production path; not yet usable live (see step 4) | with the default `executor="runner"`: the whole order path, `evedex.py`, `engine.LiveBroker`, file state | the Execution Engine path as the only executor; `evedex.py` and `LiveBroker` deleted |
 | `kairos-persistence` (`506628f`) | nothing | `engine.Store` (state file and journal) | durable journal for venue effects |
 | `kairos-backtest` (`da12378`) | nothing | `system_cli.evaluate` replays candidates on minute bars | replay through the shared generators |
 | `kairos-deploy` (`3684dd8`) | nothing | `start-live.cmd` | a runner profile next to the existing ones |
@@ -45,8 +47,9 @@ What rejects a real venue today is service configuration, not the contracts:
 2. *Do not copy a `kairos-core` message definition into a service.* Nothing is copied.
    Intent, route, context, review and risk decision are the contracts themselves.
 3. *External venue mutations must be prepared in the execution journal before submission.*
-   `LiveBroker.enter` records `pending_entry` in the state file first, which serves the
-   same purpose for one process but is not the execution journal.
+   Met with `executor="execution_engine"`, where every mutation is a journaled effect of
+   the Execution Engine. With the default `executor="runner"`, `LiveBroker.enter` records
+   `pending_entry` in the state file first, which is not the execution journal.
 4. *Provider and model selection belong to `kairos-llm`.* True for the Aggregator review.
    The runner's own probability review, Text Scouts' extraction and the Macro call still
    select `llm_model` themselves.
@@ -137,11 +140,72 @@ Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers af
    venue measurement with basis -3.0 bps and a book 0.5 s old; the runner entered 7.2 XRP
    (lot step 0.1) 43 s after the boundary. Each decision took 1.3-2.6 s. Tests run the real
    evaluator offline on synthetic books for the approval and sixteen refusal cases.
-4. **Execution.** The runner executes a `RiskTradeDecisionV1`; the API-key transport is
-   proposed to `kairos-execution-engine`.
-5. **State.** The execution journal replaces `pending_entry`.
+4. **Execution.** Built 2026-11-13/14, not yet usable live. With `executor="execution_engine"`
+   in live mode the runner hands the Aggregator review and the Macro allocation to
+   `kairos_execution.production_session_cli` and opens nothing else until the session ends;
+   the session runs the system's production path for one trade. What it took, by
+   repository:
+   - `kairos-execution-engine`: the reviewed eleven-pair PROD universe shared by custody,
+     lifecycle and capture (`58f569b`); one-command provisioning of the isolated database
+     (`deff9a6`); `drain_events` polling instead of durably blocking entries, and the
+     transport preflight at start (`8b855bf`); EVEDEX PROD REST sources for account,
+     inputs with instrument rules, exits, cancellation and terminal V2 evidence under a
+     documented single-position trust model (`edbbf1e`, `docs/REST-SOURCE-TRUST-MODEL.md`);
+     owner tools for the arm key, signed arms and evidence receipts (`dc87851`); Telegram
+     single-host alerts and their evidence facts (`b8ae425`, `cffc20f`); the automatically
+     armed one-trade session, whose arm carries exactly the owner's signed limits
+     (`a404651`), its command line (`36c4cf0`) and a fresh venue measurement inside it
+     (`39cacba`);
+   - `kairos-strategy-engine` `dc46fde`: exits placed on the execution venue's tick, so the
+     Risk Manager's instrument-rules mode can be required;
+   - `kairos-quant-scouts` `38d0c91`: an on-demand PROD venue measurement, because a
+     `VenueQualityV1` lives five seconds;
+   - the runner: the tick is passed to the rules (`7b94d81`), a heartbeat for the alert
+     monitor (`0dccc1c`), the hand-over to the Execution Engine (`8d38294`).
+   Checked: the production graph with the REST sources passes every assembly check; the
+   real `LiveRiskEvaluator` in instrument-rules mode approves an entry with the REST
+   verifiers; exit evidence passes the real exit-risk publisher; owner arms and receipts
+   are accepted by the system's verifiers; a fresh measurement comes from live public
+   books; a Telegram test message was delivered. Open before live use: the owner's
+   encrypted wallet keystore and a single-key API file, the seven signed technical-canary
+   receipts (one needs an independent security reviewer), the database drills, and an
+   end-to-end run of the session on the provisioned database against a venue double. The
+   production path holds one position at a time and admits only a bounded `LIMIT_GTC`
+   entry. On this machine the existing production-path integration test sometimes misses
+   its five-second signing and dispatch deadlines; that has to be understood before live.
+5. **State.** The Execution Engine's database becomes the only journal: the runner's
+   `Store` keeps orchestration state only, and the report reads trades from the database.
+   `evedex.py` and `LiveBroker` are deleted once the Execution Engine path has traded.
 
 Each step lands with its tests and removes the code it replaces in the same change.
+
+## Beyond the removal: the plan to the owner's end goal
+
+`kairos/docs/PHILOSOPHY.md` asks for an adaptive trader that decides capital, risk,
+leverage, instruments and position management itself inside a fixed owner constitution,
+analyses continuously and learns from its own trades. After steps 4 and 5, in this order
+(each in the repository that owns the role, with tests, without loosening a constitution
+limit):
+
+6. **Learning ledger.** Per-trade expected versus realized result and statistics per
+   strategy x instrument x regime, from the Execution Engine's database
+   (`kairos-backtest` for the history, the live database for real trades).
+7. **Adaptive risk and capital.** The Risk Manager sizes from those statistics, the review's
+   confidence, market state and the account's drawdown, starting from
+   `kairos_risk.capital_budget_proposal`; risk falls after losses and rises only with
+   evidence, always under the constitution's ceilings.
+8. **Strategies and instruments.** `kairos_strategy.adaptive` (trend, range, retest) joins
+   the live path next to `hourly_trend`; the instrument list is chosen from venue quality
+   and measured edge instead of a fixed configuration.
+9. **Continuous regime and early exits.** The Macro Strategist re-evaluates on events, not
+   only daily; a regime change or a material Text Scouts event can close an open position
+   early through the Execution Engine.
+10. **Stop management.** Break-even and trailing stops from the `ExitPlan` fields that
+    already exist; a stop only ever moves toward less risk, and a new protection is on the
+    venue before the old one is removed.
+11. **Partial exits and scaling in.** Several take-profits and adding to a winning
+    position, only when the position can be divided by the venue's minimum lot and only
+    with a new Risk Manager decision; adaptive leverage last, when the data supports it.
 
 ## Instrument universe
 
