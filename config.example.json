@@ -25,5 +25,10 @@
   "max_account_equity_usd": 200,
   "use_text_scouts": true,
   "news_poll_minutes": 5,
-  "max_news_llm_calls_per_day": 150
+  "max_news_llm_calls_per_day": 150,
+  "macro_refresh_hours": 6,
+  "adaptive_risk": true,
+  "adaptive_shadow": true,
+  "regime_exit": true,
+  "management": "measured"
 }

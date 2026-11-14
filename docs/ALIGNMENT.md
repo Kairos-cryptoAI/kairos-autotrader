@@ -1,4 +1,4 @@
-# Alignment with the Kairos repositories — 2026-11-12
+# Alignment with the Kairos repositories — 2026-11-12, updated 2026-11-14
 
 This file records, repository by repository, what the live runner uses unchanged, what
 it currently re-states or duplicates, and the order in which the duplicates are removed.
@@ -162,50 +162,82 @@ Dependency order, as `CONTRIBUTING.md` prescribes: contracts first, consumers af
      `VenueQualityV1` lives five seconds;
    - the runner: the tick is passed to the rules (`7b94d81`), a heartbeat for the alert
      monitor (`0dccc1c`), the hand-over to the Execution Engine (`8d38294`).
-   Checked: the production graph with the REST sources passes every assembly check; the
-   real `LiveRiskEvaluator` in instrument-rules mode approves an entry with the REST
-   verifiers; exit evidence passes the real exit-risk publisher; owner arms and receipts
-   are accepted by the system's verifiers; a fresh measurement comes from live public
-   books; a Telegram test message was delivered. Open before live use: the owner's
-   encrypted wallet keystore and a single-key API file, the seven signed technical-canary
-   receipts (one needs an independent security reviewer), the database drills, and an
-   end-to-end run of the session on the provisioned database against a venue double. The
-   production path holds one position at a time and admits only a bounded `LIMIT_GTC`
-   entry. On this machine the existing production-path integration test sometimes misses
-   its five-second signing and dispatch deadlines; that has to be understood before live.
-5. **State.** The Execution Engine's database becomes the only journal: the runner's
-   `Store` keeps orchestration state only, and the report reads trades from the database.
-   `evedex.py` and `LiveBroker` are deleted once the Execution Engine path has traded.
+   Then, on 2026-11-14: three defects that blocked every real REST trade were fixed
+   (`4a8c9a4`: the GTC owner binding, the cancellation's Risk decision id, decimals in
+   venue JSON); an operator latch (arm, kill, resume), an entry bounded by the two-second
+   quote window and an end-to-end stand (`964e49e`); the owner drills for recovery,
+   operator control, limits, custody and account pairing, whose facts the system's own
+   interpreters accept (`496794b`, `4ae1d24`).
+   Checked: the production graph with the REST sources passes every assembly check; owner
+   arms and receipts are accepted by the system's verifiers; a fresh measurement comes from
+   live public books; a Telegram test message was delivered. On a provisioned database
+   against a venue double that speaks EVEDEX's REST and signs with a real EIP-712 key
+   (`tests/rest_stand.py`), one armed session enters with `LIMIT_GTC`, places both
+   protections, exits by take-profit, by stop-loss or by an early exit, reconciles and has
+   its terminal accounting accepted (`KAIROS_REST_STAND=1`, three trades, about 50 s).
+   Open before live use, all the owner's: the encrypted wallet keystore and a single-key
+   API file, the seven signed technical-canary receipts (one needs an independent security
+   reviewer), running the drills on the real database, and `session.json`. The production
+   path holds one position at a time and admits only a bounded `LIMIT_GTC` entry.
+5. **State.** Done for the Execution Engine path 2026-11-14: its database is the journal of
+   closed trades (`kairos_execution.production_report`, `efeeb12`), `report --config`
+   reads them from there (`214e330`) and the learning ledger joins them with the runner's
+   own. The runner's `Store` keeps orchestration state. `evedex.py` and `LiveBroker` are
+   deleted once the Execution Engine path has traded live.
 
 Each step lands with its tests and removes the code it replaces in the same change.
 
-## Beyond the removal: the plan to the owner's end goal
+## Beyond the removal: toward the owner's end goal
 
 `kairos/docs/PHILOSOPHY.md` asks for an adaptive trader that decides capital, risk,
 leverage, instruments and position management itself inside a fixed owner constitution,
-analyses continuously and learns from its own trades. After steps 4 and 5, in this order
-(each in the repository that owns the role, with tests, without loosening a constitution
-limit):
+analyses continuously and learns from its own trades, using a professional's tools only
+where they measurably help. Steps 6-11 were built on 2026-11-14, each in the repository
+that owns the role, with tests, without loosening a constitution limit. "Measured" below
+is a replay of the live rules on 30 days of EVEDEX minute history (2 173 signals, costs
+included); overlapping signals of one instrument and day are one cluster in the error.
 
-6. **Learning ledger.** Per-trade expected versus realized result and statistics per
-   strategy x instrument x regime, from the Execution Engine's database
-   (`kairos-backtest` for the history, the live database for real trades).
-7. **Adaptive risk and capital.** The Risk Manager sizes from those statistics, the review's
-   confidence, market state and the account's drawdown, starting from
-   `kairos_risk.capital_budget_proposal`; risk falls after losses and rises only with
-   evidence, always under the constitution's ceilings.
-8. **Strategies and instruments.** `kairos_strategy.adaptive` (trend, range, retest) joins
-   the live path next to `hourly_trend`; the instrument list is chosen from venue quality
-   and measured edge instead of a fixed configuration.
-9. **Continuous regime and early exits.** The Macro Strategist re-evaluates on events, not
-   only daily; a regime change or a material Text Scouts event can close an open position
-   early through the Execution Engine.
-10. **Stop management.** Break-even and trailing stops from the `ExitPlan` fields that
-    already exist; a stop only ever moves toward less risk, and a new protection is on the
-    venue before the old one is removed.
-11. **Partial exits and scaling in.** Several take-profits and adding to a winning
-    position, only when the position can be divided by the venue's minimum lot and only
-    with a new Risk Manager decision; adaptive leverage last, when the data supports it.
+6. **Learning ledger.** `kairos_risk.learning` (`4fb3425`, `034b006`): every closed trade in
+   R, per strategy x instrument x regime with fallbacks, evidence weighted (live 1, replay
+   0.5), a lower bound at 95% (99% for one instrument). The runner feeds it its own and the
+   Execution Engine's closed trades (`050fc71`) and replayed live-rule signals as replay
+   evidence (`6214fb9`); `report --ledger` prints it (`8cefbeb`). Measured: the live rules
+   have no edge overall (-0.017 +- 0.024 R); per instrument only SOLUSDT is proven (mean
+   +0.43 R, lower +0.23 R).
+7. **Adaptive risk and capital.** `kairos_risk.adaptive_risk` (`4fb3425`): the share of the
+   0.25% ceiling grows only with a proven lower bound, is half without evidence, zero with
+   a proven non-positive one, and shrinks with drawdown, a low review priority and venue
+   cost. The runner applies it to every entry (`050fc71`); the Execution session takes the
+   fraction a candidate carries and can only lower the owner's limit (`56038f1`).
+8. **Strategies and instruments.** `kairos_strategy.adaptive` runs beside `hourly_trend` in
+   its DRY_RUN observation mode; its intents are measured on later bars and enter the
+   ledger as replay evidence, and it trades only after the owner lifts that gate and the
+   ledger proves it (`8cefbeb`). Instruments are chosen by the ledger's instrument cells:
+   a proven non-positive cell gets zero risk.
+9. **Continuous regime and early exits.** The Macro Strategist re-judges the regime every
+   `macro_refresh_hours` (6) and after shocks. A newer regime that opposes an open position
+   closes it early: the runner's broker at market, an Execution session through its
+   reviewed exit path on an `--exit-request` (`e7e2257`, `7dbe72e`, `b58b693`). Each early
+   exit is measured against holding the plan; after 20, a negative total switches them off.
+   Text Scouts events do not close positions yet.
+10. **Stop management.** `kairos_autotrader.management` (`157c3e3`) compares break-even and
+    trailing policies with the plan on the same signals and writes
+    `management-policy.json`; a policy is used only if its gain is proven at 99% over at
+    least 200 signals. Measured: none is (best, trailing from 1.0 R by 0.5 R: +0.016 +-
+    0.022 R), so positions keep the plan. With a proven policy, a stop only moves toward
+    less risk and the new stop is confirmed on the venue before the old one is cancelled.
+    The Execution Engine path keeps its hard plan stop and gets a soft managed stop through
+    the early-exit request; moving the hard stop there needs changes to its exit-risk,
+    cancellation and reconciliation code and to the REST trust model, under the security
+    review.
+11. **Partial exits, scaling in, leverage.** Partial exits are management policies (half at
+    a profit, then break-even), in lots of the venue's step leaving at least the minimum
+    lot; measured, not proven. Adding to an open winner is measured too and not proven
+    (`7038f67`: from +0.5 R, 124 add-ons, -0.082 +- 0.093 R), so the runner keeps one
+    position per instrument; add-ons on EVEDEX's netted positions would need per-leg stops
+    and takes, built only once adding is proven. `adaptive_leverage` (`8cce3d2`) decides
+    leverage by the same evidence and never above the constitution, which is 1x for LIVE;
+    every Risk decision records it.
 
 ## Instrument universe
 

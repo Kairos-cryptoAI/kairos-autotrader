@@ -26,8 +26,9 @@ exchanges JSON with the runner ([`kairos_autotrader/sibling.py`](kairos_autotrad
 | 1A Quant Scouts | `kairos-quant-scouts` | `long_gap_recovery.parse_page`: a Binance kline page becomes strict `ClosedBarEventV1` bars only if it is complete, ordered and gap-free | live: every signal bar passes it |
 | 2 Router | `kairos-router` | `SignalWindow` text aggregation, `CandidateRouterPolicy.build` → `CandidateRouteV1` (tier, review deadline, exact evidence ids) | live: every candidate is routed; a rejected one is dropped |
 | 3 Aggregator | `kairos-aggregator` | `CandidateContextStore` → `DecisionContextV1`, `CandidateReviewBrain.review_with_context` → `CandidateReviewV1`, model calls through `kairos-llm`'s `BudgetedLLMGateway` | shadow by default (`review_mode`) |
-| 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: one allocation a day |
-| 5 Risk Manager | `kairos-risk-manager` | `LiveRiskEvaluator`: every admission gate, the sizing and the `RiskTradeDecisionV1`, on a PROD `VenueQualityV1` measured by Quant Scouts' `build_venue_quality` just before the decision | live: decides every entry; the runner trades its quantity or less |
+| 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: an allocation every `macro_refresh_hours` (6) and after shocks |
+| 5 Risk Manager | `kairos-risk-manager` | `LiveRiskEvaluator`: every admission gate, the sizing and the `RiskTradeDecisionV1`, on a PROD `VenueQualityV1` measured by Quant Scouts' `build_venue_quality` just before the decision; `learning.LearningLedger` and `adaptive_risk` (the share of the per-trade ceiling and the leverage, from evidence) | live: decides every entry; the runner trades its quantity or less |
+| 6 Execution | `kairos-execution-engine` | `production_session_cli`: one automatically armed trade on the production path (`executor = "execution_engine"`), its closed-trade journal (`production_report`) | live when the owner configures it; otherwise the runner's own broker |
 | Strategy Engine | `kairos-strategy-engine` | `kairos_strategy.hourly_trend` through its strict adapter: closed Binance bars in, `StrategyIntentV1` out, pinned by the package's own source identity; registered sleeve generators | live: every candidate comes from it; registered sleeves in shadow only (`shadow`, `engine-replay`) |
 
 Owned by the runner itself:
@@ -46,7 +47,17 @@ Owned by the runner itself:
 - `evedex.py` — EVEDEX REST client and EIP-712 order signing, byte-compatible with
   `@evedex/exchange-bot-sdk` 1.2.11 (fixture-tested).
 - `engine.py` — the loop: scan, decide, size, enter with exchange-side stop and target,
-  manage, account; hard ceilings as code constants; file-based state and journal.
+  manage, account; hard ceilings as code constants; file-based state and journal. An open
+  position closes early when a newer Macro regime opposes it (`regime_exit`); each early
+  exit is measured against holding the plan, and they switch themselves off after 20
+  measurements if they cost more than they save.
+- `management.py` — break-even, trailing stops and partial exits, measured on the live
+  rules' replayed signals against the plan (`engine-replay` writes
+  `management-policy.json`) and applied only when proven; a stop only moves toward less
+  risk, and the new stop is on the venue before the old one is cancelled. Adding to an
+  open winner is measured the same way and stays refused unless proven.
+- `execution_session.py` — the hand-over to the Execution Engine and the early-exit
+  request file of a running session.
 
 ## Known deviations from the Kairos contracts
 
