@@ -59,7 +59,12 @@ class ExecutionSessions:
         return session if isinstance(session, dict) else None
 
     def start(
-        self, *, candidate_id: str, review: dict[str, Any], allocation: dict[str, Any] | None
+        self,
+        *,
+        candidate_id: str,
+        review: dict[str, Any],
+        allocation: dict[str, Any] | None,
+        per_trade_risk_fraction: str | None = None,
     ) -> dict[str, Any]:
         if self.active() is not None:
             raise RuntimeError("an Execution Engine session is already running")
@@ -70,7 +75,14 @@ class ExecutionSessions:
         result = directory / f"{stem}.result.json"
         log = directory / f"{stem}.stderr.log"
         candidate.write_text(
-            json.dumps({"review": review, "allocation": allocation, "system_mode": "NORMAL"}),
+            json.dumps(
+                {
+                    "review": review,
+                    "allocation": allocation,
+                    "system_mode": "NORMAL",
+                    "per_trade_risk_fraction": per_trade_risk_fraction,
+                }
+            ),
             encoding="utf-8",
         )
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0

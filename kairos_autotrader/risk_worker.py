@@ -249,6 +249,16 @@ def decide(request: dict, venue) -> dict:
     )
     scope_in, account = request["scope"], request["account"]
     limits = LiveRiskLimitsV1(**request["limits"])
+    adaptive_record = None
+    if request.get("adaptive") is not None:
+        limits, adaptive_record = _adaptive_limits(
+            request["adaptive"], limits, review, allocation, account, venue
+        )
+        if limits is None:
+            return {
+                "refused": "adaptive risk: " + "; ".join(adaptive_record["reasons"]),
+                "adaptive": adaptive_record,
+            }
     instruments = set(scope_in["instruments"])
     scope = LiveRiskScopeV1(
         context_sha256=canonical_sha256(scope_in["context"]),
@@ -277,7 +287,55 @@ def decide(request: dict, venue) -> dict:
         system_mode=SystemMode.NORMAL,
         raw_inputs_evidence=venue.measurement_id,
     )
-    return {"evaluation": result.model_dump(mode="json")}
+    answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json")}
+    if adaptive_record is not None:
+        answer["adaptive"] = adaptive_record
+    return answer
+
+
+def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, venue):
+    """The Risk Manager's adaptive per-trade fraction (``kairos_risk.adaptive_risk``) from the ledger."""
+    from decimal import Decimal
+
+    from kairos_risk.adaptive_risk import AdaptiveRiskPolicyV1, adapt_limits, adaptive_risk_fraction
+    from kairos_risk.learning import UNKNOWN_REGIME, LearningLedger, TradeOutcome
+
+    ledger = LearningLedger(
+        tuple(
+            TradeOutcome(
+                strategy_id=str(row["strategy_id"]),
+                symbol=str(row["symbol"]),
+                regime=str(row["regime"]),
+                r_multiple=Decimal(str(row["r_multiple"])),
+                decided_at_ms=int(row["decided_at_ms"]),
+                source=row.get("source", "LIVE"),
+            )
+            for row in adaptive.get("outcomes", [])
+        )
+    )
+    regime = allocation.regime.value if allocation is not None else UNKNOWN_REGIME
+    edge = ledger.estimate(review.intent.strategy_id, review.intent.symbol, regime)
+    equity = Decimal(str(account["balance_usd"]))
+    peak = max(equity, Decimal(str(account.get("peak_equity_usd") or equity)))
+    decision = adaptive_risk_fraction(
+        AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
+        edge,
+        equity_usd=equity,
+        peak_equity_usd=peak,
+        review_priority=review.priority,
+        venue_cost_bps=Decimal(str(venue.spread_bps)),
+    )
+    record = {
+        "regime": regime,
+        "edge_level": edge.level,
+        "edge_samples": edge.samples,
+        "edge_mean_r": str(edge.mean_r),
+        "edge_lower_r": str(edge.lower_r),
+        "per_trade_risk_fraction": str(decision.fraction),
+        "multiplier": str(decision.multiplier),
+        "reasons": list(decision.reasons),
+    }
+    return adapt_limits(limits, decision), record
 
 
 async def evaluate(request: dict) -> dict:

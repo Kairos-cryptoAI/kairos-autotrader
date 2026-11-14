@@ -135,6 +135,7 @@ async def evaluate_entry(
     limits: dict[str, Any],
     taker_fee_bps: float,
     assessed_notional_usd: float,
+    adaptive: dict[str, Any] | None = None,
     runner=None,
 ) -> RiskOutcome:
     """The Risk Manager's decision on one reviewed candidate. Raises ``RiskError`` if it cannot answer."""
@@ -146,10 +147,15 @@ async def evaluate_entry(
         "limits": limits,
         "venue": {"taker_fee_bps": taker_fee_bps, "assessed_notional_usd": assessed_notional_usd},
     }
+    if adaptive is not None:
+        request["adaptive"] = adaptive
     answer = await asyncio.to_thread(runner or _run_worker, config, request)
     if "refused" in answer:
         reason = str(answer["refused"])[:200]
-        return RiskOutcome(False, Decimal(0), (reason,), None, {"approved": False, "refused": reason})
+        record = {"approved": False, "refused": reason}
+        if "adaptive" in answer:
+            record["adaptive"] = answer["adaptive"]
+        return RiskOutcome(False, Decimal(0), (reason,), None, record)
     try:
         evaluation = answer["evaluation"]
         decision = RiskTradeDecisionV1.model_validate(evaluation["decision"])
@@ -158,6 +164,7 @@ async def evaluate_entry(
     if decision.intent.intent_id != review.intent.intent_id or decision.review.review_id != review.review_id:
         raise RiskError("the risk decision belongs to another candidate")
     quantity = Decimal(repr(decision.quantity)) if decision.approved else Decimal(0)
-    return RiskOutcome(
-        decision.approved, quantity, decision.rejection_reasons, decision, _record(decision, evaluation)
-    )
+    record = _record(decision, evaluation)
+    if "adaptive" in answer:
+        record["adaptive"] = answer["adaptive"]
+    return RiskOutcome(decision.approved, quantity, decision.rejection_reasons, decision, record)

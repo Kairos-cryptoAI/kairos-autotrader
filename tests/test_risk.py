@@ -146,7 +146,9 @@ def lineage(symbol="XRPUSD") -> dict:
     }
 
 
-def decide(*, review_=None, allocation_=..., account_=None, books_=None, refusal_only=False) -> dict:
+def decide(
+    *, review_=None, allocation_=..., account_=None, books_=None, refusal_only=False, adaptive_=None
+) -> dict:
     config = RiskConfig()
     try:
         config.check()
@@ -160,6 +162,8 @@ def decide(*, review_=None, allocation_=..., account_=None, books_=None, refusal
         "limits": LIMITS,
         "venue": {"taker_fee_bps": 4.5, "assessed_notional_usd": 33.33},
     }
+    if adaptive_ is not None:
+        request["adaptive"] = adaptive_
     done = subprocess.run(  # nosec B603
         [
             str(config.python),
@@ -467,3 +471,33 @@ def _rejected(review_: CandidateReviewV1) -> dict:
         estimated_slippage_usd=0.0,
         exit_plan=review_.intent.exit_plan,
     ).model_dump(mode="json")
+
+
+def _outcomes(r_values, *, regime):
+    intent = review().intent
+    return [
+        {
+            "strategy_id": intent.strategy_id,
+            "symbol": intent.symbol,
+            "regime": regime,
+            "r_multiple": str(r),
+            "decided_at_ms": 1_000 + index,
+            "source": "LIVE",
+        }
+        for index, r in enumerate(r_values)
+    ]
+
+
+def test_adaptive_risk_uses_part_of_the_ceiling_while_the_edge_is_unproven():
+    answer = decide(adaptive_={"outcomes": []})
+    adaptive = answer["adaptive"]
+    assert adaptive["edge_level"] == "none" and adaptive["regime"] == allocation()["regime"]
+    assert Decimal(adaptive["per_trade_risk_fraction"]) < Decimal("0.0025")
+    assert answer["evaluation"]["decision"]["approved"], answer["evaluation"]["decision"]["rejection_reasons"]
+
+
+def test_adaptive_risk_refuses_an_entry_without_proven_edge_in_the_regime():
+    regime = allocation()["regime"]
+    answer = decide(adaptive_={"outcomes": _outcomes([-0.5, 0.2] * 15, regime=regime)})
+    assert answer["refused"].startswith("adaptive risk: no proven edge")
+    assert answer["adaptive"]["per_trade_risk_fraction"] == "0"

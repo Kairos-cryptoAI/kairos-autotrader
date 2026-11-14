@@ -335,7 +335,9 @@ def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), err
             size = min(
                 limits["per_trade_dollar_cap_usd"] / per_unit, limits["max_position_notional_usd"] / ref
             )
-        decision = SimpleNamespace(decision_id="d" * 64, trade_id="e" * 64)
+        decision = SimpleNamespace(
+            decision_id="d" * 64, trade_id="e" * 64, decided_at_ms=int(__import__("time").time() * 1000)
+        )
         record = {"approved": True, "quantity": float(size), "decision_id": "d" * 64}
         return RiskOutcome(True, Decimal(repr(float(size))), (), decision, record)
 

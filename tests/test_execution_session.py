@@ -24,7 +24,7 @@ def _fake_execution(tmp_path, monkeypatch, *, outcome: str, delay_s: float = 0.0
         f"time.sleep({delay_s})\n"
         "args = sys.argv\n"
         "candidate = json.loads(open(args[args.index('--candidate') + 1], encoding='utf-8').read())\n"
-        "assert set(candidate) == {'review', 'allocation', 'system_mode'}\n"
+        "assert set(candidate) == {'review', 'allocation', 'system_mode', 'per_trade_risk_fraction'}\n"
         f"print(json.dumps({{'outcome': {outcome!r}, 'trade_id': 'a' * 64, 'detail': 'synthetic'}}))\n",
         encoding="utf-8",
     )
@@ -146,3 +146,48 @@ def test_report_reads_the_execution_engines_closed_trades(tmp_path, monkeypatch,
     _report_execution(config)
     out = capsys.readouterr().out
     assert "сделок закрыто 1" in out and "+1.200 R" in out and "SOLUSD BUY TARGET" in out
+
+
+def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tmp_path, monkeypatch):
+    package = tmp_path / "fake-ledger" / "kairos_execution"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    row = {
+        "version": "kairos.execution-closed-trade.v1",
+        "strategy_id": "hourly_trend_candidates_v1",
+        "symbol": "SOLUSDT",
+        "decided_at_ms": 1_800_000_000_000,
+        "r_multiple": "-1.0200",
+    }
+    (package / "production_report.py").write_text(
+        f"import json\nprint(json.dumps({row!r}))\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fake-ledger"))
+    session = tmp_path / "session.json"
+    session.write_text(json.dumps({"manifest": str(tmp_path / "manifest.json")}), encoding="utf-8")
+    trader = live_trader(
+        tmp_path,
+        FakeVenue(),
+        executor="execution_engine",
+        execution_python=sys.executable,
+        execution_session_config=str(session),
+    )
+    for record in (
+        {"event": "macro_allocation", "regime": "BEAR", "produced_at": "2027-01-01T00:00:00+00:00"},
+        {"event": "macro_allocation", "regime": "BULL", "produced_at": "2027-01-15T00:00:00+00:00"},
+        {
+            "event": "trade_closed",
+            "strategy_id": "hourly_trend_candidates_v1",
+            "signal_symbol": "XRPUSDT",
+            "regime": "CHOP",
+            "decided_at_ms": 5,
+            "r_multiple": "1.5",
+        },
+        {"event": "trade_closed", "pnl_usd": "0.1"},
+    ):
+        trader.store.journal(record.pop("event"), **record)
+    outcomes = trader.learning_outcomes()
+    assert {(o["symbol"], o["regime"], o["r_multiple"]) for o in outcomes} == {
+        ("XRPUSDT", "CHOP", "1.5"),
+        ("SOLUSDT", "BULL", "-1.0200"),
+    }

@@ -189,6 +189,9 @@ class Config:
     # see execution_session.py). The two paths name the Execution Engine's Python and the
     # owner's session configuration.
     executor: str = "runner"
+    # The Risk Manager's adaptive per-trade risk (kairos_risk.adaptive_risk) from the learning
+    # ledger of closed trades; always at most the fixed ceiling.
+    adaptive_risk: bool = True
     execution_python: str = ""
     execution_session_config: str = ""
 
@@ -1111,6 +1114,12 @@ class Trader:
             self.store.journal("macro_error", kind=type(exc).__name__, message=str(exc)[:300])
             return
         if allocation:
+            self.store.journal(
+                "macro_allocation",
+                regime=allocation.get("regime"),
+                produced_at=allocation.get("produced_at"),
+                origin=allocation.get("origin"),
+            )
             weights = ", ".join(
                 f"{name} {weight:.0%}" for name, weight in allocation["strategy_weights"].items()
             )
@@ -1127,6 +1136,80 @@ class Trader:
             self.store.save()
             self.store.journal("halt", reason=reason)
             say(f"НОВЫЕ ВХОДЫ ОСТАНОВЛЕНЫ: {reason}")
+
+    def learning_outcomes(self) -> list[dict[str, Any]]:
+        """Closed trades in R for the learning ledger: this runner's and the Execution Engine's.
+
+        The regime of an Execution Engine trade is the Macro regime journaled before its
+        decision (``macro_allocation``); the runner's own trades carry theirs.
+        """
+        path = self.store.directory / "journal.jsonl"
+        records = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    continue
+        outcomes = [
+            {
+                "strategy_id": r["strategy_id"],
+                "symbol": r["signal_symbol"],
+                "regime": r.get("regime") or "UNKNOWN",
+                "r_multiple": r["r_multiple"],
+                "decided_at_ms": r["decided_at_ms"],
+                "source": "LIVE",
+            }
+            for r in records
+            if r.get("event") == "trade_closed"
+            and r.get("r_multiple") is not None
+            and r.get("strategy_id")
+            and r.get("signal_symbol")
+            and isinstance(r.get("decided_at_ms"), int)
+        ]
+        if self.config.executor == "execution_engine" and self.config.execution_session_config:
+            from .execution_session import closed_trades
+
+            timeline = sorted(
+                (
+                    int(
+                        datetime.fromisoformat(str(r["produced_at"]).replace("Z", "+00:00")).timestamp()
+                        * 1000
+                    ),
+                    r["regime"],
+                )
+                for r in records
+                if r.get("event") == "macro_allocation" and r.get("produced_at") and r.get("regime")
+            )
+
+            def regime_at(at_ms: int) -> str:
+                regime = "UNKNOWN"
+                for produced, value in timeline:
+                    if produced > at_ms:
+                        break
+                    regime = value
+                return regime
+
+            try:
+                rows = closed_trades(
+                    Path(self.config.execution_python), Path(self.config.execution_session_config)
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                self.store.journal("learning_error", message=str(exc)[:200])
+                rows = []
+            outcomes.extend(
+                {
+                    "strategy_id": row["strategy_id"],
+                    "symbol": row["symbol"],
+                    "regime": regime_at(int(row["decided_at_ms"])),
+                    "r_multiple": row["r_multiple"],
+                    "decided_at_ms": int(row["decided_at_ms"]),
+                    "source": "LIVE",
+                }
+                for row in rows
+                if row.get("r_multiple") is not None
+            )
+        return outcomes
 
     def _follow_execution(self) -> bool:
         """Record a finished Execution Engine session; True while one still runs."""
@@ -1609,6 +1692,7 @@ class Trader:
                     limits=limits,
                     taker_fee_bps=float(self.fee) * 1e4,
                     assessed_notional_usd=limits["max_position_notional_usd"],
+                    adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
             except (RiskError, EvedexError, TimeoutError, aiohttp.ClientError, OSError) as exc:
                 reason = f"the Risk Manager could not decide ({type(exc).__name__}: {str(exc)[:120]})"
@@ -1640,10 +1724,12 @@ class Trader:
         if self.executions is not None:
             # The Execution Engine decides again with its own Risk Manager and places the order.
             allocation = self.macro.allocation() if self.macro else None
+            adaptive = outcome.record.get("adaptive") or {}
             session = self.executions.start(
                 candidate_id=candidate.id,
                 review=review.model_dump(mode="json"),
                 allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
+                per_trade_risk_fraction=adaptive.get("per_trade_risk_fraction"),
             )
             self._day()["trades"] += 1
             self.store.save()
@@ -1686,6 +1772,11 @@ class Trader:
             "risk_trade_id": risk_decision.trade_id,
             "first_fill_ms": now_ms,
             "max_holding_ms": candidate.intent.exit_plan.max_holding_ms,
+            # The learning ledger's inputs: the regime in force and the trade's 1 R in USD.
+            "signal_symbol": candidate.intent.symbol,
+            "regime": (allocation or {}).get("regime") or "UNKNOWN",
+            "decided_at_ms": risk_decision.decided_at_ms,
+            "one_r_usd": str(fill["quantity"] * abs(dec(str(fill["price"])) - stop)),
         }
         for other in trades:
             other["solo"] = False
@@ -1810,6 +1901,15 @@ class Trader:
             exit_price=trade.get("exit_price"),
             source=trade["decision"].get("source"),
             candidate_id=trade["candidate"].get("id"),
+            strategy_id=trade.get("strategy_id"),
+            signal_symbol=trade.get("signal_symbol"),
+            regime=trade.get("regime"),
+            decided_at_ms=trade.get("decided_at_ms"),
+            r_multiple=(
+                str((pnl / dec(trade["one_r_usd"])).quantize(Decimal("0.0001")))
+                if trade.get("one_r_usd") and dec(trade["one_r_usd"]) > 0
+                else None
+            ),
         )
         say(
             f"ВЫХОД {trade['symbol']} ({reason}). Результат сделки: {pnl:+.4f} USDT"
