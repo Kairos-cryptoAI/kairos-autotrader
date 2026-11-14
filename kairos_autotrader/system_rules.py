@@ -81,7 +81,7 @@ def bias_of(trend: str) -> str:
 
 
 class MacroDesk:
-    """Keeps one current strategic allocation: daily, and again after a price shock."""
+    """Keeps one current strategic allocation: on schedule, and again after a price shock."""
 
     def __init__(
         self,
@@ -91,9 +91,12 @@ class MacroDesk:
         *,
         runner=_run_worker,
         extract=model_extract,
+        refresh_ms: int = DAY_MS,
     ) -> None:
         self.store, self.config, self.strategy_ids = store, config, tuple(sorted(strategy_ids))
         self._runner, self._extract = runner, extract
+        # How often the regime is re-judged on schedule; price shocks trigger it sooner.
+        self.refresh_ms = int(refresh_ms)
 
     def _state(self) -> dict[str, Any]:
         return self.store.state.setdefault("macro", {})
@@ -163,7 +166,7 @@ class MacroDesk:
         }
         due = (
             not state.get("allocation")
-            or now_ms - state.get("last_run_ms", 0) >= DAY_MS
+            or now_ms - state.get("last_run_ms", 0) >= self.refresh_ms
             # An allocation made for other strategy ids gives the current one no capital.
             or state.get("allocation_strategy_ids") != list(self.strategy_ids)
         )

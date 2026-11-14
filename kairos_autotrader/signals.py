@@ -151,6 +151,34 @@ class Routed:
         }
 
 
+def held_outcome(plan: Mapping[str, Any], later_bars: list[Candle], *, cost_fraction: float) -> float | None:
+    """The R a position would have made had it been held to its plan, or None if not yet known.
+
+    ``plan`` has the entry, the stop and take in force, the initial risk per unit
+    (``risk_price``), the start and the deadline. A bar touching both levels counts as
+    the stop. R is measured on the initial risk, so a stop moved to break-even counts 0 R.
+    """
+    entry, stop, take = float(plan["entry"]), float(plan["stop"]), float(plan["take"])
+    risk = float(plan["risk_price"])
+    if risk <= 0:
+        return None
+    sign = 1.0 if plan["side"] == "LONG" else -1.0
+    start, deadline = int(plan["start_ms"]), int(plan["deadline_ms"])
+    for bar in later_bars:
+        if bar.t < start:
+            continue
+        if bar.l <= stop if sign > 0 else bar.h >= stop:
+            price = stop
+        elif bar.h >= take if sign > 0 else bar.l <= take:
+            price = take
+        elif bar.t >= deadline:
+            price = bar.c
+        else:
+            continue
+        return round(sign * (price - entry) / risk - cost_fraction * entry / risk, 4)
+    return None
+
+
 def outcome(record: Mapping[str, Any], later_bars: list[Candle], *, cost_fraction: float) -> dict:
     """Hypothetical result of a recorded signal on later bars, in R multiples net of costs.
 

@@ -68,7 +68,7 @@ from .risk import (
     risk_revisions,
 )
 from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
-from .signals import SIGNAL_VENUE, Features, Routed, outcome, signal_symbol
+from .signals import SIGNAL_VENUE, Features, Routed, held_outcome, outcome, signal_symbol
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
     HOURLY_TREND_ID,
@@ -198,6 +198,11 @@ class Config:
     # The research adaptive strategy runs alongside in observation only; its measured
     # outcomes feed the learning ledger (as replay-weight evidence).
     adaptive_shadow: bool = True
+    # The Macro Strategist re-judges the regime this often (hours); shocks trigger it sooner.
+    macro_refresh_hours: float = 6.0
+    # Close an open position early when the regime turns against it (measured; see
+    # REGIME_EXIT_MIN_SAMPLES).
+    regime_exit: bool = True
     execution_python: str = ""
     execution_session_config: str = ""
 
@@ -251,6 +256,8 @@ class Config:
             raise ConfigError("exit_confirm_polls must be within 1..20")
         if self.macro_effort not in ("low", "medium", "high"):
             raise ConfigError("macro_effort must be low, medium or high")
+        if not 1 <= float(self.macro_refresh_hours) <= 24:
+            raise ConfigError("macro_refresh_hours must be within 1..24")
         if not 0 < Decimal(str(self.max_account_equity_usd)) <= HARD_MAX_ACCOUNT_EQUITY_USD:
             raise ConfigError(f"max_account_equity_usd must be within (0, {HARD_MAX_ACCOUNT_EQUITY_USD}]")
         if self.review_mode not in ("probability", "aggregator"):
@@ -287,6 +294,41 @@ def software_exit(trade: dict[str, Any], book: Book, now_ms: int) -> str | None:
         if book.ask <= take:
             return "TAKE"
     return "TIMEOUT" if now_ms >= trade["deadline_ms"] else None
+
+
+OPPOSING_REGIME = {"LONG": "BEAR", "SHORT": "BULL"}
+# Early exits on a regime change keep running only while they measurably help: after this
+# many measured exits, a negative total of (exit R - held-to-plan R) switches them off.
+REGIME_EXIT_MIN_SAMPLES = 20
+
+
+def _iso_ms(text: Any) -> int | None:
+    try:
+        return int(datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def regime_exit_reason(
+    side: str | None,
+    entry_regime: str | None,
+    allocation: dict[str, Any] | None,
+    decided_at_ms: int | None,
+) -> str | None:
+    """Why to close an open position early: the Macro regime has turned against it since entry.
+
+    Only an allocation produced after the entry decision counts, and only a regime that
+    opposes the side (LONG in BEAR, SHORT in BULL) and differs from the entry's regime.
+    """
+    if not allocation or side not in OPPOSING_REGIME:
+        return None
+    regime = allocation.get("regime")
+    if regime != OPPOSING_REGIME[side] or regime == entry_regime:
+        return None
+    produced = _iso_ms(allocation.get("produced_at"))
+    if produced is None or (decided_at_ms is not None and produced <= int(decided_at_ms)):
+        return None
+    return f"Macro regime {regime} opposes the open {side} (entered in {entry_regime or 'UNKNOWN'})"
 
 
 def estimate_pnl(trade: dict[str, Any], exit_price: Decimal, fee: Decimal) -> Decimal:
@@ -956,7 +998,9 @@ class Trader:
         if config.use_llm and config.use_macro:
             try:
                 rules.check_macro()
-                self.macro = MacroDesk(store, rules, STRATEGY_IDS)
+                self.macro = MacroDesk(
+                    store, rules, STRATEGY_IDS, refresh_ms=int(float(config.macro_refresh_hours) * 3_600_000)
+                )
             except RulesError as exc:
                 say(f"Macro Strategist отключён: {exc}")
         self._rules_revisions = rules_revisions(rules) if self.macro else {}
@@ -1311,7 +1355,10 @@ class Trader:
         return collect_learning_outcomes(self.store.directory, self.config, self.store.journal)
 
     def _follow_execution(self) -> bool:
-        """Record a finished Execution Engine session; True while one still runs."""
+        """Record a finished Execution Engine session; True while one still runs.
+
+        While a session runs, a regime turned against its position asks it to close early.
+        """
         if self.executions is None:
             return False
         answer = self.executions.poll()
@@ -1321,7 +1368,80 @@ class Trader:
             say(f"Execution Engine: {outcome} ({str(answer.get('detail', ''))[:160]})")
             if outcome not in FINAL_OK:
                 self.halt("сделка Execution Engine не сверена: " + str(answer.get("detail", ""))[:200])
-        return self.executions.active() is not None
+            plan = answer.get("plan")
+            if answer.get("early_exit") and answer.get("r_multiple") is not None and isinstance(plan, dict):
+                self._queue_early_exit({**plan, "id": answer.get("trade_id"), "exit_r": answer["r_multiple"]})
+        session = self.executions.active()
+        if session is not None and not session.get("exit_requested"):
+            reason = self._regime_exit(
+                session.get("side"), session.get("regime"), session.get("decided_at_ms")
+            )
+            if reason and self.executions.request_exit(reason):
+                self.store.journal("regime_exit_requested", candidate=session.get("candidate"), reason=reason)
+                say(f"Execution Engine: прошу досрочно закрыть позицию — {reason}.")
+        return session is not None
+
+    def _regime_exit(self, side: Any, entry_regime: Any, decided_at_ms: Any) -> str | None:
+        """The early-exit reason for an open position, while early exits measurably help."""
+        if not self.config.regime_exit or self.macro is None:
+            return None
+        stats = self.store.state.get("early_exit_stats") or {}
+        if int(stats.get("n", 0)) >= REGIME_EXIT_MIN_SAMPLES and float(stats.get("saved_r", 0)) < 0:
+            if not stats.get("disabled"):
+                stats["disabled"] = True
+                self.store.journal("regime_exit_disabled", measured=stats["n"], saved_r=stats["saved_r"])
+                say(
+                    f"Досрочные выходы по смене режима отключены: за {stats['n']} измеренных выходов "
+                    f"они дали {stats['saved_r']:+.2f} R против удержания по плану."
+                )
+                self.store.save()
+            return None
+        return regime_exit_reason(
+            side,
+            entry_regime,
+            self.macro.allocation(),
+            int(decided_at_ms) if decided_at_ms is not None else None,
+        )
+
+    def _queue_early_exit(self, plan: dict[str, Any]) -> None:
+        """Keep an early exit's plan until the bars show what holding it would have made."""
+        pending = self.store.state.setdefault("early_exit_pending", [])
+        pending.append(plan)
+        del pending[:-200]
+        self.store.save()
+
+    def _measure_early_exits(self, series: dict[str, list[list[Any]]]) -> None:
+        """Compare each early exit with holding the position to its plan, on the closed bars."""
+        pending = self.store.state.get("early_exit_pending", [])
+        if not pending:
+            return
+        by_signal = {signal_symbol(instrument): rows for instrument, rows in series.items()}
+        cost_fraction = 2 * (float(self.fee) + self.config.slippage_fraction)
+        stats = self.store.state.setdefault("early_exit_stats", {"n": 0, "saved_r": 0.0})
+        remaining = []
+        for plan in pending:
+            rows = by_signal.get(plan.get("signal_symbol"), [])
+            held = (
+                held_outcome(plan, to_candles(rows), cost_fraction=cost_fraction)
+                if rows and rows[-1][0] >= int(plan["deadline_ms"])
+                else None
+            )
+            if held is None:
+                remaining.append(plan)
+                continue
+            saved = round(float(plan["exit_r"]) - held, 4)
+            stats["n"] = int(stats.get("n", 0)) + 1
+            stats["saved_r"] = round(float(stats.get("saved_r", 0)) + saved, 4)
+            self.store.journal(
+                "early_exit_measured",
+                id=plan.get("id"),
+                signal_symbol=plan.get("signal_symbol"),
+                exit_r=str(plan["exit_r"]),
+                held_r=str(held),
+                saved_r=str(saved),
+            )
+        self.store.state["early_exit_pending"] = remaining
+        self.store.save()
 
     def entries_blocked(self) -> str | None:
         state = self.store.state
@@ -1546,6 +1666,7 @@ class Trader:
             skipped.extend(found.skipped)
             if self.config.adaptive_shadow:
                 await self._observe_adaptive(series, slot)
+            self._measure_early_exits(series)
         try:
             metrics = await self.api.metrics()
         except EvedexError:
@@ -1831,6 +1952,22 @@ class Trader:
                 review=review.model_dump(mode="json"),
                 allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
                 per_trade_risk_fraction=adaptive.get("per_trade_risk_fraction"),
+                context={
+                    # What the runner needs to judge an early exit and to measure it later.
+                    "side": candidate.side,
+                    "regime": (allocation or {}).get("regime") or "UNKNOWN",
+                    "decided_at_ms": risk_decision.decided_at_ms,
+                    "plan": {
+                        "signal_symbol": candidate.intent.symbol,
+                        "side": candidate.side,
+                        "entry": str(ref),
+                        "stop": str(stop),
+                        "take": str(take),
+                        "risk_price": str(abs(ref - stop)),
+                        "start_ms": now_ms,
+                        "deadline_ms": now_ms + candidate.timeout_minutes * 60_000,
+                    },
+                },
             )
             self._day()["trades"] += 1
             self.store.save()
@@ -1911,6 +2048,12 @@ class Trader:
         book = await self.api.book(trade["symbol"])
         reason = "OPERATOR_CLOSE" if self.store.flag("CLOSE") else software_exit(trade, book, now_ms)
         if reason is None:
+            early = self._regime_exit(trade["side"], trade.get("regime"), trade.get("decided_at_ms"))
+            if early:
+                trade["early_exit"] = early
+                say(f"Досрочный выход {trade['symbol']} {trade['side']}: {early}.")
+                reason = "REGIME_EXIT"
+        if reason is None:
             trade["breaches"] = 0
             if now_ms - self._status_at.get(trade["id"], 0) >= 600_000:
                 self._status_at[trade["id"]] = now_ms
@@ -1989,6 +2132,27 @@ class Trader:
             }
         )
         del history[:-HISTORY_LENGTH]
+        r_multiple = (
+            (pnl / dec(trade["one_r_usd"])).quantize(Decimal("0.0001"))
+            if trade.get("one_r_usd") and dec(trade["one_r_usd"]) > 0
+            else None
+        )
+        if reason == "REGIME_EXIT" and r_multiple is not None and trade.get("signal_symbol"):
+            entry = dec(trade["entry_price"])
+            self._queue_early_exit(
+                {
+                    "id": trade["id"],
+                    "signal_symbol": trade["signal_symbol"],
+                    "side": trade["side"],
+                    "entry": str(entry),
+                    "stop": trade["stop"],
+                    "take": trade["take"],
+                    "risk_price": str(dec(trade["one_r_usd"]) / dec(trade["quantity"])),
+                    "start_ms": trade["opened_ms"],
+                    "deadline_ms": trade["deadline_ms"],
+                    "exit_r": str(r_multiple),
+                }
+            )
         self.store.save()
         self.store.journal(
             "trade_closed",
@@ -2006,11 +2170,8 @@ class Trader:
             signal_symbol=trade.get("signal_symbol"),
             regime=trade.get("regime"),
             decided_at_ms=trade.get("decided_at_ms"),
-            r_multiple=(
-                str((pnl / dec(trade["one_r_usd"])).quantize(Decimal("0.0001")))
-                if trade.get("one_r_usd") and dec(trade["one_r_usd"]) > 0
-                else None
-            ),
+            r_multiple=None if r_multiple is None else str(r_multiple),
+            early_exit=trade.get("early_exit"),
         )
         say(
             f"ВЫХОД {trade['symbol']} ({reason}). Результат сделки: {pnl:+.4f} USDT"

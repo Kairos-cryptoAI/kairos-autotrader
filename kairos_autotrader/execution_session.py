@@ -65,6 +65,7 @@ class ExecutionSessions:
         review: dict[str, Any],
         allocation: dict[str, Any] | None,
         per_trade_risk_fraction: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self.active() is not None:
             raise RuntimeError("an Execution Engine session is already running")
@@ -74,6 +75,7 @@ class ExecutionSessions:
         candidate = directory / f"{stem}.candidate.json"
         result = directory / f"{stem}.result.json"
         log = directory / f"{stem}.stderr.log"
+        exit_request = directory / f"{stem}.exit-request"
         candidate.write_text(
             json.dumps(
                 {
@@ -96,6 +98,8 @@ class ExecutionSessions:
                     str(self.settings.session_config),
                     "--candidate",
                     str(candidate),
+                    "--exit-request",
+                    str(exit_request),
                 ],
                 stdout=stdout,
                 stderr=stderr,
@@ -108,10 +112,25 @@ class ExecutionSessions:
             "started_ms": int(time.time() * 1000),
             "candidate_file": str(candidate),
             "result_file": str(result),
+            "exit_request_file": str(exit_request),
+            **(context or {}),
         }
         self.store.state["execution_session"] = session
         self.store.save()
         return session
+
+    def request_exit(self, reason: str) -> bool:
+        """Ask the running session to close its position early; True when newly asked."""
+        session = self.active()
+        if session is None or session.get("exit_requested"):
+            return False
+        path = Path(session["exit_request_file"])
+        partial = path.with_suffix(".partial")
+        partial.write_text(reason.strip()[:200] + "\n", encoding="utf-8")
+        partial.replace(path)
+        session["exit_requested"] = reason.strip()[:200]
+        self.store.save()
+        return True
 
     def poll(self) -> dict[str, Any] | None:
         """The session's final answer once it exists; the session is then cleared."""
@@ -144,4 +163,9 @@ class ExecutionSessions:
         self.store.state.pop("execution_session", None)
         self.store.save()
         self._process = None
-        return {**answer, "candidate": session["candidate"]}
+        return {
+            **answer,
+            "candidate": session["candidate"],
+            "exit_requested": session.get("exit_requested"),
+            "plan": session.get("plan"),
+        }
