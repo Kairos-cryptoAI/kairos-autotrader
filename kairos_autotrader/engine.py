@@ -1167,6 +1167,15 @@ class Trader:
             and r.get("signal_symbol")
             and isinstance(r.get("decided_at_ms"), int)
         ]
+        replay = self.store.directory / "learning-replay.jsonl"
+        if replay.exists():
+            for line in replay.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("source") == "REPLAY" and row.get("r_multiple") is not None:
+                    outcomes.append(row)
         if self.config.executor == "execution_engine" and self.config.execution_session_config:
             from .execution_session import closed_trades
 

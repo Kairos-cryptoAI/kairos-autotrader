@@ -191,3 +191,20 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
         ("XRPUSDT", "CHOP", "1.5"),
         ("SOLUSDT", "BULL", "-1.0200"),
     }
+
+
+def test_replayed_signals_join_the_ledger_as_half_weight_evidence(tmp_path):
+    trader = live_trader(tmp_path, FakeVenue())
+    replay = {
+        "strategy_id": "hourly_trend_candidates_v1",
+        "symbol": "SOLUSDT",
+        "regime": "UNKNOWN",
+        "r_multiple": "-0.31",
+        "decided_at_ms": 1_000,
+        "source": "REPLAY",
+    }
+    (trader.store.directory / "learning-replay.jsonl").write_text(
+        json.dumps(replay) + "\n" + json.dumps({**replay, "source": "LIVE"}) + "\nnot json\n",
+        encoding="utf-8",
+    )
+    assert trader.learning_outcomes() == [replay]

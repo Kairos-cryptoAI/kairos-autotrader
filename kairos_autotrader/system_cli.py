@@ -38,6 +38,7 @@ from .system_engine import (
 from .text_scouts import NewsDesk
 
 SHADOW_MODE = "engine-shadow"
+LEARNING_REPLAY_FILE = "learning-replay.jsonl"
 LIVE_RULES = "боевые правила (hourly_trend, сигнал по свечам Binance), скан раз в час"
 LIVE_RULES_QUARTER = "боевые правила (hourly_trend, сигнал по свечам Binance), скан каждые 15 минут"
 
@@ -192,6 +193,27 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
     path = args.runtime_dir / "engine-replay.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     say(f"Подробности записаны в {path}.")
+    # The live rules' replayed signals feed the learning ledger as REPLAY evidence (half weight).
+    # No Macro decision exists for history, so their regime is UNKNOWN.
+    replay = args.runtime_dir / LEARNING_REPLAY_FILE
+    replay.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "strategy_id": row["setup"],
+                    "symbol": signal_symbol(row["symbol"]),
+                    "regime": "UNKNOWN",
+                    "r_multiple": str(row["r"]),
+                    "decided_at_ms": int(row["signal_time"]),
+                    "source": "REPLAY",
+                }
+            )
+            + "\n"
+            for row in own_quarter
+        ),
+        encoding="utf-8",
+    )
+    say(f"Повторы истории для журнала обучения ({len(own_quarter)} сигналов) записаны в {replay}.")
     return 0
 
 
