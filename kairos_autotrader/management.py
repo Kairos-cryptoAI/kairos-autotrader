@@ -139,7 +139,9 @@ def managed_outcome(
     deadline = start + int(record["timeout_minutes"]) * MINUTE_MS
     level = partial_level(policy, side, entry, stop0)
     stop, best, remaining, realized, reason = stop0, entry, 1.0, 0.0, "OPEN"
+    exit_ms = None
     for bar in later_bars:
+        exit_ms = bar.t
         if bar.t < start:
             continue
         if bar.l <= stop if sign > 0 else bar.h >= stop:
@@ -164,7 +166,68 @@ def managed_outcome(
             stop = tighter(side, stop, entry)
     else:
         return {"reason": reason, "r": None}
-    return {"reason": reason, "r": round(realized - cost_fraction * entry / risk, 4)}
+    return {"reason": reason, "r": round(realized - cost_fraction * entry / risk, 4), "exit_ms": exit_ms}
+
+
+def scale_in_evidence(
+    records: list[dict[str, Any]],
+    candles_by_symbol: Mapping[str, list[Any]],
+    cost_fraction: float,
+    *,
+    min_open_gain_r: float,
+) -> dict[str, Any]:
+    """Do new signals that agree with an open winner earn on their own? (Adding to winners.)
+
+    Per instrument, a flat book takes the first signal as a base position held to its plan.
+    While it is open, the first later signal on the same side, at a moment the base shows
+    at least ``min_open_gain_r``, is an add-on; its own plan result is measured. One add-on
+    per base, as the runner would do. Errors are clustered by instrument and day.
+    """
+    addons: list[float] = []
+    groups: list[str] = []
+    for symbol, candles in candles_by_symbol.items():
+        times = [c.t for c in candles]
+        base: dict[str, Any] | None = None
+        open_until, added = -1, False
+        for rec in sorted((r for r in records if r["symbol"] == symbol), key=lambda r: r["signal_time"]):
+            begin = bisect_left(times, rec["signal_time"])
+            window = candles[begin : begin + int(rec["timeout_minutes"]) + 2]
+            if base is None or rec["signal_time"] >= open_until:
+                result = managed_outcome(rec, window, cost_fraction=cost_fraction)
+                if result["r"] is None:
+                    continue
+                base, open_until, added = rec, int(result["exit_ms"]), False
+                continue
+            if added or rec["side"] != base["side"] or begin == 0:
+                continue
+            sign = 1.0 if base["side"] == "LONG" else -1.0
+            price = candles[begin - 1].c
+            gain = (
+                sign
+                * (price - float(base["ref_price"]))
+                / abs(float(base["ref_price"]) - float(base["stop"]))
+            )
+            if gain < min_open_gain_r:
+                continue
+            result = managed_outcome(rec, window, cost_fraction=cost_fraction)
+            if result["r"] is None:
+                continue
+            added = True
+            addons.append(float(result["r"]))
+            groups.append(f"{symbol}:{int(rec['signal_time']) // DAY_MS}")
+    if len(addons) < 2:
+        return {"min_open_gain_r": min_open_gain_r, "signals": len(addons), "proven": False}
+    mean, error = _clustered(addons, groups)
+    lower = mean - SELECTION_Z * error
+    return {
+        "min_open_gain_r": min_open_gain_r,
+        "signals": len(addons),
+        "clusters": len(set(groups)),
+        "mean_r": round(mean, 4),
+        "error_r": round(error, 4),
+        "lower_r": round(lower, 4),
+        "proven": len(addons) >= MIN_SIGNALS // 2 and lower > 0,
+    }
 
 
 def _clustered(values: list[float], clusters: list[str]) -> tuple[float, float]:
@@ -240,12 +303,23 @@ def choose_policy(results: list[dict[str, Any]], *, min_signals: int = MIN_SIGNA
 
 
 def write_policy(
-    directory: Path, results: list[dict[str, Any]], *, now_ms: int, reward_risk: float
+    directory: Path,
+    results: list[dict[str, Any]],
+    *,
+    now_ms: int,
+    reward_risk: float,
+    scale_in: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     chosen = choose_policy(results)
+    proven_scale_in = [item for item in scale_in or [] if item.get("proven")]
     document = {
         "version": "kairos.management-policy.v1",
         "reward_risk": reward_risk,
+        # Adding to an open winner: the lowest proven open-gain threshold, or None.
+        "scale_in": min(proven_scale_in, key=lambda item: item["min_open_gain_r"])
+        if proven_scale_in
+        else None,
+        "scale_in_evidence": scale_in or [],
         "measured_at_ms": now_ms,
         "measured_utc": datetime.fromtimestamp(now_ms / 1000, tz=UTC).isoformat(timespec="seconds"),
         "selection_z": SELECTION_Z,
@@ -258,6 +332,32 @@ def write_policy(
     partial.write_text(json.dumps(document, indent=1), encoding="utf-8")
     partial.replace(path)
     return document
+
+
+def scale_in_status(directory: Path, *, now_ms: int, reward_risk: float) -> str:
+    """The measured verdict on adding to an open winner, in words for the journal.
+
+    The runner keeps one position per instrument either way: EVEDEX nets an instrument
+    into one position with full-position protection, so an add-on would need per-leg
+    stops and takes, which are built only once adding is proven.
+    """
+    path = directory / POLICY_FILE
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "adding to it is not measured yet"
+    if (
+        float(document.get("reward_risk", -1)) != float(reward_risk)
+        or now_ms - int(document.get("measured_at_ms", 0)) > MAX_POLICY_AGE_MS
+    ):
+        return "adding to it is not measured for the current plan"
+    proven = document.get("scale_in")
+    if not proven:
+        return "adding to it is not proven profitable"
+    return (
+        f"adding from +{proven['min_open_gain_r']} R is proven, but per-leg protection "
+        "for add-ons is not built yet"
+    )
 
 
 def load_policy(directory: Path, *, now_ms: int, reward_risk: float) -> tuple[Management | None, str]:

@@ -55,7 +55,7 @@ from .evedex import (
     plain,
 )
 from .execution_session import FINAL_OK, ExecutionSessions, ExecutionSettings
-from .management import Management, load_policy, managed_stop, partial_level, tighter
+from .management import Management, load_policy, managed_stop, partial_level, scale_in_status, tighter
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
     LIVE_ACCOUNT_SOURCE,
@@ -2073,7 +2073,9 @@ class Trader:
         if stop % instrument.price_step or take % instrument.price_step:
             reason = "the exit barriers are not on the instrument's price tick"
         elif any(t["symbol"] == candidate.instrument for t in trades):
-            reason = "there is already a position in this instrument"
+            reason = "there is already a position in this instrument; " + scale_in_status(
+                self.store.directory, now_ms=now_ms, reward_risk=self.config.reward_risk
+            )
         elif len(trades) >= self.slot_limit():
             reason = "no free position slot"
         elif now_ms > candidate.intent.entry_expires_ts_ms:

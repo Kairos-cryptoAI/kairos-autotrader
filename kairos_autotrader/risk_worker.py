@@ -297,7 +297,12 @@ def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, 
     """The Risk Manager's adaptive per-trade fraction (``kairos_risk.adaptive_risk``) from the ledger."""
     from decimal import Decimal
 
-    from kairos_risk.adaptive_risk import AdaptiveRiskPolicyV1, adapt_limits, adaptive_risk_fraction
+    from kairos_risk.adaptive_risk import (
+        AdaptiveRiskPolicyV1,
+        adapt_limits,
+        adaptive_leverage,
+        adaptive_risk_fraction,
+    )
     from kairos_risk.learning import UNKNOWN_REGIME, LearningLedger, TradeOutcome
 
     ledger = LearningLedger(
@@ -325,8 +330,23 @@ def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, 
         review_priority=review.priority,
         venue_cost_bps=Decimal(str(venue.spread_bps)),
     )
+    # Leverage by the same evidence, capped by the constitution (exactly 1x for LIVE today):
+    # the open notional plus the largest proposed position, over equity.
+    open_notional = sum(
+        Decimal(str(abs(p["quantity"]))) * Decimal(str(p["mark_price"])) for p in account.get("positions", [])
+    )
+    leverage = adaptive_leverage(
+        AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
+        edge,
+        constitution_max=Decimal(str(limits.max_leverage)),
+        required_gross=(open_notional + Decimal(str(limits.max_position_notional_usd))) / equity,
+        equity_usd=equity,
+        peak_equity_usd=peak,
+    )
     record = {
         "regime": regime,
+        "leverage": str(leverage.leverage),
+        "leverage_reasons": list(leverage.reasons),
         "edge_level": edge.level,
         "edge_samples": edge.samples,
         "edge_mean_r": str(edge.mean_r),

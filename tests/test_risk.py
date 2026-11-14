@@ -493,6 +493,8 @@ def test_adaptive_risk_uses_part_of_the_ceiling_while_the_edge_is_unproven():
     adaptive = answer["adaptive"]
     assert adaptive["edge_level"] == "none" and adaptive["regime"] == allocation()["regime"]
     assert Decimal(adaptive["per_trade_risk_fraction"]) < Decimal("0.0025")
+    assert adaptive["leverage"] == "1", "the constitution is 1x"
+    assert "1x only" in adaptive["leverage_reasons"][0]
     assert answer["evaluation"]["decision"]["approved"], answer["evaluation"]["decision"]["rejection_reasons"]
 
 

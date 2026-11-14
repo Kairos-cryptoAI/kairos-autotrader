@@ -23,7 +23,7 @@ import aiohttp
 from .binance_bars import ClosedBarStore, QuantConfig, http_fetcher
 from .engine import BAR_MS, Config, ConfigError, Store, say
 from .evedex import Evedex
-from .management import compare_policies, policies_for, write_policy
+from .management import compare_policies, policies_for, scale_in_evidence, write_policy
 from .signals import outcome, signal_symbol
 from .system_engine import (
     DAY_MS,
@@ -182,13 +182,33 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
     # Position management (break-even, trailing, partial exits) against the plan, paired on
     # the live rules' signals; the chosen policy, if any is proven, is used by the runner.
     management = compare_policies(live, candles_by_symbol, cost_fraction, policies_for(config.reward_risk))
-    policy = write_policy(args.runtime_dir, management, now_ms=now_ms, reward_risk=config.reward_risk)
+    scale_in = [
+        scale_in_evidence(
+            live, candles_by_symbol, cost_fraction, min_open_gain_r=round(config.reward_risk * f, 4)
+        )
+        for f in (1 / 3, 2 / 3)
+    ]
+    policy = write_policy(
+        args.runtime_dir, management, now_ms=now_ms, reward_risk=config.reward_risk, scale_in=scale_in
+    )
     say("Сопровождение позиции против плана (те же сигналы, ошибка с учётом пересечений):")
     for item in management:
         say(
             f"  {item['policy']['name']}: {item['mean_r']:+.3f} R (план {item['plan_mean_r']:+.3f} R), "
             f"выигрыш {item['gain_r']:+.3f} ± {item['gain_error_r']:.3f} R, "
             f"нижняя граница {item['gain_lower_r']:+.3f} R"
+        )
+    say("Добавление к прибыльной позиции (новый сигнал в ту же сторону, сам по себе):")
+    for item in scale_in:
+        say(
+            f"  при прибыли базы от {item['min_open_gain_r']} R: {item['signals']} добавлений"
+            + (
+                f", средний {item['mean_r']:+.3f} ± {item['error_r']:.3f} R, "
+                f"нижняя граница {item['lower_r']:+.3f} R"
+                if "mean_r" in item
+                else ""
+            )
+            + (" — доказано" if item["proven"] else " — не доказано")
         )
     say(
         "Выбрано: "

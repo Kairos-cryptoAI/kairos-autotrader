@@ -310,3 +310,38 @@ def test_execution_session_gets_a_soft_managed_stop_over_its_hard_plan_stop(tmp_
     while trader._follow_execution() and time.time() < deadline:
         time.sleep(0.1)
     assert [e for e in journal_of(trader) if e["event"] == "managed_stop_exit_requested"]
+
+
+def test_adding_to_an_open_position_stays_refused_with_the_measured_verdict(tmp_path, monkeypatch):
+    from kairos_autotrader.management import scale_in_status
+
+    now = 1_794_400_000_000
+    assert scale_in_status(tmp_path, now_ms=now, reward_risk=1.5) == "adding to it is not measured yet"
+    write_policy(
+        tmp_path,
+        [],
+        now_ms=now,
+        reward_risk=1.5,
+        scale_in=[{"min_open_gain_r": 0.5, "signals": 124, "proven": False}],
+    )
+    assert scale_in_status(tmp_path, now_ms=now, reward_risk=1.5) == "adding to it is not proven profitable"
+    assert "current plan" in scale_in_status(tmp_path, now_ms=now, reward_risk=2.0)
+    write_policy(
+        tmp_path,
+        [],
+        now_ms=now,
+        reward_risk=1.5,
+        scale_in=[{"min_open_gain_r": 1.0, "proven": True}, {"min_open_gain_r": 0.5, "proven": True}],
+    )
+    assert "from +0.5 R is proven" in scale_in_status(tmp_path, now_ms=now, reward_risk=1.5)
+
+    _real_review(monkeypatch)
+    trader = paper_trader(tmp_path / "rt", FakeVenue(), Config(use_llm=False, cooldown_minutes=0))
+    asyncio.run(trader.start())
+    enter(trader)
+    enter(trader)
+    skipped = [e for e in journal_of(trader) if e["event"] == "entry_skipped"][-1]
+    assert (
+        skipped["reason"]
+        == "there is already a position in this instrument; adding to it is not measured yet"
+    )
