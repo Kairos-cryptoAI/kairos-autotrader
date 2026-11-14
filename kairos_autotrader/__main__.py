@@ -298,8 +298,40 @@ def _report_execution(config_path: Path | None) -> None:
         )
 
 
+async def _report_ledger(config_path: Path | None, runtime_dir: Path) -> None:
+    """The learning ledger: what each strategy earned per instrument and regime, and its evidence."""
+    from .engine import collect_learning_outcomes
+    from .risk import RiskConfig, RiskError, ledger_table
+
+    config = Config.load(config_path)
+    outcomes = collect_learning_outcomes(runtime_dir, config)
+    if not outcomes:
+        say("Журнал обучения пуст: закрытых сделок и повторов истории ещё нет.")
+        return
+    risk = RiskConfig()
+    try:
+        risk.check()
+        table = await ledger_table(risk, outcomes)
+    except RiskError as exc:
+        say(f"Журнал обучения недоступен: {str(exc)[:200]}")
+        return
+    say(f"Журнал обучения ({len(outcomes)} исходов; повторы истории весят половину):")
+    for cell in table:
+        verdict = (
+            "мало данных"
+            if not cell["enough_evidence"]
+            else ("преимущество доказано" if Decimal(cell["lower_r"]) > 0 else "преимущества нет — риск 0")
+        )
+        say(
+            f"  {cell['strategy_id']} {cell['symbol']} {cell['regime']}: {cell['trades']} исходов, "
+            f"средний {cell['mean_r'] or '—'} R, нижняя граница {cell['lower_r'] or '—'} R — {verdict}"
+        )
+
+
 async def cmd_report(args: argparse.Namespace) -> int:
     _report_execution(getattr(args, "config", None))
+    if getattr(args, "ledger", False):
+        await _report_ledger(getattr(args, "config", None), args.runtime_dir)
     records = _read_journal(args.runtime_dir)
     if not records:
         say("Журнал пуст.")
@@ -480,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--runtime-dir", type=Path, required=True)
     report.add_argument("--outcomes", action="store_true", help="also evaluate every signal on later candles")
     report.add_argument("--config", type=Path, help="with executor execution_engine: its closed trades too")
+    report.add_argument("--ledger", action="store_true", help="also the learning ledger, cell by cell")
 
     extra = system_cli.add_parsers(sub)
 

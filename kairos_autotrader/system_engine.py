@@ -284,6 +284,41 @@ def _run_hourly_trend(config: EngineConfig, request: dict[str, Any]) -> dict[str
         raise EngineError(f"Strategy Engine: {exc}") from exc
 
 
+ADAPTIVE_HISTORY_MS = 3_240 * MINUTE_MS
+
+
+async def adaptive_shadow_scan(
+    config: EngineConfig,
+    series: dict[str, list[list[Any]]],
+    boundary_ms: int,
+    *,
+    observed_at_ms: int,
+    source_set_sha256: str,
+    runner=None,
+) -> dict[str, Any]:
+    """The research ``adaptive`` strategy on the same closed bars, in its DRY_RUN observation mode.
+
+    Its intents are recorded and measured, never traded: the Strategy Engine allows it
+    PAPER or LIVE only after the owner lifts that gate, and the learning ledger has to show
+    a proven edge first.
+    """
+    first_ms = boundary_ms - ADAPTIVE_HISTORY_MS
+    windows = {
+        signal_symbol(instrument): [row for row in bars if first_ms <= row[0] < boundary_ms]
+        for instrument, bars in series.items()
+    }
+    request = {
+        "op": "adaptive_bars",
+        "series": {symbol: rows for symbol, rows in windows.items() if rows},
+        "observed_at_ms": int(observed_at_ms),
+        "source_set_sha256": source_set_sha256,
+    }
+    answer = await asyncio.to_thread(runner or _run_hourly_trend, config, request)
+    if "error" in answer or not isinstance(answer.get("results"), dict):
+        raise EngineError(f"adaptive observation failed: {str(answer.get('error', 'malformed'))[:200]}")
+    return answer
+
+
 def hourly_trend_config(*, reward_risk: float, timeout_minutes: int) -> dict[str, Any]:
     """The two controls the runner sets; the engine validates and fingerprints them."""
     return {"target_reward_to_risk": float(reward_risk), "max_hold_minutes": int(timeout_minutes)}

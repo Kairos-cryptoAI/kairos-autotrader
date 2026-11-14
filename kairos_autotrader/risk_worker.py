@@ -338,6 +338,28 @@ def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, 
     return adapt_limits(limits, decision), record
 
 
+def ledger_table(request: dict) -> dict:
+    """The Risk Manager's learning ledger, cell by cell, for the report."""
+    from decimal import Decimal
+
+    from kairos_risk.learning import LearningLedger, TradeOutcome
+
+    ledger = LearningLedger(
+        tuple(
+            TradeOutcome(
+                strategy_id=str(row["strategy_id"]),
+                symbol=str(row["symbol"]),
+                regime=str(row["regime"]),
+                r_multiple=Decimal(str(row["r_multiple"])),
+                decided_at_ms=int(row["decided_at_ms"]),
+                source=row.get("source", "LIVE"),
+            )
+            for row in request.get("outcomes", [])
+        )
+    )
+    return {"table": ledger.table()}
+
+
 async def evaluate(request: dict) -> dict:
     signal_symbol = request["review"]["intent"]["symbol"]
     venue_symbol = venue_symbol_for(signal_symbol)
@@ -359,7 +381,9 @@ def main() -> int:
     sys.path.insert(1, sys.argv[2])
     request = json.load(sys.stdin)
     try:
-        answer: dict[str, Any] = asyncio.run(evaluate(request))
+        answer: dict[str, Any] = (
+            ledger_table(request) if request.get("op") == "ledger" else asyncio.run(evaluate(request))
+        )
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
         answer = {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
     sys.stdout.write("\n" + MARKER + json.dumps(answer, separators=(",", ":")) + "\n")

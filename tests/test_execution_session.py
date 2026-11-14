@@ -208,3 +208,41 @@ def test_replayed_signals_join_the_ledger_as_half_weight_evidence(tmp_path):
         encoding="utf-8",
     )
     assert trader.learning_outcomes() == [replay]
+
+
+def test_adaptive_strategy_is_observed_measured_and_never_traded(tmp_path, monkeypatch):
+    import asyncio as aio
+
+    from kairos_autotrader import engine as engine_module
+
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    start = 1_800_000_000_000
+    intent = {
+        "intent_id": "a" * 64,
+        "side": "LONG",
+        "reference_price": 100.0,
+        "decision_ts_ms": start,
+        "exit_plan": {"stop_price": 99.0, "target_price": 102.0, "max_holding_ms": 10 * 60_000},
+    }
+
+    async def fake_scan(config, series, slot, **kwargs):
+        return {
+            "strategy_id": "adaptive_pullback_range_v1",
+            "results": {"SOLUSDT": {"status": "INTENT", "regime": "BULL", "intent": intent}},
+        }
+
+    monkeypatch.setattr(engine_module, "adaptive_shadow_scan", fake_scan)
+    rows = [
+        [start + i * 60_000, 100.0, 100.5 if i < 3 else 102.5, 99.5, 100.2, 1, 1, 1, 1, "x"]
+        for i in range(15)
+    ]
+    trader.engine = object()  # the scan itself is stubbed; only its presence matters here
+    aio.run(trader._observe_adaptive({"SOLUSD": rows[:2]}, start))
+    assert trader.store.state["shadow_pending"][0]["id"] == "a" * 64
+    assert not venue.market_bodies, "an observed strategy never places an order"
+    trader._measure_shadow({"SOLUSD": rows})
+    assert trader.store.state["shadow_pending"] == []
+    outcomes = trader.learning_outcomes()
+    assert len(outcomes) == 1 and outcomes[0]["source"] == "REPLAY"
+    assert outcomes[0]["strategy_id"] == "adaptive_pullback_range_v1" and float(outcomes[0]["r_multiple"]) > 1

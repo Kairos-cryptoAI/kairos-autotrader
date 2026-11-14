@@ -220,6 +220,8 @@ def fake_engine(
     requests: list[dict] = []
 
     def runner(config, request):
+        if request.get("op") == "adaptive_bars":  # the observed research strategy: no intents here
+            return {"strategy_id": "adaptive_pullback_range_v1", "strategy_revision": "1", "results": {}}
         requests.append(request)
         results = {}
         for symbol, rows in request["series"].items():

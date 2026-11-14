@@ -107,13 +107,66 @@ def _registered(request: dict, candle_type: Any) -> dict:
     return {"results": results}
 
 
+def _closed_bars(symbol: str, rows: list, candle_type: Any) -> list:
+    """The strict closed bars of cached rows, each checked against its recorded identity."""
+    from kairos_strategy.runtime import candle_to_closed_bar
+
+    bars = []
+    for row in rows:
+        bar = candle_to_closed_bar(
+            candle_type(
+                symbol=str(symbol),
+                timeframe="1m",
+                open_time_ms=int(row[0]),
+                close_time_ms=int(row[0]) + MINUTE_MS - 1,
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+                quote_volume=float(row[6]),
+                taker_buy_volume=float(row[7]),
+                taker_buy_quote_volume=float(row[8]),
+            )
+        )
+        if bar.bar_sha256 != row[9]:
+            raise ValueError(f"cached bar {int(row[0])} does not hash to its recorded identity")
+        bars.append(bar)
+    return bars
+
+
+def _adaptive_bars(request: dict, candle_type: Any) -> dict:
+    """The research ``adaptive`` strategy in its own DRY_RUN observation mode, per symbol."""
+    from kairos_strategy.adaptive.adapter import evaluate_adaptive_closed_bars
+    from kairos_strategy.adaptive.config import STRATEGY_ID, STRATEGY_REVISION, UNIVERSE
+
+    results: dict[str, dict] = {}
+    for symbol, rows in request["series"].items():
+        if symbol not in UNIVERSE:
+            continue
+        try:
+            evaluation = evaluate_adaptive_closed_bars(
+                _closed_bars(symbol, rows, candle_type),
+                observed_at_ms=int(request["observed_at_ms"]),
+                source_set_sha256=str(request["source_set_sha256"]),
+            )
+            results[symbol] = {
+                "status": evaluation.decision.status,
+                "reason": evaluation.decision.reason,
+                "regime": str(evaluation.decision.regime.value),
+                "intent": None if evaluation.intent is None else evaluation.intent.model_dump(mode="json"),
+            }
+        except Exception as exc:  # noqa: BLE001 - one broken symbol must not hide the others
+            results[symbol] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    return {"strategy_id": STRATEGY_ID, "strategy_revision": STRATEGY_REVISION, "results": results}
+
+
 def _hourly_trend_bars(request: dict, candle_type: Any) -> dict:
     from kairos_strategy.hourly_trend import (
         HourlyTrendCandidatesConfig,
         evaluate_hourly_trend_closed_bars,
         hourly_trend_source_identity,
     )
-    from kairos_strategy.runtime import candle_to_closed_bar
 
     # Only fields of the engine's own validated config are accepted; the identity reports it.
     config = HourlyTrendCandidatesConfig(**dict(request.get("config") or {}))
@@ -121,27 +174,7 @@ def _hourly_trend_bars(request: dict, candle_type: Any) -> dict:
     results: dict[str, dict] = {}
     for symbol, rows in request["series"].items():
         try:
-            bars = []
-            for row in rows:
-                bar = candle_to_closed_bar(
-                    candle_type(
-                        symbol=str(symbol),
-                        timeframe="1m",
-                        open_time_ms=int(row[0]),
-                        close_time_ms=int(row[0]) + MINUTE_MS - 1,
-                        open=float(row[1]),
-                        high=float(row[2]),
-                        low=float(row[3]),
-                        close=float(row[4]),
-                        volume=float(row[5]),
-                        quote_volume=float(row[6]),
-                        taker_buy_volume=float(row[7]),
-                        taker_buy_quote_volume=float(row[8]),
-                    )
-                )
-                if bar.bar_sha256 != row[9]:
-                    raise ValueError(f"cached bar {int(row[0])} does not hash to its recorded identity")
-                bars.append(bar)
+            bars = _closed_bars(str(symbol), rows, candle_type)
             tick = increments.get(symbol)
             evaluation = evaluate_hourly_trend_closed_bars(
                 bars, config, price_increment=None if tick is None else Decimal(str(tick))
@@ -186,6 +219,7 @@ def main() -> int:
 
         operations = {
             "hourly_trend_bars": _hourly_trend_bars,
+            "adaptive_bars": _adaptive_bars,
             "hourly_trend_history": _hourly_trend_history,
             None: _registered,
         }

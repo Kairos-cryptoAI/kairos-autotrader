@@ -8,6 +8,7 @@ JSON file.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -67,14 +68,16 @@ from .risk import (
     risk_revisions,
 )
 from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
-from .signals import SIGNAL_VENUE, Features, Routed, signal_symbol
+from .signals import SIGNAL_VENUE, Features, Routed, outcome, signal_symbol
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
     HOURLY_TREND_ID,
     EngineConfig,
     EngineError,
+    adaptive_shadow_scan,
     engine_revision,
     hourly_trend_scan,
+    to_candles,
 )
 from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of
 from .system_rules import revisions as rules_revisions
@@ -192,6 +195,9 @@ class Config:
     # The Risk Manager's adaptive per-trade risk (kairos_risk.adaptive_risk) from the learning
     # ledger of closed trades; always at most the fixed ceiling.
     adaptive_risk: bool = True
+    # The research adaptive strategy runs alongside in observation only; its measured
+    # outcomes feed the learning ledger (as replay-weight evidence).
+    adaptive_shadow: bool = True
     execution_python: str = ""
     execution_session_config: str = ""
 
@@ -800,6 +806,97 @@ class LiveBroker:
         await asyncio.sleep(self._settle_seconds * 2)
 
 
+def collect_learning_outcomes(directory: Path, config: Config, journal=None) -> list[dict[str, Any]]:
+    """Closed trades in R for the learning ledger: this runner's and the Execution Engine's.
+
+    The regime of an Execution Engine trade is the Macro regime journaled before its
+    decision (``macro_allocation``); the runner's own trades carry theirs.
+    """
+    path = directory / "journal.jsonl"
+    records = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    outcomes = [
+        {
+            "strategy_id": r["strategy_id"],
+            "symbol": r["signal_symbol"],
+            "regime": r.get("regime") or "UNKNOWN",
+            "r_multiple": r["r_multiple"],
+            "decided_at_ms": r["decided_at_ms"],
+            "source": "LIVE",
+        }
+        for r in records
+        if r.get("event") == "trade_closed"
+        and r.get("r_multiple") is not None
+        and r.get("strategy_id")
+        and r.get("signal_symbol")
+        and isinstance(r.get("decided_at_ms"), int)
+    ]
+    outcomes.extend(
+        {
+            "strategy_id": r["strategy_id"],
+            "symbol": r["signal_symbol"],
+            "regime": r.get("regime") or "UNKNOWN",
+            "r_multiple": r["r_multiple"],
+            "decided_at_ms": r["decided_at_ms"],
+            "source": "REPLAY",
+        }
+        for r in records
+        if r.get("event") == "shadow_outcome" and r.get("r_multiple") is not None
+    )
+    replay = directory / "learning-replay.jsonl"
+    if replay.exists():
+        for line in replay.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("source") == "REPLAY" and row.get("r_multiple") is not None:
+                outcomes.append(row)
+    if config.executor == "execution_engine" and config.execution_session_config:
+        from .execution_session import closed_trades
+
+        timeline = sorted(
+            (
+                int(datetime.fromisoformat(str(r["produced_at"]).replace("Z", "+00:00")).timestamp() * 1000),
+                r["regime"],
+            )
+            for r in records
+            if r.get("event") == "macro_allocation" and r.get("produced_at") and r.get("regime")
+        )
+
+        def regime_at(at_ms: int) -> str:
+            regime = "UNKNOWN"
+            for produced, value in timeline:
+                if produced > at_ms:
+                    break
+                regime = value
+            return regime
+
+        try:
+            rows = closed_trades(Path(config.execution_python), Path(config.execution_session_config))
+        except (OSError, RuntimeError, ValueError, KeyError) as exc:
+            (journal or (lambda *a, **k: None))("learning_error", message=str(exc)[:200])
+            rows = []
+        outcomes.extend(
+            {
+                "strategy_id": row["strategy_id"],
+                "symbol": row["symbol"],
+                "regime": regime_at(int(row["decided_at_ms"])),
+                "r_multiple": row["r_multiple"],
+                "decided_at_ms": int(row["decided_at_ms"]),
+                "source": "LIVE",
+            }
+            for row in rows
+            if row.get("r_multiple") is not None
+        )
+    return outcomes
+
+
 class Trader:
     def __init__(
         self,
@@ -1137,88 +1234,81 @@ class Trader:
             self.store.journal("halt", reason=reason)
             say(f"НОВЫЕ ВХОДЫ ОСТАНОВЛЕНЫ: {reason}")
 
-    def learning_outcomes(self) -> list[dict[str, Any]]:
-        """Closed trades in R for the learning ledger: this runner's and the Execution Engine's.
-
-        The regime of an Execution Engine trade is the Macro regime journaled before its
-        decision (``macro_allocation``); the runner's own trades carry theirs.
-        """
-        path = self.store.directory / "journal.jsonl"
-        records = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    records.append(json.loads(line))
-                except ValueError:
-                    continue
-        outcomes = [
-            {
-                "strategy_id": r["strategy_id"],
-                "symbol": r["signal_symbol"],
-                "regime": r.get("regime") or "UNKNOWN",
-                "r_multiple": r["r_multiple"],
-                "decided_at_ms": r["decided_at_ms"],
-                "source": "LIVE",
+    async def _observe_adaptive(self, series: dict[str, list[list[Any]]], slot: int) -> None:
+        """Record the adaptive strategy's intents at this boundary; nothing is traded."""
+        if self.engine is None:
+            return
+        try:
+            answer = await adaptive_shadow_scan(
+                self.engine,
+                series,
+                slot,
+                observed_at_ms=int(time.time() * 1000),
+                source_set_sha256=hashlib.sha256(
+                    json.dumps(self._signal_revisions, sort_keys=True).encode()
+                ).hexdigest(),
+            )
+        except EngineError as exc:
+            self.store.journal("shadow_error", message=str(exc)[:300])
+            return
+        allocation = self.macro.allocation() if self.macro else None
+        pending = self.store.state.setdefault("shadow_pending", [])
+        for symbol, result in sorted(answer["results"].items()):
+            intent = result.get("intent")
+            if not intent:
+                continue
+            record = {
+                "id": intent["intent_id"],
+                "strategy_id": answer["strategy_id"],
+                "signal_symbol": symbol,
+                "side": intent["side"],
+                "ref_price": intent["reference_price"],
+                "stop": intent["exit_plan"]["stop_price"],
+                "take": intent["exit_plan"]["target_price"],
+                "timeout_minutes": int(intent["exit_plan"]["max_holding_ms"]) // 60_000,
+                "signal_time": int(intent["decision_ts_ms"]),
+                "regime": (allocation or {}).get("regime") or "UNKNOWN",
+                "detector_regime": result.get("regime"),
             }
-            for r in records
-            if r.get("event") == "trade_closed"
-            and r.get("r_multiple") is not None
-            and r.get("strategy_id")
-            and r.get("signal_symbol")
-            and isinstance(r.get("decided_at_ms"), int)
-        ]
-        replay = self.store.directory / "learning-replay.jsonl"
-        if replay.exists():
-            for line in replay.read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if row.get("source") == "REPLAY" and row.get("r_multiple") is not None:
-                    outcomes.append(row)
-        if self.config.executor == "execution_engine" and self.config.execution_session_config:
-            from .execution_session import closed_trades
+            if all(item["id"] != record["id"] for item in pending):
+                pending.append(record)
+                self.store.journal("shadow_signal", **record)
+        self.store.save()
+        self._measure_shadow(series)
 
-            timeline = sorted(
-                (
-                    int(
-                        datetime.fromisoformat(str(r["produced_at"]).replace("Z", "+00:00")).timestamp()
-                        * 1000
-                    ),
-                    r["regime"],
-                )
-                for r in records
-                if r.get("event") == "macro_allocation" and r.get("produced_at") and r.get("regime")
+    def _measure_shadow(self, series: dict[str, list[list[Any]]]) -> None:
+        """Measure every observed signal whose holding time has passed, on the cached closed bars."""
+        pending = self.store.state.get("shadow_pending", [])
+        if not pending:
+            return
+        by_signal = {signal_symbol(instrument): rows for instrument, rows in series.items()}
+        cost_fraction = 2 * (float(self.fee) + self.config.slippage_fraction)
+        remaining = []
+        for record in pending:
+            rows = by_signal.get(record["signal_symbol"], [])
+            deadline = record["signal_time"] + record["timeout_minutes"] * 60_000
+            if not rows or rows[-1][0] < deadline:
+                remaining.append(record)
+                continue
+            result = outcome(record, to_candles(rows), cost_fraction=cost_fraction)
+            if result["r"] is None:
+                remaining.append(record)
+                continue
+            self.store.journal(
+                "shadow_outcome",
+                strategy_id=record["strategy_id"],
+                signal_symbol=record["signal_symbol"],
+                regime=record["regime"],
+                decided_at_ms=record["signal_time"],
+                r_multiple=str(result["r"]),
+                reason=result["reason"],
             )
+        self.store.state["shadow_pending"] = remaining[-500:]
+        self.store.save()
 
-            def regime_at(at_ms: int) -> str:
-                regime = "UNKNOWN"
-                for produced, value in timeline:
-                    if produced > at_ms:
-                        break
-                    regime = value
-                return regime
-
-            try:
-                rows = closed_trades(
-                    Path(self.config.execution_python), Path(self.config.execution_session_config)
-                )
-            except (OSError, RuntimeError, ValueError, KeyError) as exc:
-                self.store.journal("learning_error", message=str(exc)[:200])
-                rows = []
-            outcomes.extend(
-                {
-                    "strategy_id": row["strategy_id"],
-                    "symbol": row["symbol"],
-                    "regime": regime_at(int(row["decided_at_ms"])),
-                    "r_multiple": row["r_multiple"],
-                    "decided_at_ms": int(row["decided_at_ms"]),
-                    "source": "LIVE",
-                }
-                for row in rows
-                if row.get("r_multiple") is not None
-            )
-        return outcomes
+    def learning_outcomes(self) -> list[dict[str, Any]]:
+        """Closed trades in R for the learning ledger (``collect_learning_outcomes``)."""
+        return collect_learning_outcomes(self.store.directory, self.config, self.store.journal)
 
     def _follow_execution(self) -> bool:
         """Record a finished Execution Engine session; True while one still runs."""
@@ -1454,6 +1544,8 @@ class Trader:
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
                 return [], []
             skipped.extend(found.skipped)
+            if self.config.adaptive_shadow:
+                await self._observe_adaptive(series, slot)
         try:
             metrics = await self.api.metrics()
         except EvedexError:

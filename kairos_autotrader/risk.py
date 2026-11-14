@@ -125,6 +125,16 @@ def _record(decision: RiskTradeDecisionV1, evaluation: dict[str, Any]) -> dict[s
     }
 
 
+async def ledger_table(
+    config: RiskConfig, outcomes: list[dict[str, Any]], runner=None
+) -> list[dict[str, Any]]:
+    """The learning ledger's cells (strategy x instrument x regime) as the Risk Manager sees them."""
+    answer = await asyncio.to_thread(runner or _run_worker, config, {"op": "ledger", "outcomes": outcomes})
+    if "table" not in answer:
+        raise RiskError(str(answer.get("error", "the ledger worker returned no table"))[:200])
+    return list(answer["table"])
+
+
 async def evaluate_entry(
     config: RiskConfig,
     *,
