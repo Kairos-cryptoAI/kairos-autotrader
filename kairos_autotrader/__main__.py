@@ -268,7 +268,38 @@ def _read_journal(directory: Path) -> list[dict]:
     return records
 
 
+def _report_execution(config_path: Path | None) -> None:
+    """The Execution Engine's closed trades, when it is the executor: its database is the journal."""
+    if config_path is None:
+        return
+    config = Config.load(config_path)
+    if config.executor != "execution_engine":
+        return
+    from .execution_session import closed_trades
+
+    try:
+        trades = closed_trades(Path(config.execution_python), Path(config.execution_session_config))
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        say(f"Журнал Execution Engine недоступен: {str(exc)[:200]}")
+        return
+    net = sum(Decimal(t["net_pnl_usd"]) for t in trades)
+    r_values = [Decimal(t["r_multiple"]) for t in trades if t.get("r_multiple") is not None]
+    wins = sum(Decimal(t["net_pnl_usd"]) > 0 for t in trades)
+    say(
+        f"Execution Engine (единый журнал): сделок закрыто {len(trades)}, в плюс {wins}, "
+        f"итог {net:+.4f} USDT"
+        + (f", средний результат {sum(r_values) / len(r_values):+.3f} R." if r_values else ".")
+    )
+    for t in trades:
+        say(
+            f"  {t['settled_at'][:19]} {t['venue_symbol']} {t['side']} {t['exit_reason']}: "
+            f"{Decimal(t['net_pnl_usd']):+.4f} USDT ({t['r_multiple']} R; комиссии {t['fees_usd']}, "
+            f"финансирование {t['funding_cost_usd']})"
+        )
+
+
 async def cmd_report(args: argparse.Namespace) -> int:
+    _report_execution(getattr(args, "config", None))
     records = _read_journal(args.runtime_dir)
     if not records:
         say("Журнал пуст.")
@@ -448,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     report = sub.add_parser("report", help="summary of the journal")
     report.add_argument("--runtime-dir", type=Path, required=True)
     report.add_argument("--outcomes", action="store_true", help="also evaluate every signal on later candles")
+    report.add_argument("--config", type=Path, help="with executor execution_engine: its closed trades too")
 
     extra = system_cli.add_parsers(sub)
 

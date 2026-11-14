@@ -32,6 +32,20 @@ class ExecutionSettings:
     max_session_s: float
 
 
+def closed_trades(python: Path, session_config: Path) -> list[dict[str, Any]]:
+    """The Execution Engine's closed trades from its own database (``production_report``)."""
+    manifest = json.loads(Path(session_config).read_text(encoding="utf-8"))["manifest"]
+    completed = subprocess.run(  # noqa: S603 - fixed module of the owner's configured environment
+        [str(python), "-m", "kairos_execution.production_report", "--manifest", str(manifest)],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.decode(errors="replace").strip()[:300] or "report failed")
+    return [json.loads(line) for line in completed.stdout.decode().splitlines() if line.strip()]
+
+
 class ExecutionSessions:
     """The one running Execution Engine session, persisted in the runner's state."""
 

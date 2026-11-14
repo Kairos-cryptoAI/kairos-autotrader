@@ -102,3 +102,47 @@ def test_paper_mode_keeps_the_runner_as_executor(tmp_path, monkeypatch):
     cfg = Config(**{"use_llm": False, **_fake_execution(tmp_path, monkeypatch, outcome="REFUSED")})
     trader = paper_trader(tmp_path, FakeVenue(), cfg)
     assert trader.executions is None
+
+
+def test_report_reads_the_execution_engines_closed_trades(tmp_path, monkeypatch, capsys):
+    from kairos_autotrader.execution_session import closed_trades
+
+    package = tmp_path / "fake-report" / "kairos_execution"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    row = {
+        "settled_at": "2026-11-14T10:00:00+00:00",
+        "venue_symbol": "SOLUSD",
+        "side": "BUY",
+        "exit_reason": "TARGET",
+        "net_pnl_usd": "0.31",
+        "r_multiple": "1.2",
+        "fees_usd": "0.02",
+        "funding_cost_usd": "0",
+    }
+    (package / "production_report.py").write_text(
+        "import json, sys\n"
+        "assert sys.argv[sys.argv.index('--manifest') + 1].endswith('manifest.json')\n"
+        f"print(json.dumps({row!r}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fake-report"))
+    session = tmp_path / "session.json"
+    session.write_text(json.dumps({"manifest": str(tmp_path / "manifest.json")}), encoding="utf-8")
+    assert closed_trades(sys.executable, session) == [row]
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "executor": "execution_engine",
+                "execution_python": sys.executable,
+                "execution_session_config": str(session),
+            }
+        ),
+        encoding="utf-8",
+    )
+    from kairos_autotrader.__main__ import _report_execution
+
+    _report_execution(config)
+    out = capsys.readouterr().out
+    assert "сделок закрыто 1" in out and "+1.200 R" in out and "SOLUSD BUY TARGET" in out
