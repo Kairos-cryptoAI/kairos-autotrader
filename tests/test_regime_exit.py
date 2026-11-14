@@ -156,6 +156,7 @@ def _fake_execution_waiting_for_exit(tmp_path, monkeypatch):
     package = tmp_path / "fake-execution" / "kairos_execution"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
     (package / "production_session_cli.py").write_text(
         "import json, os, sys, time\n"
         "args = sys.argv\n"

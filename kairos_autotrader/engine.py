@@ -2141,30 +2141,35 @@ class Trader:
             # The Execution Engine decides again with its own Risk Manager and places the order.
             allocation = self.macro.allocation() if self.macro else None
             adaptive = outcome.record.get("adaptive") or {}
-            session = self.executions.start(
-                candidate_id=candidate.id,
-                review=review.model_dump(mode="json"),
-                allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
-                per_trade_risk_fraction=adaptive.get("per_trade_risk_fraction"),
-                context={
-                    # What the runner needs to judge an early exit and to measure it later.
-                    "instrument": candidate.instrument,
-                    "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
-                    "side": candidate.side,
-                    "regime": (allocation or {}).get("regime") or "UNKNOWN",
-                    "decided_at_ms": risk_decision.decided_at_ms,
-                    "plan": {
-                        "signal_symbol": candidate.intent.symbol,
+            try:
+                session = self.executions.start(
+                    candidate_id=candidate.id,
+                    review=review.model_dump(mode="json"),
+                    allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
+                    per_trade_risk_fraction=adaptive.get("per_trade_risk_fraction"),
+                    context={
+                        # What the runner needs to judge an early exit and to measure it later.
+                        "instrument": candidate.instrument,
+                        "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
                         "side": candidate.side,
-                        "entry": str(ref),
-                        "stop": str(stop),
-                        "take": str(take),
-                        "risk_price": str(abs(ref - stop)),
-                        "start_ms": now_ms,
-                        "deadline_ms": now_ms + candidate.timeout_minutes * 60_000,
+                        "regime": (allocation or {}).get("regime") or "UNKNOWN",
+                        "decided_at_ms": risk_decision.decided_at_ms,
+                        "plan": {
+                            "signal_symbol": candidate.intent.symbol,
+                            "side": candidate.side,
+                            "entry": str(ref),
+                            "stop": str(stop),
+                            "take": str(take),
+                            "risk_price": str(abs(ref - stop)),
+                            "start_ms": now_ms,
+                            "deadline_ms": now_ms + candidate.timeout_minutes * 60_000,
+                        },
                     },
-                },
-            )
+                )
+            except RuntimeError as exc:
+                self.store.journal("entry_skipped", candidate=candidate.id, reason=str(exc)[:300])
+                say(f"Вход пропущен ({candidate.instrument} {candidate.side}): {str(exc)[:200]}")
+                return
             self._day()["trades"] += 1
             self.store.save()
             self.store.journal("execution_session_started", candidate=candidate.id, pid=session["pid"])

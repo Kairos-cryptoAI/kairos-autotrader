@@ -19,6 +19,7 @@ def _fake_execution(tmp_path, monkeypatch, *, outcome: str, delay_s: float = 0.0
     package = tmp_path / "fake-execution" / "kairos_execution"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
     (package / "production_session_cli.py").write_text(
         "import json, sys, time\n"
         f"time.sleep({delay_s})\n"
@@ -110,6 +111,7 @@ def test_report_reads_the_execution_engines_closed_trades(tmp_path, monkeypatch,
     package = tmp_path / "fake-report" / "kairos_execution"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
     row = {
         "settled_at": "2026-11-14T10:00:00+00:00",
         "venue_symbol": "SOLUSD",
@@ -152,6 +154,7 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
     package = tmp_path / "fake-ledger" / "kairos_execution"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
     row = {
         "version": "kairos.execution-closed-trade.v1",
         "strategy_id": "hourly_trend_candidates_v1",
@@ -246,3 +249,21 @@ def test_adaptive_strategy_is_observed_measured_and_never_traded(tmp_path, monke
     outcomes = trader.learning_outcomes()
     assert len(outcomes) == 1 and outcomes[0]["source"] == "REPLAY"
     assert outcomes[0]["strategy_id"] == "adaptive_pullback_range_v1" and float(outcomes[0]["r_multiple"]) > 1
+
+
+def test_stale_readiness_receipts_stop_the_entry_before_any_session(tmp_path, monkeypatch):
+    _real_review(monkeypatch)
+    venue = FakeVenue()
+    trader = live_trader(
+        tmp_path, venue, **_fake_execution(tmp_path, monkeypatch, outcome="CLOSED_AND_ACCOUNTED")
+    )
+    refusing = json.dumps({"ok": False, "error": "facts are missing"})
+    (tmp_path / "fake-execution" / "kairos_execution" / "production_setup.py").write_text(
+        f"import sys\nprint({refusing!r})\nsys.exit(1)\n", encoding="utf-8"
+    )
+    asyncio.run(trader.start())
+    entry = candidate()
+    asyncio.run(trader.try_enter(entry, brain.control_decision([entry])))
+    assert "execution_session" not in trader.store.state and not venue.market_bodies
+    skipped = [e for e in journal_of(trader) if e["event"] == "entry_skipped"][-1]
+    assert "receipts could not be refreshed" in skipped["reason"] and "facts are missing" in skipped["reason"]

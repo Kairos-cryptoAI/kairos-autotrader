@@ -69,6 +69,7 @@ class ExecutionSessions:
     ) -> dict[str, Any]:
         if self.active() is not None:
             raise RuntimeError("an Execution Engine session is already running")
+        self.refresh_receipts()
         directory = Path(self.store.directory) / "execution"
         directory.mkdir(parents=True, exist_ok=True)
         stem = f"{int(time.time() * 1000)}-{candidate_id[:16]}"
@@ -118,6 +119,30 @@ class ExecutionSessions:
         self.store.state["execution_session"] = session
         self.store.save()
         return session
+
+    def refresh_receipts(self) -> None:
+        """Re-sign the seven readiness receipts from their stored facts when they are 12 h old.
+
+        A receipt lives at most 24 hours (``kairos_execution.production_setup refresh``); the
+        session refuses to start on stale ones, so a failure here stops the entry.
+        """
+        root = Path(self.settings.session_config).parent
+        completed = subprocess.run(  # noqa: S603 - fixed module of the owner's configured environment
+            [
+                str(self.settings.python),
+                "-m",
+                "kairos_execution.production_setup",
+                "--root",
+                str(root),
+                "refresh",
+            ],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stdout.decode(errors="replace").strip()[-300:]
+            raise RuntimeError(f"the readiness receipts could not be refreshed: {detail}")
 
     def request_exit(self, reason: str) -> bool:
         """Ask the running session to close its position early; True when newly asked."""
