@@ -345,3 +345,22 @@ def test_adding_to_an_open_position_stays_refused_with_the_measured_verdict(tmp_
         skipped["reason"]
         == "there is already a position in this instrument; adding to it is not measured yet"
     )
+
+
+def test_scan_cadence_takes_one_position_per_instrument_with_cooldown():
+    from kairos_autotrader.management import scan_cadence_summary
+
+    day = 86_400_000
+    records, candles = [], []
+    for d in range(3):
+        start = d * day
+        candles += path(start, [101, 103, 106, 108, 108, 108, 108, 108, 108, 108])
+        records += [
+            record(id=f"a{d}", start=start, minutes=60),
+            record(id=f"b{d}", start=start + 60_000, minutes=60),
+            record(id=f"c{d}", start=start + 9 * 60_000, minutes=60),
+        ]
+    summary = scan_cadence_summary(records, {"SOLUSD": candles}, 0.0, cooldown_minutes=30, days=3)
+    assert summary["every_signal"]["signals"] == 9
+    assert summary["taken"]["signals"] == 3, "one at a time, nothing during the cooldown"
+    assert summary["taken"]["mean_r"] == 1.5

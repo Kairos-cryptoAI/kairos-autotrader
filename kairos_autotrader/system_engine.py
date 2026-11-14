@@ -503,18 +503,24 @@ def hourly_trend_history(
     reward_risk: float,
     timeout_minutes: int,
     runner=None,
+    step_minutes: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Every candidate the live rules produce over a whole bar history, for the replay.
+
+    ``step_minutes`` (research): decide every 1, 5 or 15 minutes with the engine's own
+    decision function instead of the engine's quarter-hour generator.
 
     ``series`` maps an EVEDEX instrument to the bars of its Binance signal symbol. The
     replay reads the engine's research ``SleeveIntent``: a strict intent per candidate
     would hash the whole window thousands of times and add nothing to a report.
     """
-    request = {
-        "op": "hourly_trend_history",
+    request: dict[str, Any] = {
+        "op": "hourly_trend_history" if step_minutes is None else "hourly_trend_history_step",
         "series": {signal_symbol(instrument): bars for instrument, bars in series.items()},
         "config": hourly_trend_config(reward_risk=reward_risk, timeout_minutes=timeout_minutes),
     }
+    if step_minutes is not None:
+        request["step_minutes"] = int(step_minutes)
     _, results = checked_hourly_answer((runner or _run_hourly_trend)(config, request))
     records: list[dict[str, Any]] = []
     problems: list[str] = []

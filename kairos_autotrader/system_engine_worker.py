@@ -209,6 +209,66 @@ def _hourly_trend_history(request: dict, candle_type: Any) -> dict:
     return {"identity": asdict(hourly_trend_source_identity(config)), "results": results}
 
 
+def _hourly_trend_history_step(request: dict, candle_type: Any) -> dict:
+    """Research only: the live rules decided every ``step_minutes`` instead of every quarter.
+
+    The engine's rules read hourly bars that close at the decision. Live, the hour is
+    rebuilt to close at each quarter; here it is rebuilt to close every 1, 5 or 15
+    minutes and the engine's own decision function is applied unchanged. With a 15-minute
+    step this reproduces ``generate_hourly_trend_candidates_intents`` exactly.
+    """
+    from kairos_strategy.hourly_trend import HourlyTrendCandidatesConfig, rules
+    from kairos_strategy.timeframes import aggregate
+
+    step = int(request["step_minutes"])
+    if step not in (1, 5, 15):
+        raise ValueError("step_minutes must be 1, 5 or 15")
+    step_ms, hour_ms = step * MINUTE_MS, 60 * MINUTE_MS
+    four_hours_ms, per_hour = 4 * hour_ms, 60 // step
+    settings = rules._settings(HourlyTrendCandidatesConfig(**dict(request.get("config") or {})))
+    results: dict[str, dict] = {}
+    for symbol, rows in request["series"].items():
+        try:
+            candles = _candles(candle_type, str(symbol), rows)
+            base = candles if step == 1 else aggregate(candles, f"{step}m")
+            bars = [rules._Bar(c.open_time_ms, c.open, c.high, c.low, c.close, c.quote_volume) for c in base]
+            phases = {}
+            for offset in range(0, hour_ms, step_ms):
+                buckets: dict[int, list] = {}
+                for bar in bars:
+                    buckets.setdefault((bar.open_time_ms - offset) // hour_ms * hour_ms + offset, []).append(
+                        bar
+                    )
+                hours = [
+                    rules._merge(items, opened)
+                    for opened, items in sorted(buckets.items())
+                    if len(items) == per_hour
+                ]
+                trend: dict[int, list] = {}
+                for hour in hours:
+                    trend.setdefault(hour.open_time_ms // four_hours_ms * four_hours_ms, []).append(hour)
+                complete = [(opened, items) for opened, items in sorted(trend.items()) if len(items) == 4]
+                phases[offset] = rules._Phase(
+                    hours=hours,
+                    hour_opens=[hour.open_time_ms for hour in hours],
+                    trend_bars=[rules._merge(items, opened) for opened, items in complete],
+                    trend_first_hour_opens=[items[0].open_time_ms for _, items in complete],
+                    trend_last_hour_opens=[items[-1].open_time_ms for _, items in complete],
+                )
+            found = []
+            for candle in base:
+                offset = (candle.close_time_ms + 1) % hour_ms
+                _, intent = rules._decide(str(symbol), candle.close_time_ms, phases[offset], settings)
+                if intent is not None:
+                    found.append(_intent(intent))
+            results[symbol] = {"intents": found}
+        except Exception as exc:  # noqa: BLE001 - one broken symbol must not hide the others
+            results[symbol] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    from kairos_strategy.hourly_trend import hourly_trend_source_identity
+
+    return {"identity": asdict(hourly_trend_source_identity(settings)), "results": results}
+
+
 def main() -> int:
     # argv[1] is the engine's source directory. It replaces this script's own directory
     # on the import path, so nothing from the runner package can shadow engine imports.
@@ -221,6 +281,7 @@ def main() -> int:
             "hourly_trend_bars": _hourly_trend_bars,
             "adaptive_bars": _adaptive_bars,
             "hourly_trend_history": _hourly_trend_history,
+            "hourly_trend_history_step": _hourly_trend_history_step,
             None: _registered,
         }
         answer = operations[request.get("op")](request, Candle)

@@ -244,6 +244,54 @@ def _clustered(values: list[float], clusters: list[str]) -> tuple[float, float]:
     return mean, math.sqrt(variance)
 
 
+def scan_cadence_summary(
+    records: list[dict[str, Any]],
+    candles_by_symbol: Mapping[str, list[Any]],
+    cost_fraction: float,
+    *,
+    cooldown_minutes: int,
+    days: float,
+) -> dict[str, Any]:
+    """How the live rules do when decided at a given cadence: every signal, and the trades taken.
+
+    Taken trades follow the runner: one position per instrument, none while one is open
+    and none during the cooldown after its exit. Errors are clustered by instrument and day.
+    """
+    times = {symbol: [c.t for c in candles] for symbol, candles in candles_by_symbol.items()}
+    every: list[tuple[str, float]] = []
+    taken: list[tuple[str, float]] = []
+    busy_until: dict[str, int] = {}
+    for record in sorted(records, key=lambda r: (r["signal_time"], r["id"])):
+        candles = candles_by_symbol.get(record["symbol"])
+        if not candles:
+            continue
+        begin = bisect_left(times[record["symbol"]], record["signal_time"])
+        window = candles[begin : begin + int(record["timeout_minutes"]) + 2]
+        result = managed_outcome(record, window, cost_fraction=cost_fraction)
+        if result["r"] is None:
+            continue
+        cluster = f"{record['symbol']}:{int(record['signal_time']) // DAY_MS}"
+        every.append((cluster, float(result["r"])))
+        if record["signal_time"] >= busy_until.get(record["symbol"], -1):
+            taken.append((cluster, float(result["r"])))
+            busy_until[record["symbol"]] = int(result["exit_ms"]) + cooldown_minutes * MINUTE_MS
+
+    def stats(rows: list[tuple[str, float]]) -> dict[str, Any]:
+        if len(rows) < 2:
+            return {"signals": len(rows)}
+        mean, error = _clustered([r for _, r in rows], [c for c, _ in rows])
+        return {
+            "signals": len(rows),
+            "per_day": round(len(rows) / days, 1),
+            "mean_r": round(mean, 4),
+            "error_r": round(error, 4),
+            "total_r": round(sum(r for _, r in rows), 2),
+            "wins": sum(r > 0 for _, r in rows),
+        }
+
+    return {"every_signal": stats(every), "taken": stats(taken)}
+
+
 def compare_policies(
     records: list[dict[str, Any]],
     candles_by_symbol: Mapping[str, list[Any]],

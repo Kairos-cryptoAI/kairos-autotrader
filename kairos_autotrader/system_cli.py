@@ -23,7 +23,13 @@ import aiohttp
 from .binance_bars import ClosedBarStore, QuantConfig, http_fetcher
 from .engine import BAR_MS, Config, ConfigError, Store, say
 from .evedex import Evedex
-from .management import compare_policies, policies_for, scale_in_evidence, write_policy
+from .management import (
+    compare_policies,
+    policies_for,
+    scale_in_evidence,
+    scan_cadence_summary,
+    write_policy,
+)
 from .signals import outcome, signal_symbol
 from .system_engine import (
     DAY_MS,
@@ -104,6 +110,77 @@ def summarise(name: str, rows: list[dict[str, Any]], days: float) -> dict[str, A
         "median_stop_pct": round(stop, 3),
         "exits": dict(exits),
     }
+
+
+async def cmd_scan_replay(args: argparse.Namespace) -> int:
+    """The live rules decided at several cadences on the same history, with costs."""
+    config = Config.load(args.config)
+    engine = EngineConfig(window_days=args.days, timeout_s=1_800.0)
+    engine.check()
+    symbols = args.symbols or config.symbols
+    args.runtime_dir.mkdir(parents=True, exist_ok=True)
+    quant = QuantConfig()
+    quant.check()
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        api = Evedex(session)
+        fee = float(await api.taker_fee())
+        cost_fraction = 2 * (fee + config.slippage_fraction)
+        now_ms = int(time.time() * 1000)
+        _, problems, bars = await collect(
+            api, MinuteStore(args.runtime_dir / "minute-cache"), engine, symbols, now_ms
+        )
+        signal_bars, bar_problems = await ClosedBarStore(args.runtime_dir / "closed-bars").update(
+            quant,
+            [signal_symbol(symbol) for symbol in symbols],
+            now_ms,
+            args.days * DAY_MS,
+            fetch=http_fetcher(session),
+        )
+    problems.extend(f"{symbol}: {reason}" for symbol, reason in bar_problems.items())
+    series = {s: signal_bars[signal_symbol(s)] for s in symbols if signal_symbol(s) in signal_bars}
+    candles_by_symbol = {s: to_candles(bars[s]) for s in symbols if bars.get(s)}
+    days = max(1.0, args.days - 12.5)
+    say(f"Боевые правила, решение каждые {', '.join(map(str, args.steps))} мин; {len(series)} инструментов.")
+    report: dict[str, Any] = {"cost_fraction": cost_fraction, "days": args.days, "steps": {}}
+    engine_quarter = None
+    for step in args.steps:
+        records, step_problems = hourly_trend_history(
+            engine,
+            series,
+            reward_risk=config.reward_risk,
+            timeout_minutes=config.timeout_minutes,
+            step_minutes=step,
+        )
+        problems.extend(step_problems)
+        if step == 15:
+            engine_quarter, _ = hourly_trend_history(
+                engine, series, reward_risk=config.reward_risk, timeout_minutes=config.timeout_minutes
+            )
+            same = {(r["symbol"], r["signal_time"], r["side"]) for r in records} == {
+                (r["symbol"], r["signal_time"], r["side"]) for r in engine_quarter
+            }
+            report["step15_matches_engine"] = same
+            say(f"  проверка: 15 мин совпадает с генератором движка — {'да' if same else 'НЕТ'}")
+        summary = scan_cadence_summary(
+            records, candles_by_symbol, cost_fraction, cooldown_minutes=config.cooldown_minutes, days=days
+        )
+        report["steps"][str(step)] = summary
+        for label, key in (("все сигналы", "every_signal"), ("взятые сделки", "taken")):
+            item = summary[key]
+            if "mean_r" not in item:
+                say(f"  {step} мин, {label}: {item['signals']}")
+                continue
+            say(
+                f"  {step} мин, {label}: {item['signals']} ({item['per_day']} в день), "
+                f"{item['mean_r']:+.3f} ± {item['error_r']:.3f} R, всего {item['total_r']:+.1f} R, "
+                f"в плюс {item['wins']}"
+            )
+    for problem in problems[:20]:
+        say(f"  замечание: {problem}")
+    path = args.runtime_dir / "scan-replay.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    say(f"Подробности: {path}. Это условный результат по истории, не сделки.")
+    return 0
 
 
 async def cmd_engine_replay(args: argparse.Namespace) -> int:
@@ -388,6 +465,15 @@ def add_parsers(sub: argparse._SubParsersAction) -> dict[str, Any]:
     replay.add_argument("--days", type=int, default=45)
     replay.add_argument("--symbols", nargs="*")
 
+    cadence = sub.add_parser(
+        "scan-replay", help="compare deciding the live rules every 1, 5 or 15 minutes on history; no orders"
+    )
+    cadence.add_argument("--runtime-dir", type=Path, required=True)
+    cadence.add_argument("--config", type=Path)
+    cadence.add_argument("--days", type=int, default=30)
+    cadence.add_argument("--steps", type=int, nargs="+", default=[15, 5, 1])
+    cadence.add_argument("--symbols", nargs="*")
+
     shadow = sub.add_parser("shadow", help="record the Strategy Engine's new intents; no orders, no keys")
     shadow.add_argument("--runtime-dir", type=Path, required=True)
     shadow.add_argument("--config", type=Path)
@@ -395,4 +481,9 @@ def add_parsers(sub: argparse._SubParsersAction) -> dict[str, Any]:
     shadow.add_argument("--max-cycles", type=int, help=argparse.SUPPRESS)
     news = sub.add_parser("news", help="one Text Scouts poll without a model key; no orders")
     news.add_argument("--runtime-dir", type=Path)
-    return {"engine-replay": cmd_engine_replay, "shadow": cmd_shadow, "news": cmd_news}
+    return {
+        "engine-replay": cmd_engine_replay,
+        "scan-replay": cmd_scan_replay,
+        "shadow": cmd_shadow,
+        "news": cmd_news,
+    }
