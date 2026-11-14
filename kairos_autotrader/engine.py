@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from decimal import ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ from .evedex import (
     plain,
 )
 from .execution_session import FINAL_OK, ExecutionSessions, ExecutionSettings
+from .management import Management, load_policy, managed_stop, partial_level, tighter
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
     LIVE_ACCOUNT_SOURCE,
@@ -203,6 +204,10 @@ class Config:
     # Close an open position early when the regime turns against it (measured; see
     # REGIME_EXIT_MIN_SAMPLES).
     regime_exit: bool = True
+    # Break-even, trailing stops and partial exits: "measured" applies the policy a replay
+    # proved better than the plan (management-policy.json in the runtime directory);
+    # "off" always keeps the plan.
+    management: str = "measured"
     execution_python: str = ""
     execution_session_config: str = ""
 
@@ -258,6 +263,8 @@ class Config:
             raise ConfigError("macro_effort must be low, medium or high")
         if not 1 <= float(self.macro_refresh_hours) <= 24:
             raise ConfigError("macro_refresh_hours must be within 1..24")
+        if self.management not in ("measured", "off"):
+            raise ConfigError("management must be measured or off")
         if not 0 < Decimal(str(self.max_account_equity_usd)) <= HARD_MAX_ACCOUNT_EQUITY_USD:
             raise ConfigError(f"max_account_equity_usd must be within (0, {HARD_MAX_ACCOUNT_EQUITY_USD}]")
         if self.review_mode not in ("probability", "aggregator"):
@@ -329,6 +336,59 @@ def regime_exit_reason(
     if produced is None or (decided_at_ms is not None and produced <= int(decided_at_ms)):
         return None
     return f"Macro regime {regime} opposes the open {side} (entered in {entry_regime or 'UNKNOWN'})"
+
+
+def management_step(
+    trade: dict[str, Any], book: Book, instrument: Instrument | None
+) -> tuple[Decimal | None, Decimal | None]:
+    """What the trade's management policy asks for now: a tighter stop and/or a partial exit.
+
+    The best price since entry is updated from the book. A new stop is on the price tick,
+    strictly less risky than the stop in force and away from the market by one tick; a
+    partial exit is a multiple of the quantity step and leaves at least the minimum lot.
+    """
+    if not trade.get("management"):
+        return None, None
+    policy = Management.from_dict(trade["management"])
+    side, entry = trade["side"], float(trade["entry_price"])
+    initial = float(trade.get("initial_stop", trade["stop"]))
+    touch = book.bid if side == "LONG" else book.ask
+    best = float(trade.get("best_price", trade["entry_price"]))
+    best = max(best, float(touch)) if side == "LONG" else min(best, float(touch))
+    trade["best_price"] = repr(best)
+    part: Decimal | None = None
+    level = partial_level(policy, side, entry, initial)
+    if level is not None and not trade.get("partial_done") and instrument is not None:
+        reached = float(touch) >= level if side == "LONG" else float(touch) <= level
+        if reached:
+            quantity = dec(trade["quantity"])
+            step = instrument.quantity_step
+            wanted = quantity * Decimal(repr(policy.partial_fraction))
+            part = (wanted / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if part < instrument.min_quantity or quantity - part < instrument.min_quantity:
+                trade["partial_done"] = "skipped: the position is not divisible into minimum lots"
+                part = None
+    desired = managed_stop(policy, side, entry, initial, best)
+    if trade.get("partial_done") == "done" and policy.breakeven_at_r is not None:
+        desired = tighter(side, desired, entry)
+    if instrument is None:
+        return None, part
+    tick = instrument.price_step
+    rounding = ROUND_DOWN if side == "LONG" else ROUND_UP
+    stop = (Decimal(repr(desired)) / tick).to_integral_value(rounding=rounding) * tick
+    current = dec(trade["stop"])
+    safe = stop <= touch - tick if side == "LONG" else stop >= touch + tick
+    better = stop > current if side == "LONG" else stop < current
+    return (stop if better and safe else None), part
+
+
+def row_price(row: dict[str, Any]) -> Decimal | None:
+    """A TP/SL row's price, or None when the venue did not give a readable one."""
+    try:
+        price = Decimal(str(row.get("price")))
+    except ArithmeticError:
+        return None
+    return price if price.is_finite() and price > 0 else None
 
 
 def estimate_pnl(trade: dict[str, Any], exit_price: Decimal, fee: Decimal) -> Decimal:
@@ -437,8 +497,24 @@ class PaperBroker:
         fees = (entry + price) * quantity * self._fee
         pnl = sign * (price - entry) * quantity - fees
         trade["exit_price"] = str(price)
-        trade["pnl_usd"] = str(pnl)
+        trade["pnl_usd"] = str(pnl + dec(trade.get("partial_pnl_usd", "0")))
         self._store.state["paper_equity"] = str(await self.equity() + pnl)
+
+    async def move_stop(self, trade: dict[str, Any], stop: Decimal) -> bool:
+        trade["stop"] = str(stop)
+        return True
+
+    async def partial_close(self, trade: dict[str, Any], book: Book, quantity: Decimal) -> Decimal | None:
+        """Close part of the position at the book; returns the price."""
+        entry = dec(trade["entry_price"])
+        sign = 1 if trade["side"] == "LONG" else -1
+        touch = book.bid if sign > 0 else book.ask
+        price = touch * (1 - sign * self._slip)
+        pnl = sign * (price - entry) * quantity - (entry + price) * quantity * self._fee
+        trade["partial_pnl_usd"] = str(dec(trade.get("partial_pnl_usd", "0")) + pnl)
+        trade["quantity"] = str(dec(trade["quantity"]) - quantity)
+        self._store.state["paper_equity"] = str(await self.equity() + pnl)
+        return price
 
     async def settle(self, trade: dict[str, Any]) -> None:
         return None
@@ -772,6 +848,66 @@ class LiveBroker:
                 return True
         return False
 
+    async def move_stop(self, trade: dict[str, Any], stop: Decimal) -> bool:
+        """Place the tighter stop first; only once the venue holds it, cancel the older stops.
+
+        If the cancel fails, two stops stay: the tighter one acts first and the leftover is
+        cancelled when the position is settled. The stop never moves toward more risk.
+        """
+        symbol, current = trade["symbol"], dec(trade["stop"])
+        if not (stop > current if trade["side"] == "LONG" else stop < current):
+            raise ValueError("a stop may only move toward less risk")
+        position = await self.position(symbol)
+        if position is None:
+            return False
+        if not await self._protect(symbol, position.side, stop, "stop-loss"):
+            self._store.journal("stop_move_refused", symbol=symbol, stop=str(stop), kept=str(current))
+            return False
+        rows = await self._api.active_tpsl(symbol)
+        if not any(row.get("type") == "stop-loss" and row_price(row) == stop for row in rows):
+            self._store.journal("stop_move_unconfirmed", symbol=symbol, stop=str(stop), kept=str(current))
+            return False
+        trade["stop"] = str(stop)
+        for row in rows:
+            # A stop whose price cannot be read is left in place: more protection, never less.
+            if row.get("type") == "stop-loss" and row_price(row) not in (None, stop):
+                try:
+                    await self._api.cancel_tpsl(symbol, str(row.get("id")))
+                    self._store.journal("protection_cancelled", id=row.get("id"), kind="stop-loss")
+                except EvedexError as exc:
+                    self._store.journal("protection_cancel_failed", id=row.get("id"), error=str(exc)[:200])
+        return True
+
+    async def partial_close(self, trade: dict[str, Any], book: Book, quantity: Decimal) -> Decimal | None:
+        """Close part of the position; the full-position TP/SL keep covering the rest."""
+        symbol = trade["symbol"]
+        before = await self.position(symbol)
+        if before is None or before.quantity - quantity <= 0:
+            return None
+        order_id = new_order_id()
+        self._store.journal("partial_close_sent", order_id=order_id, symbol=symbol, quantity=str(quantity))
+        self._positions_at = None
+        try:
+            await self._api.post_close(
+                self._signer(self._chains()[0]).close_order(
+                    order_id=order_id, instrument=symbol, quantity=quantity
+                )
+            )
+        except (Rejected, Unknown) as exc:
+            self._store.journal("partial_close_failed", order_id=order_id, error=str(exc)[:200])
+        for _ in range(10):
+            await asyncio.sleep(self._settle_seconds)
+            try:
+                after = await self.position(symbol)
+            except EvedexError:
+                continue
+            if after is not None and after.quantity == before.quantity - quantity:
+                trade["quantity"] = str(after.quantity)
+                return book.bid if trade["side"] == "LONG" else book.ask
+            if after is None:
+                return None
+        return None
+
     async def ensure_stop(self, trade: dict[str, Any]) -> bool:
         """After a restart: make sure a live stop-loss exists for the adopted position."""
         symbol = trade["symbol"]
@@ -1014,6 +1150,7 @@ class Trader:
             self.risk = None
             say(f"Risk Manager недоступен, новых входов не будет: {exc}")
         self._reviews: dict[str, Any] = {}
+        self._policy: tuple[int, Management | None, str] = (0, None, "not loaded")
         self.executions: ExecutionSessions | None = None
         if config.executor == "execution_engine" and broker.mode == "live":
             self.executions = ExecutionSessions(
@@ -1380,6 +1517,61 @@ class Trader:
                 self.store.journal("regime_exit_requested", candidate=session.get("candidate"), reason=reason)
                 say(f"Execution Engine: прошу досрочно закрыть позицию — {reason}.")
         return session is not None
+
+    def management_policy(self, now_ms: int) -> Management | None:
+        """The measured management policy for new trades (re-read every ten minutes)."""
+        if self.config.management == "off":
+            return None
+        loaded_at, policy, reason = self._policy
+        if now_ms - loaded_at >= 600_000:
+            policy, reason = load_policy(
+                self.store.directory, now_ms=now_ms, reward_risk=self.config.reward_risk
+            )
+            if reason != self._policy[2]:
+                self.store.journal(
+                    "management_policy", policy=policy.as_dict() if policy else None, reason=reason
+                )
+            self._policy = (now_ms, policy, reason)
+        return policy
+
+    async def _manage_execution(self, now_ms: int) -> None:
+        """A soft managed stop for an Execution Engine position: close early once crossed.
+
+        That path keeps its hard exchange stop at the plan; the runner asks for an early
+        close when the market crosses the stop the measured policy would have moved to.
+        Partial exits are not available there.
+        """
+        session = self.executions.active() if self.executions else None
+        if not session or session.get("exit_requested") or not session.get("management"):
+            return
+        plan = session.get("plan") or {}
+        book = await self.api.book(session["instrument"])
+        view = {
+            "side": plan["side"],
+            "entry_price": plan["entry"],
+            "stop": session.get("managed_stop", plan["stop"]),
+            "initial_stop": plan["stop"],
+            "best_price": session.get("best_price", plan["entry"]),
+            "quantity": "0",
+            "management": session["management"],
+            "partial_done": "not available on the Execution Engine path",
+        }
+        stop, _ = management_step(view, book, self.instruments.get(session["instrument"]))
+        session["best_price"] = view["best_price"]
+        if stop is not None:
+            session["managed_stop"] = str(stop)
+            self.store.journal("managed_stop_moved", candidate=session.get("candidate"), stop=str(stop))
+        touch = book.bid if plan["side"] == "LONG" else book.ask
+        managed = dec(session.get("managed_stop", plan["stop"]))
+        crossed = touch <= managed if plan["side"] == "LONG" else touch >= managed
+        if crossed and managed != dec(plan["stop"]):
+            reason = f"managed stop {managed} crossed ({session['management']['name']})"
+            if self.executions is not None and self.executions.request_exit(reason):
+                self.store.journal(
+                    "managed_stop_exit_requested", candidate=session.get("candidate"), reason=reason
+                )
+                say(f"Execution Engine: прошу закрыть позицию — {reason}.")
+        self.store.save()
 
     def _regime_exit(self, side: Any, entry_regime: Any, decided_at_ms: Any) -> str | None:
         """The early-exit reason for an open position, while early exits measurably help."""
@@ -1954,6 +2146,8 @@ class Trader:
                 per_trade_risk_fraction=adaptive.get("per_trade_risk_fraction"),
                 context={
                     # What the runner needs to judge an early exit and to measure it later.
+                    "instrument": candidate.instrument,
+                    "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
                     "side": candidate.side,
                     "regime": (allocation or {}).get("regime") or "UNKNOWN",
                     "decided_at_ms": risk_decision.decided_at_ms,
@@ -2015,6 +2209,10 @@ class Trader:
             "regime": (allocation or {}).get("regime") or "UNKNOWN",
             "decided_at_ms": risk_decision.decided_at_ms,
             "one_r_usd": str(fill["quantity"] * abs(dec(str(fill["price"])) - stop)),
+            # Position management fixed for this trade's life (None: the plan as it is).
+            "initial_stop": str(stop),
+            "initial_quantity": str(fill["quantity"]),
+            "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
         }
         for other in trades:
             other["solo"] = False
@@ -2053,6 +2251,8 @@ class Trader:
                 trade["early_exit"] = early
                 say(f"Досрочный выход {trade['symbol']} {trade['side']}: {early}.")
                 reason = "REGIME_EXIT"
+        if reason is None and trade.get("management"):
+            await self._apply_management(trade, book)
         if reason is None:
             trade["breaches"] = 0
             if now_ms - self._status_at.get(trade["id"], 0) >= 600_000:
@@ -2081,6 +2281,33 @@ class Trader:
             self.store.save()
             raise
 
+    async def _apply_management(self, trade: dict[str, Any], book: Book) -> None:
+        """Move the stop toward less risk and take a partial profit, as the trade's policy says."""
+        stop, part = management_step(trade, book, self.instruments.get(trade["symbol"]))
+        if part is not None:
+            price = await self.broker.partial_close(trade, book, part)
+            if price is not None:
+                trade["partial_done"] = "done"
+                if self.broker.mode == "live":
+                    # Exact for a solo trade (balance change); an estimate when positions overlap.
+                    partial = estimate_pnl({**trade, "quantity": str(part)}, price, self.fee)
+                    trade["partial_pnl_usd"] = str(dec(trade.get("partial_pnl_usd", "0")) + partial)
+                self.store.journal(
+                    "partial_exit",
+                    id=trade["id"],
+                    quantity=str(part),
+                    price=str(price),
+                    left=trade["quantity"],
+                )
+                say(f"Частичный выход {trade['symbol']}: {part} по {price}, осталось {trade['quantity']}.")
+                stop, _ = management_step(trade, book, self.instruments.get(trade["symbol"]))
+        if stop is not None:
+            before = trade["stop"]
+            if await self.broker.move_stop(trade, stop):
+                self.store.journal("stop_moved", id=trade["id"], old=before, new=str(stop))
+                say(f"Стоп {trade['symbol']} перенесён {before} → {stop} (к меньшему риску).")
+        self.store.save()
+
     async def _trade_result(
         self, trade: dict[str, Any], reason: str, book: Book | None, equity: Decimal
     ) -> tuple[Decimal, bool]:
@@ -2094,7 +2321,7 @@ class Trader:
         touch = book.bid if trade["side"] == "LONG" else book.ask
         exit_price = nearest_level(trade, touch) if reason == "VENUE_EXIT" else touch
         trade["exit_price"] = str(exit_price)
-        return estimate_pnl(trade, exit_price, self.fee), False
+        return estimate_pnl(trade, exit_price, self.fee) + dec(trade.get("partial_pnl_usd", "0")), False
 
     async def _finish(self, trade: dict[str, Any], reason: str, book: Book | None, *, close: bool) -> None:
         if close:
@@ -2147,7 +2374,9 @@ class Trader:
                     "entry": str(entry),
                     "stop": trade["stop"],
                     "take": trade["take"],
-                    "risk_price": str(dec(trade["one_r_usd"]) / dec(trade["quantity"])),
+                    "risk_price": str(
+                        dec(trade["one_r_usd"]) / dec(trade.get("initial_quantity", trade["quantity"]))
+                    ),
                     "start_ms": trade["opened_ms"],
                     "deadline_ms": trade["deadline_ms"],
                     "exit_r": str(r_multiple),
@@ -2197,6 +2426,7 @@ class Trader:
         if failure is not None:
             raise failure
         if self.executions is not None and self._follow_execution():
+            await self._manage_execution(now_ms)
             return
         if self.entries_blocked():
             return

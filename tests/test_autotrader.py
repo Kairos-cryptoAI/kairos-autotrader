@@ -334,7 +334,13 @@ class FakeVenue:
         self.position_list.append(Position(symbol, body["side"], quantity, ask, self.attach_stop))
         if self.attach_stop:
             self.tpsl += [
-                {"id": f"{symbol}-t{i}", "instrument": symbol, "type": item["type"], "status": "active"}
+                {
+                    "id": f"{symbol}-t{i}",
+                    "instrument": symbol,
+                    "type": item["type"],
+                    "price": item.get("price"),
+                    "status": "active",
+                }
                 for i, item in enumerate(body.get("tpsl", []))
             ]
         if self.unknown_entry:
@@ -364,6 +370,7 @@ class FakeVenue:
                 "id": f"s{len(self.tpsl)}",
                 "instrument": body["instrument"],
                 "type": body["type"],
+                "price": body.get("price"),
                 "status": "active",
             }
         )

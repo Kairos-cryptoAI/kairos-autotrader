@@ -23,6 +23,7 @@ import aiohttp
 from .binance_bars import ClosedBarStore, QuantConfig, http_fetcher
 from .engine import BAR_MS, Config, ConfigError, Store, say
 from .evedex import Evedex
+from .management import compare_policies, policies_for, write_policy
 from .signals import outcome, signal_symbol
 from .system_engine import (
     DAY_MS,
@@ -155,10 +156,12 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
     rows: list[dict[str, Any]] = []
     own: list[dict[str, Any]] = []
     own_quarter: list[dict[str, Any]] = []
+    candles_by_symbol: dict[str, list[Any]] = {}
     for symbol in symbols:
         candles = to_candles(bars.get(symbol, []))
         if not candles:
             continue
+        candles_by_symbol[symbol] = candles
         rows.extend(evaluate([c for c in candidates if c["symbol"] == symbol], candles, cost_fraction))
         quarter = [c for c in live if c["symbol"] == symbol]
         own_quarter.extend(evaluate(quarter, candles, cost_fraction))
@@ -176,6 +179,26 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
     summary.append(summarise(LIVE_RULES, own, max(1.0, args.days - 12.5)))
     summary.append(summarise(LIVE_RULES_QUARTER, own_quarter, max(1.0, args.days - 12.5)))
     say("Не запускались: " + "; ".join(f"{name} ({reason})" for name, reason in EXCLUDED_SLEEVES.items()))
+    # Position management (break-even, trailing, partial exits) against the plan, paired on
+    # the live rules' signals; the chosen policy, if any is proven, is used by the runner.
+    management = compare_policies(live, candles_by_symbol, cost_fraction, policies_for(config.reward_risk))
+    policy = write_policy(args.runtime_dir, management, now_ms=now_ms, reward_risk=config.reward_risk)
+    say("Сопровождение позиции против плана (те же сигналы, ошибка с учётом пересечений):")
+    for item in management:
+        say(
+            f"  {item['policy']['name']}: {item['mean_r']:+.3f} R (план {item['plan_mean_r']:+.3f} R), "
+            f"выигрыш {item['gain_r']:+.3f} ± {item['gain_error_r']:.3f} R, "
+            f"нижняя граница {item['gain_lower_r']:+.3f} R"
+        )
+    say(
+        "Выбрано: "
+        + (
+            policy["policy"]["name"]
+            if policy["policy"]
+            else "ничего — ни одно сопровождение не доказало преимущества, позиции идут по плану"
+        )
+        + "."
+    )
     say(
         "Это условный результат по истории, не сделки. "
         "Погрешность ± показывает, отличим ли результат от нуля."
@@ -187,6 +210,7 @@ async def cmd_engine_replay(args: argparse.Namespace) -> int:
         "symbols": symbols,
         "cost_fraction": cost_fraction,
         "summary": [s for s in summary if s],
+        "management": management,
         "problems": problems,
         "signals": rows,
     }
