@@ -267,3 +267,27 @@ def test_stale_readiness_receipts_stop_the_entry_before_any_session(tmp_path, mo
     assert "execution_session" not in trader.store.state and not venue.market_bodies
     skipped = [e for e in journal_of(trader) if e["event"] == "entry_skipped"][-1]
     assert "receipts could not be refreshed" in skipped["reason"] and "facts are missing" in skipped["reason"]
+
+
+def test_a_briefly_locked_heartbeat_is_written_on_retry(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from tests.test_autotrader import paper_trader
+
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False))
+    original = Path.replace
+    failures = []
+
+    def flaky(self, target):
+        if len(failures) < 2:
+            failures.append(1)
+            raise PermissionError(5, "Access is denied")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    trader._heartbeat("2026-11-16T00:00:00+00:00")
+    assert json.loads((trader.store.directory / "heartbeat.json").read_text())["started_at"].startswith(
+        "2026-11-16"
+    )
+    journal = trader.store.directory / "journal.jsonl"
+    assert not journal.exists() or not [e for e in journal_of(trader) if e["event"] == "heartbeat_error"]

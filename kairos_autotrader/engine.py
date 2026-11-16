@@ -2503,11 +2503,18 @@ class Trader:
         path = self.store.directory / "heartbeat.json"
         temporary = path.with_suffix(".tmp")
         beat = {"pid": os.getpid(), "started_at": started_at, "at": datetime.now(UTC).isoformat()}
-        try:
-            temporary.write_text(json.dumps(beat), encoding="utf-8")
-            temporary.replace(path)
-        except OSError as exc:
-            self.store.journal("heartbeat_error", message=str(exc)[:200])
+        # On Windows the monitor's read briefly locks the file; the replace is retried.
+        for attempt in range(5):
+            try:
+                temporary.write_text(json.dumps(beat), encoding="utf-8")
+                temporary.replace(path)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as exc:
+                self.store.journal("heartbeat_error", message=str(exc)[:200])
+                return
+        self.store.journal("heartbeat_error", message="the heartbeat file stayed locked")
 
     async def _loop(self, max_steps: int | None) -> None:
         errors = steps = 0
