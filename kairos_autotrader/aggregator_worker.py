@@ -267,6 +267,8 @@ def main() -> int:
     # argv[1] replaces this script's own directory on the import path, so nothing from the
     # runner package can shadow Aggregator imports.
     sys.path[0] = sys.argv[1]
+    if len(sys.argv) > 2:
+        sys.path.insert(1, sys.argv[2])  # the kairos-llm checkout, ahead of the installed copy
     request = json.load(sys.stdin)
     secret = str((request.get("llm") or {}).get("openai_api_key") or "")
     try:

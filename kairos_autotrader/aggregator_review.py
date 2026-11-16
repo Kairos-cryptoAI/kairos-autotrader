@@ -41,6 +41,9 @@ class AggregatorError(RuntimeError):
 class AggregatorConfig:
     python: Path = field(default_factory=lambda: sibling_python("kairos-aggregator"))
     source: Path = field(default_factory=lambda: sibling_checkout("kairos-aggregator"))
+    # kairos-llm from its checkout, ahead of the Aggregator's pinned copy: it carries the
+    # owner's registered budget ceiling (40 USD from 2026-11-16).
+    llm_source: Path = field(default_factory=lambda: sibling_checkout("kairos-llm"))
     timeout_s: float = 150.0
     # An OpenAI-compatible endpoint instead of OpenAI itself; tests point it at a local stub.
     openai_base_url: str | None = None
@@ -50,15 +53,26 @@ class AggregatorConfig:
             raise AggregatorError(f"Aggregator Python not found: {self.python}")
         if not (self.source / "kairos_aggregator" / "candidate_review.py").exists():
             raise AggregatorError(f"Aggregator source not found: {self.source}")
+        if not (self.llm_source / "kairos_llm" / "budget.py").exists():
+            raise AggregatorError(f"kairos-llm source not found: {self.llm_source}")
 
 
 def revisions(config: AggregatorConfig) -> dict[str, str]:
-    return {"aggregator": git_revision(config.source, "kairos_aggregator")}
+    return {
+        "aggregator": git_revision(config.source, "kairos_aggregator"),
+        "llm": git_revision(config.llm_source, "kairos_llm"),
+    }
 
 
 def _run_worker(config: AggregatorConfig, request: dict[str, Any]) -> dict[str, Any]:
     try:
-        return run_worker(config.python, WORKER, [str(config.source)], request, timeout_s=config.timeout_s)
+        return run_worker(
+            config.python,
+            WORKER,
+            [str(config.source), str(config.llm_source)],
+            request,
+            timeout_s=config.timeout_s,
+        )
     except SiblingError as exc:
         raise AggregatorError(f"Aggregator: {exc}") from exc
 
