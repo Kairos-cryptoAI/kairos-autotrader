@@ -22,8 +22,6 @@ def main() -> int:
     worker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(worker)  # type: ignore[union-attr]
 
-    from kairos_core.enums import EvedexProfile
-    from kairos_quant.runtime_venue_gate import VenueGatePolicy, build_venue_quality
     from kairos_quant.venue_comparison import BookLevel, BookSnapshot
 
     payload = json.load(sys.stdin)
@@ -38,28 +36,26 @@ def main() -> int:
         return 0
     now = int(time.time() * 1000)
 
+    lead = int(payload.get("exchange_clock_lead_ms", 0))
+
     def book(source: str, raw: dict) -> BookSnapshot:
         return BookSnapshot(
             source=source,
             symbol=raw["symbol"],
-            timestamp_ms=now - int(raw.get("age_ms", 100)),
+            timestamp_ms=now + lead - int(raw.get("age_ms", 100)),
             bids=tuple(BookLevel(price, quantity) for price, quantity in raw["bids"]),
             asks=tuple(BookLevel(price, quantity) for price, quantity in raw["asks"]),
             latency_ms=50.0,
         )
 
-    venue = build_venue_quality(
-        binance=book("binance", books["binance"]),
-        evedex=book("evedex", books["evedex"]),
-        venue_symbol=books["evedex"]["symbol"],
-        observed_at_ms=now,
+    # The worker's own measurement path, which times it on the venues' clock.
+    venue = worker.venue_quality(
+        book("binance", books["binance"]),
+        book("evedex", books["evedex"]),
+        books["evedex"]["symbol"],
         latency_ms=50,
-        policy=VenueGatePolicy(
-            assessed_notional_usd=request["venue"]["assessed_notional_usd"],
-            taker_fee_bps=request["venue"]["taker_fee_bps"],
-        ),
-        profile=EvedexProfile.PROD,
-        source="kairos-quant-scouts",
+        taker_fee_bps=request["venue"]["taker_fee_bps"],
+        assessed=request["venue"]["assessed_notional_usd"],
     )
     try:
         answer = worker.decide(request, venue)

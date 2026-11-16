@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -22,7 +25,15 @@ from typing import Any
 from kairos_core.contracts import RiskTradeDecisionV1
 from pydantic import ValidationError
 
-from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
+from .sibling import (
+    _PASSED_ENVIRONMENT,
+    MARKER,
+    SiblingError,
+    git_revision,
+    run_worker,
+    sibling_checkout,
+    sibling_python,
+)
 
 WORKER = Path(__file__).with_name("risk_worker.py")
 # Ceilings of LiveRiskLimitsV1 that the runner uses at their maximum.
@@ -65,6 +76,13 @@ def account_id_for(wallet_address: str) -> str:
     return "evedex-prod-" + hashlib.sha256(wallet_address.lower().encode()).hexdigest()[:20]
 
 
+def _constant(value: dict[str, Any]) -> Callable[[], Awaitable[dict[str, Any]]]:
+    async def read() -> dict[str, Any]:
+        return value
+
+    return read
+
+
 def _run_worker(config: RiskConfig, request: dict[str, Any]) -> dict[str, Any]:
     try:
         return run_worker(
@@ -76,6 +94,85 @@ def _run_worker(config: RiskConfig, request: dict[str, Any]) -> dict[str, Any]:
         )
     except SiblingError as exc:
         raise RiskError(f"Risk Manager: {exc}") from exc
+
+
+class RiskSession:
+    """One persistent Risk worker (``risk_worker.py --serve``) shared by every entry.
+
+    The worker keeps Quant Scouts and the Risk Manager loaded. For each entry it measures
+    the venue and only then asks for the account, which the runner reads at that moment:
+    the account evidence reaches the decision well inside its five-second freshness.
+    Any failure kills the worker; the next entry starts a fresh one.
+    """
+
+    def __init__(self, config: RiskConfig) -> None:
+        self.config = config
+        self._process: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
+
+    async def _read(self) -> dict[str, Any]:
+        assert self._process is not None and self._process.stdout is not None
+        while True:
+            line = await self._process.stdout.readline()
+            if not line:
+                raise RiskError("Risk Manager: the worker exited")
+            text = line.decode("utf-8", errors="replace").strip()
+            if text.startswith(MARKER):
+                value = json.loads(text[len(MARKER) :])
+                if not isinstance(value, dict):
+                    raise RiskError("Risk Manager: malformed worker message")
+                return value
+
+    async def _write(self, value: dict[str, Any]) -> None:
+        assert self._process is not None and self._process.stdin is not None
+        self._process.stdin.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
+        await self._process.stdin.drain()
+
+    async def _start(self) -> None:
+        environment = {key: os.environ[key] for key in _PASSED_ENVIRONMENT if key in os.environ}
+        environment["PYTHONIOENCODING"] = "utf-8"
+        self._process = await asyncio.create_subprocess_exec(
+            str(self.config.python),
+            "-s",
+            "-B",
+            str(WORKER),
+            str(self.config.quant_source),
+            str(self.config.risk_source),
+            "--serve",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=environment,
+            limit=32 * 1024 * 1024,
+        )
+        if not (await asyncio.wait_for(self._read(), timeout=self.config.timeout_s * 2)).get("ready"):
+            raise RiskError("Risk Manager: the worker did not get ready")
+
+    async def stop(self) -> None:
+        process, self._process = self._process, None
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    async def ask(
+        self, request: dict[str, Any], account: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        async with self._lock:
+            try:
+                if self._process is None or self._process.returncode is not None:
+                    await self._start()
+                async with asyncio.timeout(self.config.timeout_s):
+                    await self._write(request)
+                    answer = await self._read()
+                    if answer.get("need_account"):
+                        await self._write({"account": await account()})
+                        answer = await self._read()
+                return answer
+            except (TimeoutError, OSError, ValueError, RiskError) as exc:
+                await self.stop()
+                if isinstance(exc, RiskError):
+                    raise
+                raise RiskError(f"Risk Manager: {type(exc).__name__}: {str(exc)[:200]}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,26 +237,35 @@ async def evaluate_entry(
     *,
     review: Any,
     allocation: dict[str, Any] | None,
-    account: dict[str, Any],
+    account: dict[str, Any] | Callable[[], Awaitable[dict[str, Any]]],
     scope: dict[str, Any],
     limits: dict[str, Any],
     taker_fee_bps: float,
     assessed_notional_usd: float,
     adaptive: dict[str, Any] | None = None,
     runner=None,
+    session: RiskSession | None = None,
 ) -> RiskOutcome:
-    """The Risk Manager's decision on one reviewed candidate. Raises ``RiskError`` if it cannot answer."""
-    request = {
+    """The Risk Manager's decision on one reviewed candidate. Raises ``RiskError`` if it cannot answer.
+
+    With a ``session`` and an ``account`` reader, the account is read after the venue is
+    measured, just before the decision.
+    """
+    request: dict[str, Any] = {
         "review": review.model_dump(mode="json"),
         "allocation": allocation,
-        "account": account,
         "scope": scope,
         "limits": limits,
         "venue": {"taker_fee_bps": taker_fee_bps, "assessed_notional_usd": assessed_notional_usd},
     }
     if adaptive is not None:
         request["adaptive"] = adaptive
-    answer = await asyncio.to_thread(runner or _run_worker, config, request)
+    if session is not None and runner is None:
+        reader = account if callable(account) else _constant(account)
+        answer = await session.ask(request, reader)
+    else:
+        request["account"] = await account() if callable(account) else account
+        answer = await asyncio.to_thread(runner or _run_worker, config, request)
     if "refused" in answer:
         reason = str(answer["refused"])[:200]
         record = {"approved": False, "refused": reason}

@@ -53,11 +53,21 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# The decision is timed on the venues' clock: when this computer is behind the exchanges,
+# their book timestamps would otherwise look like they come from the future. Up to this
+# bound the local clock is advanced by the observed lead; beyond it Quant Scouts flags
+# ``exchange_clock_ahead`` and the venue is refused.
+MAX_CLOCK_LEAD_MS = 2_000
+_clock_lead_ms = 0
+
+
+def _venue_now_ms() -> int:
+    return _now_ms() + _clock_lead_ms
+
+
 async def _measure(signal_symbol: str, venue_symbol: str, *, taker_fee_bps: float, assessed: float):
     """One PROD ``VenueQualityV1`` from both public books, fetched now."""
     import aiohttp
-    from kairos_core.enums import EvedexProfile
-    from kairos_quant.runtime_venue_gate import VenueGatePolicy, build_venue_quality
     from kairos_quant.venue_comparison import parse_binance_book, parse_evedex_book
 
     async with aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -75,12 +85,33 @@ async def _measure(signal_symbol: str, venue_symbol: str, *, taker_fee_bps: floa
         )
     evedex = parse_evedex_book(venue_symbol, evedex_raw, latency_ms=evedex_ms)
     binance = parse_binance_book(signal_symbol, binance_raw, latency_ms=binance_ms)
+    return venue_quality(
+        binance,
+        evedex,
+        venue_symbol,
+        latency_ms=math.ceil(max(evedex_ms, binance_ms)),
+        taker_fee_bps=taker_fee_bps,
+        assessed=assessed,
+    )
+
+
+def venue_quality(
+    binance, evedex, venue_symbol: str, *, latency_ms: int, taker_fee_bps: float, assessed: float
+):
+    """``build_venue_quality`` observed on the venues' clock (see ``MAX_CLOCK_LEAD_MS``)."""
+    global _clock_lead_ms
+    from kairos_core.enums import EvedexProfile
+    from kairos_quant.runtime_venue_gate import VenueGatePolicy, build_venue_quality
+
+    local = _now_ms()
+    lead = max(binance.timestamp_ms, evedex.timestamp_ms) - local
+    _clock_lead_ms = lead if 0 < lead <= MAX_CLOCK_LEAD_MS else 0
     return build_venue_quality(
         binance=binance,
         evedex=evedex,
         venue_symbol=venue_symbol,
-        observed_at_ms=_now_ms(),
-        latency_ms=math.ceil(max(evedex_ms, binance_ms)),
+        observed_at_ms=local + _clock_lead_ms,
+        latency_ms=latency_ms,
         policy=VenueGatePolicy(assessed_notional_usd=assessed, taker_fee_bps=taker_fee_bps),
         profile=EvedexProfile.PROD,
         source="kairos-quant-scouts",
@@ -283,11 +314,11 @@ def decide(request: dict, venue) -> dict:
         review=review,
         venue=venue,
         allocation=allocation,
-        decided_at_ms=_now_ms(),
+        decided_at_ms=_venue_now_ms(),
         system_mode=SystemMode.NORMAL,
         raw_inputs_evidence=venue.measurement_id,
     )
-    answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json")}
+    answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
     if adaptive_record is not None:
         answer["adaptive"] = adaptive_record
     return answer
@@ -394,11 +425,70 @@ async def evaluate(request: dict) -> dict:
     return decide(request, venue)
 
 
+def _say(message: dict) -> None:
+    sys.stdout.write("\n" + MARKER + json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _listen() -> dict:
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError("the runner closed the session")
+    value = json.loads(line)
+    if not isinstance(value, dict):
+        raise ValueError("a request must be one JSON object")
+    return value
+
+
+async def _serve_one(request: dict) -> dict:
+    """Measure the venue first, then ask for the account, so it is read just before deciding."""
+    signal_symbol = request["review"]["intent"]["symbol"]
+    venue_symbol = venue_symbol_for(signal_symbol)
+    if venue_symbol is None or venue_symbol not in set(request["scope"]["instruments"]):
+        return {"refused": f"{signal_symbol} is outside Quant Scouts' approved PROD symbol map"}
+    venue = await _measure(
+        signal_symbol,
+        venue_symbol,
+        taker_fee_bps=float(request["venue"]["taker_fee_bps"]),
+        assessed=float(request["venue"]["assessed_notional_usd"]),
+    )
+    _say({"need_account": True})
+    request = {**request, "account": _listen()["account"]}
+    return decide(request, venue)
+
+
+def serve() -> int:
+    """A persistent worker: libraries load once; one request per line, answers after MARKER."""
+    import kairos_quant.runtime_venue_gate  # noqa: F401 - warm the imports before the first entry
+    import kairos_risk.live  # noqa: F401
+
+    _say({"ready": True})
+    while True:
+        try:
+            request = _listen()
+        except EOFError:
+            return 0
+        except ValueError as exc:
+            _say({"error": f"ValueError: {str(exc)[:300]}"})
+            continue
+        try:
+            answer = (
+                ledger_table(request) if request.get("op") == "ledger" else asyncio.run(_serve_one(request))
+            )
+        except EOFError:
+            return 0
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
+            answer = {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+        _say(answer)
+
+
 def main() -> int:
     # argv[1] replaces this script's own directory on the import path, so nothing from the
     # runner package can shadow the system's imports.
     sys.path[0] = sys.argv[1]
     sys.path.insert(1, sys.argv[2])
+    if "--serve" in sys.argv[3:]:
+        return serve()
     request = json.load(sys.stdin)
     try:
         answer: dict[str, Any] = (

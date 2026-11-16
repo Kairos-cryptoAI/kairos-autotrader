@@ -64,6 +64,7 @@ from .risk import (
     PER_TRADE_RISK_FRACTION,
     RiskConfig,
     RiskError,
+    RiskSession,
     account_id_for,
     evaluate_entry,
     risk_revisions,
@@ -88,7 +89,10 @@ HARD_MAX_CAPITAL_USD = Decimal(100)
 HARD_MAX_RISK_PER_TRADE_USD = Decimal(1)
 HARD_MAX_SESSION_LOSS_USD = Decimal(10)
 HARD_MAX_TRADES_PER_DAY = 12
-HARD_MAX_OPEN_POSITIONS = 3
+HARD_MAX_OPEN_POSITIONS = 10
+# One position's notional is sized as a third of the capital basis, however many may be
+# open: their number is bounded by the Risk Manager's aggregate open risk and free margin.
+POSITION_SIZING_SHARES = 3
 # The account equity above which the Risk Manager refuses every entry (LiveRiskLimitsV1).
 HARD_MAX_ACCOUNT_EQUITY_USD = Decimal(250)
 HISTORY_LENGTH = 20
@@ -151,7 +155,7 @@ class Config:
     risk_per_trade_usd: float = 0.25
     session_loss_stop_usd: float = 5.0
     max_trades_per_day: int = 12
-    max_open_positions: int = 3
+    max_open_positions: int = 10
     cooldown_minutes: int = 30  # per instrument, after its trade closes
     reward_risk: float = 1.5
     timeout_minutes: int = 720
@@ -1142,10 +1146,12 @@ class Trader:
         self._rules_revisions = rules_revisions(rules) if self.macro else {}
         # Every entry is decided by the Kairos Risk Manager; without it nothing is opened.
         self.risk: RiskConfig | None = RiskConfig()
+        self.risk_session: RiskSession | None = None
         self._risk_revisions: dict[str, str] = {}
         try:
             self.risk.check()
             self._risk_revisions = risk_revisions(self.risk)
+            self.risk_session = RiskSession(self.risk)
         except RiskError as exc:
             self.risk = None
             say(f"Risk Manager недоступен, новых входов не будет: {exc}")
@@ -1337,7 +1343,7 @@ class Trader:
         """The frozen scope inputs and limits of LiveRiskEvaluator, from this configuration."""
         config = self.config
         capital = float(config.capital_basis_usd)
-        position_cap = capital / int(config.max_open_positions)
+        position_cap = capital / POSITION_SIZING_SHARES
         limits = {
             "per_trade_risk_fraction": PER_TRADE_RISK_FRACTION,
             "aggregate_open_risk_fraction": AGGREGATE_OPEN_RISK_FRACTION,
@@ -1397,6 +1403,7 @@ class Trader:
                 regime=allocation.get("regime"),
                 produced_at=allocation.get("produced_at"),
                 origin=allocation.get("origin"),
+                allocation=allocation,
             )
             weights = ", ".join(
                 f"{name} {weight:.0%}" for name, weight in allocation["strategy_weights"].items()
@@ -2103,7 +2110,9 @@ class Trader:
                     self.risk,
                     review=review,
                     allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
-                    account=await self._account_evidence(),
+                    # Read after the venue is measured, just before the decision.
+                    account=self._account_evidence,
+                    session=self.risk_session,
                     scope=scope,
                     limits=limits,
                     taker_fee_bps=float(self.fee) * 1e4,

@@ -20,7 +20,7 @@ from pathlib import Path
 import aiohttp
 
 from . import system_cli
-from .engine import Config, ConfigError, LiveBroker, PaperBroker, Store, Trader, say
+from .engine import POSITION_SIZING_SHARES, Config, ConfigError, LiveBroker, PaperBroker, Store, Trader, say
 from .evedex import Evedex, EvedexError, OrderSigner, Rejected, new_order_id
 from .signals import outcome
 from .system_engine import EngineError
@@ -135,7 +135,7 @@ async def cmd_check(args: argparse.Namespace) -> int:
             book = await api.book(symbol)
             spread = float((book.ask - book.bid) / book.ask) * 1e4
             lot_usd = max(inst.min_quantity * book.ask, inst.min_volume)
-            share = Decimal(str(config.capital_basis_usd)) / config.max_open_positions
+            share = Decimal(str(config.capital_basis_usd)) / POSITION_SIZING_SHARES
             notes = []
             if spread > config.max_spread_bps:
                 notes.append("спред сейчас шире допустимого")
@@ -462,11 +462,14 @@ async def cmd_report(args: argparse.Namespace) -> int:
             )
     allocations = [r for r in records if r["event"] == "macro_allocation"]
     if allocations:
-        last = allocations[-1]["allocation"]
+        # Older records carry the whole allocation; some carry only its regime and origin.
+        last = allocations[-1].get("allocation") or allocations[-1]
+        reserve = last.get("stable_reserve_pct")
         say(
-            f"  Macro Strategist, последнее решение ({allocations[-1]['ts'][:16]}): режим {last['regime']}, "
-            f"резерв {last['stable_reserve_pct']:.0%}, доли {last['strategy_weights']}, "
-            f"источник: {last.get('origin')}"
+            f"  Macro Strategist, последнее решение ({allocations[-1]['ts'][:16]}): "
+            f"режим {last.get('regime')}, "
+            f"резерв {f'{reserve:.0%}' if isinstance(reserve, int | float) else '—'}, "
+            f"доли {last.get('strategy_weights', '—')}, источник: {last.get('origin')}"
         )
     setups = sorted({c["setup"] for c in candidates.values()})
     if len(setups) > 1:

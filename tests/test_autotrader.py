@@ -112,7 +112,7 @@ def test_number_and_id_formats():
         ("risk_per_trade_usd", 1.5),
         ("session_loss_stop_usd", 11),
         ("max_trades_per_day", 13),
-        ("max_open_positions", 4),
+        ("max_open_positions", 11),
     ],
 )
 def test_hard_ceilings_cannot_be_configured_away(field, value):

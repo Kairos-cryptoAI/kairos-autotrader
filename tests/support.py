@@ -324,6 +324,7 @@ def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), err
     calls: list[dict] = []
 
     async def evaluate(config, *, review, allocation, account, scope, limits, taker_fee_bps, **_):
+        account = await account() if callable(account) else account
         calls.append({"review": review, "allocation": allocation, "account": account, "limits": limits})
         if error is not None:
             raise RiskError(error)

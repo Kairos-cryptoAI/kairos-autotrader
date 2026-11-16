@@ -147,7 +147,14 @@ def lineage(symbol="XRPUSD") -> dict:
 
 
 def decide(
-    *, review_=None, allocation_=..., account_=None, books_=None, refusal_only=False, adaptive_=None
+    *,
+    review_=None,
+    allocation_=...,
+    account_=None,
+    books_=None,
+    refusal_only=False,
+    adaptive_=None,
+    exchange_clock_lead_ms=0,
 ) -> dict:
     config = RiskConfig()
     try:
@@ -175,7 +182,12 @@ def decide(
             str(RUNNER_PACKAGE),
         ],
         input=json.dumps(
-            {"request": request, "books": books_ or books(), "refusal_only": refusal_only}
+            {
+                "request": request,
+                "books": books_ or books(),
+                "refusal_only": refusal_only,
+                "exchange_clock_lead_ms": exchange_clock_lead_ms,
+            }
         ).encode(),
         capture_output=True,
         timeout=60,
@@ -348,7 +360,7 @@ def test_account_evidence_carries_each_positions_lineage(tmp_path, monkeypatch):
     assert position["venue_symbol"] == "SOLUSD" and position["side"] == "LONG"
     assert position["trade"]["risk_decision_id"] == trade["risk_decision_id"]
     assert position["trade"]["entry_order_id"] == trade["id"]
-    assert evidence["reconciliation_seq"] == 2 and calls[-1]["limits"]["max_position_notional_usd"] == 50.0
+    assert evidence["reconciliation_seq"] == 2 and calls[-1]["limits"]["max_position_notional_usd"] == 33.33
 
     del trade["risk_decision_id"]
     assert asyncio.run(trader._account_evidence())["positions"][0]["trade"] is None, (
@@ -503,3 +515,120 @@ def test_adaptive_risk_refuses_an_entry_without_proven_edge_in_the_regime():
     answer = decide(adaptive_={"outcomes": _outcomes([-0.5, 0.2] * 15, regime=regime)})
     assert answer["refused"].startswith("adaptive risk: no proven edge")
     assert answer["adaptive"]["per_trade_risk_fraction"] == "0"
+
+
+def test_a_computer_clock_behind_the_exchanges_does_not_put_the_venue_in_the_future():
+    """Seen live on 2026-11-15: this computer ran 0.7-1.0 s behind Binance and EVEDEX."""
+    behind = decide(exchange_clock_lead_ms=900)
+    assert not [r for r in reasons(behind) if "from_future" in r or r == "input_source_verification_failed"]
+    assert behind["evaluation"]["decision"]["approved"] and 700 <= behind["clock_lead_ms"] <= 900
+    far = decide(exchange_clock_lead_ms=3_000)
+    assert far["clock_lead_ms"] == 0 and not far["evaluation"]["decision"]["approved"]
+    assert "venue_entry_blocked" in reasons(far), "beyond the bound the venue gate refuses it"
+
+
+FAKE_SERVE = """
+import json, os, sys, time
+MARKER = "@@KAIROS-WORKER@@"
+def say(v):
+    print("noise line"); print(MARKER + json.dumps(v)); sys.stdout.flush()
+say({"ready": True})
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("hang"):
+        time.sleep(30)
+    say({"need_account": True, "measured_at": time.time()})
+    account = json.loads(sys.stdin.readline())["account"]
+    say({"echo": account, "pid": os.getpid(), "request_keys": sorted(request)})
+"""
+
+
+def _fake_session(tmp_path, monkeypatch, timeout_s=10.0):
+    import dataclasses
+    import sys
+
+    from kairos_autotrader import risk as risk_module
+
+    script = tmp_path / "fake_risk_worker.py"
+    script.write_text(FAKE_SERVE, encoding="utf-8")
+    monkeypatch.setattr(risk_module, "WORKER", script)
+    config = dataclasses.replace(
+        RiskConfig(),
+        python=Path(sys.executable),
+        quant_source=tmp_path,
+        risk_source=tmp_path,
+        timeout_s=timeout_s,
+    )
+    return risk_module.RiskSession(config)
+
+
+def test_risk_session_reads_the_account_after_the_venue_and_reuses_one_process(tmp_path, monkeypatch):
+    import asyncio
+
+    session = _fake_session(tmp_path, monkeypatch)
+    reads = []
+
+    async def account():
+        reads.append("read")
+        return {"captured_at_ms": len(reads)}
+
+    async def scenario():
+        try:
+            first = await session.ask({"review": 1}, account)
+            second = await session.ask({"review": 2}, account)
+            return first, second
+        finally:
+            await session.stop()
+
+    first, second = asyncio.run(scenario())
+    assert first["echo"] == {"captured_at_ms": 1} and second["echo"] == {"captured_at_ms": 2}
+    assert "account" not in first["request_keys"], "the account is never sent before the venue is measured"
+    assert first["pid"] == second["pid"], "one worker serves every entry"
+
+
+def test_a_hung_risk_worker_is_killed_and_the_next_entry_starts_fresh(tmp_path, monkeypatch):
+    import asyncio
+
+    session = _fake_session(tmp_path, monkeypatch, timeout_s=2.0)
+
+    async def account():
+        return {}
+
+    async def scenario():
+        try:
+            with pytest.raises(RiskError, match="TimeoutError"):
+                await session.ask({"hang": True}, account)
+            assert session._process is None
+            return await session.ask({"review": 3}, account)
+        finally:
+            await session.stop()
+
+    assert asyncio.run(scenario())["echo"] == {}
+
+
+def test_the_real_worker_serves_a_refusal_without_reading_the_account():
+    import asyncio
+
+    from kairos_autotrader.risk import RiskSession
+
+    config = RiskConfig()
+    try:
+        config.check()
+    except RiskError:
+        pytest.skip("Quant Scouts or Risk Manager checkout or environment is not present")
+    session = RiskSession(config)
+
+    async def account():
+        raise AssertionError("a refused candidate needs no account")
+
+    async def scenario():
+        try:
+            request = {
+                "review": review().model_dump(mode="json"),
+                "scope": {**SCOPE, "instruments": ["ETHUSD"]},
+            }
+            return await session.ask(request, account)
+        finally:
+            await session.stop()
+
+    assert "outside Quant Scouts' approved PROD symbol map" in asyncio.run(scenario())["refused"]
