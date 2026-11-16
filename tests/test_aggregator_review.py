@@ -546,7 +546,8 @@ def test_market_snapshots_are_taken_before_the_boundary_and_used_only_for_its_de
     trader.engine = system_engine.EngineConfig()
     boundary = 1_794_400_000_000 // (15 * MINUTE) * (15 * MINUTE)
     assert trader._market_due(boundary - 30_000) == boundary
-    assert trader._market_due(boundary - 60_000) is None, "too early: the snapshot would expire"
+    assert trader._market_due(boundary - 60_000) == boundary
+    assert trader._market_due(boundary - 80_000) is None, "too early: the snapshot would expire"
     assert trader._market_due(boundary - 5_000) is None, "too late: it might land after the decision"
 
     async def update_bars(now_ms):

@@ -109,7 +109,9 @@ SNAPSHOT_BARS = 200  # the indicator window of Quant Scouts' snapshot builder (p
 # The market snapshot for a decision is taken in this window before its boundary: it must be
 # produced before the decision and stay within the snapshot's 120-second life until the
 # review has finished.
-SNAPSHOT_LEAD_MS = (10_000, 55_000)
+# Started 75-10 s before the boundary: 23 instruments on a slow line take up to ~30 s, and a
+# snapshot lives 120 s, past the review 15-40 s after the boundary.
+SNAPSHOT_LEAD_MS = (10_000, 75_000)
 # The strategies the Macro Strategist allocates capital to; the Risk Manager gives an entry
 # capital only through the weight of its intent's strategy id.
 STRATEGY_IDS = (HOURLY_TREND_ID,)

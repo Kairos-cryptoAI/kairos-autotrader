@@ -33,6 +33,9 @@ import json
 import sys
 import time
 
+MAX_CLOCK_LEAD_S = 2.0
+DEPTH_CONCURRENCY = 6
+
 MARKER = "@@KAIROS-WORKER@@"
 DEPTH_LIMIT = 20
 
@@ -65,15 +68,18 @@ def _page(parse_page, page: dict) -> dict:
     }
 
 
-async def _depth(session, rest_base: str, symbol: str) -> dict:
+async def _depth(session, rest_base: str, symbol: str, gate: asyncio.Semaphore | None = None) -> dict:
+    """One book, with the local time it arrived (``_received``): its age is read then."""
     url = f"{rest_base}/fapi/v1/depth"
-    async with session.get(url, params={"symbol": symbol, "limit": str(DEPTH_LIMIT)}) as response:
-        if response.status != 200:
-            raise ValueError(f"depth answered HTTP {response.status}")
-        body = await response.json()
+    async with gate or asyncio.Semaphore(1):
+        async with session.get(url, params={"symbol": symbol, "limit": str(DEPTH_LIMIT)}) as response:
+            if response.status != 200:
+                raise ValueError(f"depth answered HTTP {response.status}")
+            body = await response.json()
+            received = time.time()
     if not isinstance(body, dict):
         raise ValueError("depth answer is not an object")
-    return body
+    return {**body, "_received": received}
 
 
 async def _snapshots(request: dict) -> dict:
@@ -94,27 +100,50 @@ async def _snapshots(request: dict) -> dict:
     )
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as session:
-        # Derivatives first: the collector reads open interest one symbol after another. The
-        # books are read last, so that each one is as fresh as possible when it is built.
-        await collector.refresh_funding(session)
-        await collector.refresh_open_interest(session)
-        depths = await asyncio.gather(
-            *(_depth(session, settings.binance_rest_base, symbol) for symbol in symbols),
-            return_exceptions=True,
+        # The collector reads open interest one symbol after another; the books are read
+        # alongside it, a few at a time (all at once can take 15 s on a slow line). Each
+        # book's age is taken when it arrives.
+        gate = asyncio.Semaphore(DEPTH_CONCURRENCY)
+
+        async def books() -> list:
+            return await asyncio.gather(
+                *(_depth(session, settings.binance_rest_base, symbol, gate) for symbol in symbols),
+                return_exceptions=True,
+            )
+
+        _, _, depths = await asyncio.gather(
+            collector.refresh_funding(session), collector.refresh_open_interest(session), books()
         )
+        # Funding for every symbol is one request; one lost answer would leave all without it.
+        if not all(collector.is_funding_fresh(s, settings.derivatives_stale_after_s) for s in symbols):
+            await collector.refresh_funding(session)
     builder = SnapshotBuilder(settings.service_name, settings.price_window, settings.depth_levels)
     snapshots: dict[str, dict] = {}
+    # Ages are read on the venue's clock: when this computer runs behind Binance (seen
+    # 0.3-1.0 s), a fresh book would otherwise look like it comes from the future. The
+    # local clock is advanced by the observed lead, up to MAX_CLOCK_LEAD_S.
+    leads = [
+        collector._integer(d.get("E")) / 1_000 - d["_received"]
+        for d in depths
+        if isinstance(d, dict) and collector._integer(d.get("E"))
+    ]
+    lead_s = max(leads) if leads else 0.0
+    lead_s = lead_s if 0 < lead_s <= MAX_CLOCK_LEAD_S else 0.0
     for symbol, depth in zip(symbols, depths, strict=True):
         try:
             if isinstance(depth, BaseException):
                 raise ValueError(f"order book unavailable ({type(depth).__name__})")
             event_ms = collector._integer(depth.get("E"))
-            age_s = time.time() - event_ms / 1_000 if event_ms else -1.0
+            age_s = depth["_received"] + lead_s - event_ms / 1_000 if event_ms else -1.0
             if (
                 event_ms is None
                 or not -collector._max_exchange_future_skew_s <= age_s <= settings.book_stale_after_s
             ):
-                raise ValueError("order book is stale or from the future")
+                raise ValueError(
+                    "order book has no event time"
+                    if event_ms is None
+                    else f"order book is stale or from the future (age {age_s:.1f} s)"
+                )
             book_bids, book_asks = normalize_order_book(
                 collector._levels(depth.get("bids")), collector._levels(depth.get("asks"))
             )
