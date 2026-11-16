@@ -391,7 +391,7 @@ def test_answers_about_other_candidates_are_refused():
         with pytest.raises(AggregatorError):
             ask(answer(rows))
     with pytest.raises(AggregatorError, match="ceiling"):
-        ask(answer([]), budget=12.5)
+        ask(answer([]), budget=40.5)
 
 
 def test_allowed_candidates_are_ranked_by_priority_one_per_instrument():
