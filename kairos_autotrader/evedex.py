@@ -139,6 +139,7 @@ class Instrument:
     price_step: Decimal
     min_volume: Decimal
     tradable: bool
+    max_leverage: int = 1  # the venue's own maximum for this instrument
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,11 +201,23 @@ class OrderSigner:
         side: str,
         cash: Decimal,
         protection: list[dict[str, str]] | None = None,
+        leverage: int = 1,
     ) -> dict[str, Any]:
-        """Market IOC by cash. ``protection`` rides in the body; the venue does not sign it."""
+        """Market IOC by cash (the position's notional, whatever the leverage).
+
+        ``protection`` rides in the body; the venue does not sign it.
+        """
         if side not in ("BUY", "SELL") or cash <= 0:
             raise ValueError("market order needs BUY/SELL and positive cash")
-        base = {"id": order_id, "instrument": instrument, "side": side, "timeInForce": "IOC", "leverage": 1}
+        if not 1 <= int(leverage) <= 255:
+            raise ValueError("leverage is a whole number within 1..255")
+        base = {
+            "id": order_id,
+            "instrument": instrument,
+            "side": side,
+            "timeInForce": "IOC",
+            "leverage": int(leverage),
+        }
         signature = self._sign(
             "New market order", {**base, "cashQuantity": eth_number(cash), "chainId": self.chain_id}
         )
@@ -213,10 +226,14 @@ class OrderSigner:
             body["tpsl"] = protection
         return body
 
-    def close_order(self, *, order_id: str, instrument: str, quantity: Decimal) -> dict[str, Any]:
+    def close_order(
+        self, *, order_id: str, instrument: str, quantity: Decimal, leverage: int = 1
+    ) -> dict[str, Any]:
         if quantity <= 0:
             raise ValueError("close quantity must be positive")
-        base = {"id": order_id, "instrument": instrument, "leverage": 1}
+        if not 1 <= int(leverage) <= 255:
+            raise ValueError("leverage is a whole number within 1..255")
+        base = {"id": order_id, "instrument": instrument, "leverage": int(leverage)}
         signature = self._sign(
             "Position close order", {**base, "quantity": eth_number(quantity), "chainId": self.chain_id}
         )
@@ -330,6 +347,7 @@ class Evedex:
                     price_step=dec(row["priceIncrement"]),
                     min_volume=dec(row["minVolume"]),
                     tradable=row.get("trading") == "all" and row.get("marketState") == "OPEN",
+                    max_leverage=max(1, int(row.get("maxLeverage") or 1)),
                 )
             except (KeyError, ValueError):
                 continue

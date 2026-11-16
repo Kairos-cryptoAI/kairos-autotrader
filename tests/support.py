@@ -309,7 +309,9 @@ def fake_parser(monkeypatch) -> None:
 # ---- the Risk Manager in tests of the trading loop ---------------------------------------
 
 
-def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), error=None) -> list[dict]:
+def approve_entries(
+    monkeypatch, *, quantity=None, approve=True, reasons=(), error=None, leverage=1.0
+) -> list[dict]:
     """Every candidate counts as reviewed, and the Risk Manager's answer is a stand-in.
 
     Without ``quantity`` the stand-in sizes like a loss-at-stop rule: the per-trade risk
@@ -339,7 +341,10 @@ def approve_entries(monkeypatch, *, quantity=None, approve=True, reasons=(), err
                 limits["per_trade_dollar_cap_usd"] / per_unit, limits["max_position_notional_usd"] / ref
             )
         decision = SimpleNamespace(
-            decision_id="d" * 64, trade_id="e" * 64, decided_at_ms=int(__import__("time").time() * 1000)
+            decision_id="d" * 64,
+            trade_id="e" * 64,
+            decided_at_ms=int(__import__("time").time() * 1000),
+            leverage=leverage,
         )
         record = {"approved": True, "quantity": float(size), "decision_id": "d" * 64}
         return RiskOutcome(True, Decimal(repr(float(size))), (), decision, record)

@@ -283,7 +283,13 @@ def decide(request: dict, venue) -> dict:
     adaptive_record = None
     if request.get("adaptive") is not None:
         limits, adaptive_record = _adaptive_limits(
-            request["adaptive"], limits, review, allocation, account, venue
+            request["adaptive"],
+            limits,
+            review,
+            allocation,
+            account,
+            venue,
+            int(request.get("venue", {}).get("max_leverage", 1)),
         )
         if limits is None:
             return {
@@ -317,6 +323,7 @@ def decide(request: dict, venue) -> dict:
         decided_at_ms=_venue_now_ms(),
         system_mode=SystemMode.NORMAL,
         raw_inputs_evidence=venue.measurement_id,
+        leverage=float(adaptive_record["leverage"]) if adaptive_record else 1.0,
     )
     answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
     if adaptive_record is not None:
@@ -324,7 +331,9 @@ def decide(request: dict, venue) -> dict:
     return answer
 
 
-def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, venue):
+def _adaptive_limits(
+    adaptive: dict, limits, review, allocation, account: dict, venue, venue_max_leverage: int = 1
+):
     """The Risk Manager's adaptive per-trade fraction (``kairos_risk.adaptive_risk``) from the ledger."""
     from decimal import Decimal
 
@@ -361,18 +370,27 @@ def _adaptive_limits(adaptive: dict, limits, review, allocation, account: dict, 
         review_priority=review.priority,
         venue_cost_bps=Decimal(str(venue.spread_bps)),
     )
-    # Leverage by the same evidence, capped by the constitution (exactly 1x for LIVE today):
-    # the open notional plus the largest proposed position, over equity.
+    # Leverage: the margin the open book and this trade at its full risk need, capped by the
+    # same evidence, the stop, the venue's maximum and the constitution (kairos_risk).
     open_notional = sum(
         Decimal(str(abs(p["quantity"]))) * Decimal(str(p["mark_price"])) for p in account.get("positions", [])
+    )
+    reference = Decimal(str(review.intent.reference_price))
+    stop_fraction = abs(reference - Decimal(str(review.intent.exit_plan.stop_price))) / reference
+    loss_budget = min(equity * decision.fraction, Decimal(str(limits.per_trade_dollar_cap_usd)))
+    this_notional = min(
+        loss_budget / stop_fraction if stop_fraction > 0 else Decimal(0),
+        Decimal(str(limits.max_position_notional_usd)),
     )
     leverage = adaptive_leverage(
         AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
         edge,
         constitution_max=Decimal(str(limits.max_leverage)),
-        required_gross=(open_notional + Decimal(str(limits.max_position_notional_usd))) / equity,
+        required_gross=(open_notional + this_notional) / equity,
         equity_usd=equity,
         peak_equity_usd=peak,
+        stop_fraction=stop_fraction,
+        venue_max=Decimal(int(venue_max_leverage)),
     )
     record = {
         "regime": regime,

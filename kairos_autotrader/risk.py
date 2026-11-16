@@ -195,6 +195,7 @@ def _record(decision: RiskTradeDecisionV1, evaluation: dict[str, Any]) -> dict[s
         "rejection_reasons": list(decision.rejection_reasons),
         "quantity": decision.quantity,
         "notional_usd": decision.notional_usd,
+        "leverage": decision.leverage,
         "loss_budget_usd": decision.loss_budget_usd,
         "worst_case_loss_usd": decision.worst_case_loss_usd,
         "worst_entry_price": decision.worst_entry_price,
@@ -243,6 +244,7 @@ async def evaluate_entry(
     taker_fee_bps: float,
     assessed_notional_usd: float,
     adaptive: dict[str, Any] | None = None,
+    venue_max_leverage: int = 1,
     runner=None,
     session: RiskSession | None = None,
 ) -> RiskOutcome:
@@ -256,7 +258,11 @@ async def evaluate_entry(
         "allocation": allocation,
         "scope": scope,
         "limits": limits,
-        "venue": {"taker_fee_bps": taker_fee_bps, "assessed_notional_usd": assessed_notional_usd},
+        "venue": {
+            "taker_fee_bps": taker_fee_bps,
+            "assessed_notional_usd": assessed_notional_usd,
+            "max_leverage": int(venue_max_leverage),
+        },
     }
     if adaptive is not None:
         request["adaptive"] = adaptive

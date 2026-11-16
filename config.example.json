@@ -1,6 +1,6 @@
 {
   "_comment": "Скопируйте в config.json и меняйте. Потолки зашиты в коде: капитал <= 100, риск на сделку <= 1, убыток сессии <= 10, сделок в день <= 12, позиций одновременно <= 10.",
-  "symbols": ["BTCUSD", "ETHUSD", "HYPEUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "LINKUSD", "SUIUSD", "AAVEUSD", "ZECUSD"],
+  "symbols": ["BTCUSD", "ETHUSD", "HYPEUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "LINKUSD", "SUIUSD", "AAVEUSD", "ZECUSD", "ENAUSD", "1000PEPEUSD", "LTCUSD", "TRXUSD", "ARBUSD", "TAOUSD", "APTUSD", "1000BONKUSD", "VIRTUALUSD", "BCHUSD", "OPUSD", "DOTUSD", "AVAXUSD"],
   "capital_basis_usd": 100,
   "risk_per_trade_usd": 0.25,
   "session_loss_stop_usd": 5,

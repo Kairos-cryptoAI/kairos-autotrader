@@ -155,6 +155,8 @@ def decide(
     refusal_only=False,
     adaptive_=None,
     exchange_clock_lead_ms=0,
+    limits_=None,
+    venue_max_leverage=None,
 ) -> dict:
     config = RiskConfig()
     try:
@@ -166,9 +168,11 @@ def decide(
         "allocation": allocation() if allocation_ is ... else allocation_,
         "account": (account_() if callable(account_) else account_) or account(),
         "scope": SCOPE,
-        "limits": LIMITS,
+        "limits": limits_ or LIMITS,
         "venue": {"taker_fee_bps": 4.5, "assessed_notional_usd": 33.33},
     }
+    if venue_max_leverage is not None:
+        request["venue"]["max_leverage"] = venue_max_leverage
     if adaptive_ is not None:
         request["adaptive"] = adaptive_
     done = subprocess.run(  # nosec B603
@@ -360,7 +364,7 @@ def test_account_evidence_carries_each_positions_lineage(tmp_path, monkeypatch):
     assert position["venue_symbol"] == "SOLUSD" and position["side"] == "LONG"
     assert position["trade"]["risk_decision_id"] == trade["risk_decision_id"]
     assert position["trade"]["entry_order_id"] == trade["id"]
-    assert evidence["reconciliation_seq"] == 2 and calls[-1]["limits"]["max_position_notional_usd"] == 33.33
+    assert evidence["reconciliation_seq"] == 2 and calls[-1]["limits"]["max_position_notional_usd"] == 300.0
 
     del trade["risk_decision_id"]
     assert asyncio.run(trader._account_evidence())["positions"][0]["trade"] is None, (
@@ -632,3 +636,22 @@ def test_the_real_worker_serves_a_refusal_without_reading_the_account():
             await session.stop()
 
     assert "outside Quant Scouts' approved PROD symbol map" in asyncio.run(scenario())["refused"]
+
+
+def test_the_risk_manager_picks_the_leverage_within_the_owners_30x():
+    leveraged = {
+        **LIMITS,
+        "max_leverage": 30.0,
+        "max_position_notional_usd": 300.0,
+        "aggregate_dollar_cap_usd": 3000.0,
+    }
+    answer = decide(adaptive_={"outcomes": []}, limits_=leveraged, venue_max_leverage=75)
+    adaptive = answer["adaptive"]
+    chosen = int(adaptive["leverage"])
+    assert 1 <= chosen <= 3, "without a proven edge: margin only, at most 3x"
+    assert any("edge not proven" in r for r in adaptive["leverage_reasons"])
+    decision = answer["evaluation"]["decision"]
+    assert decision["leverage"] == float(chosen)
+    assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
+    capped = decide(adaptive_={"outcomes": []}, limits_=leveraged, venue_max_leverage=1)
+    assert capped["adaptive"]["leverage"] == "1", "the venue's own maximum caps it"

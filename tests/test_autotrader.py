@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from kairos_autotrader.engine import (
     Config,
     ConfigError,
     LiveBroker,
+    NeedsOperator,
     PaperBroker,
     Store,
     Trader,
@@ -854,28 +856,60 @@ def test_close_falls_back_to_the_other_signing_chain(tmp_path):
     assert only(trader) is None and trader.store.state["chain_id"] == 161803
 
 
-def test_account_leverage_other_than_1x_is_set_to_1x_and_the_order_resent_once(tmp_path):
+def test_instrument_leverage_is_set_to_the_trades_before_the_order(tmp_path):
     venue = FakeVenue()
     venue.account_leverage["SOLUSD"] = 10
     trader = live_trader(tmp_path, venue)
     asyncio.run(trader.start())
     enter(trader)
-    assert venue.leverage_calls == [("SOLUSD", 1)] and len(venue.market_bodies) == 2, (
-        "refused once, then accepted"
-    )
-    assert only(trader)["symbol"] == "SOLUSD" and "leverage_set" in events(trader)
-    assert not trader.store.state.get("halted")
+    assert venue.leverage_calls == [("SOLUSD", 1)] and len(venue.market_bodies) == 1
+    assert venue.market_bodies[0]["leverage"] == 1
+    assert only(trader)["symbol"] == "SOLUSD" and only(trader)["leverage"] == 1
+    assert "leverage_set" in events(trader) and not trader.store.state.get("halted")
 
 
-def test_leverage_that_cannot_be_changed_leaves_no_trade_and_no_loop(tmp_path):
+def test_leverage_that_cannot_be_changed_leaves_no_trade_and_no_order(tmp_path):
     venue = FakeVenue()
     venue.account_leverage["SOLUSD"], venue.leverage_locked = 10, True
     trader = live_trader(tmp_path, venue)
     asyncio.run(trader.start())
     enter(trader)
-    assert venue.leverage_calls == [("SOLUSD", 1)] and len(venue.market_bodies) == 1, "no second attempt"
+    assert venue.leverage_calls == [("SOLUSD", 1)] and not venue.market_bodies, "nothing is sent"
     assert only(trader) is None and "leverage_change_failed" in events(trader)
     assert "pending_entry" not in trader.store.state
+
+
+def test_the_risk_managers_leverage_is_used_for_the_order_and_the_close(tmp_path, monkeypatch):
+    from support import approve_entries
+
+    approve_entries(monkeypatch, leverage=5.0)
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    enter(trader)
+    trade = only(trader)
+    assert venue.leverage_calls == [("SOLUSD", 5)] and venue.market_bodies[0]["leverage"] == 5
+    assert trade["leverage"] == 5
+    trade["deadline_ms"] = 0
+    asyncio.run(trader.manage(trade, now_ms()))
+    assert venue.close_bodies and venue.close_bodies[-1]["leverage"] == 5
+
+
+def test_a_position_larger_than_requested_is_closed_at_once(tmp_path):
+    venue = FakeVenue()
+    original = venue.post_market_order
+
+    async def doubled(body):
+        answer = await original(body)
+        venue.position_list = [dataclasses.replace(p, quantity=p.quantity * 3) for p in venue.position_list]
+        return answer
+
+    venue.post_market_order = doubled
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    with pytest.raises(NeedsOperator, match="larger position"):
+        enter(trader)
+    assert venue.close_bodies and not venue.position_list and "entry_oversized" in events(trader)
 
 
 def test_one_empty_position_answer_does_not_end_a_trade_or_cancel_its_protection(tmp_path):

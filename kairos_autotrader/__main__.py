@@ -20,7 +20,16 @@ from pathlib import Path
 import aiohttp
 
 from . import system_cli
-from .engine import POSITION_SIZING_SHARES, Config, ConfigError, LiveBroker, PaperBroker, Store, Trader, say
+from .engine import (
+    POSITION_NOTIONAL_OF_CAPITAL,
+    Config,
+    ConfigError,
+    LiveBroker,
+    PaperBroker,
+    Store,
+    Trader,
+    say,
+)
 from .evedex import Evedex, EvedexError, OrderSigner, Rejected, new_order_id
 from .signals import outcome
 from .system_engine import EngineError
@@ -135,7 +144,7 @@ async def cmd_check(args: argparse.Namespace) -> int:
             book = await api.book(symbol)
             spread = float((book.ask - book.bid) / book.ask) * 1e4
             lot_usd = max(inst.min_quantity * book.ask, inst.min_volume)
-            share = Decimal(str(config.capital_basis_usd)) / POSITION_SIZING_SHARES
+            share = Decimal(str(config.capital_basis_usd)) * POSITION_NOTIONAL_OF_CAPITAL
             notes = []
             if spread > config.max_spread_bps:
                 notes.append("спред сейчас шире допустимого")

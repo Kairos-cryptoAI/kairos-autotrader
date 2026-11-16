@@ -90,9 +90,13 @@ HARD_MAX_RISK_PER_TRADE_USD = Decimal(1)
 HARD_MAX_SESSION_LOSS_USD = Decimal(10)
 HARD_MAX_TRADES_PER_DAY = 12
 HARD_MAX_OPEN_POSITIONS = 10
-# One position's notional is sized as a third of the capital basis, however many may be
-# open: their number is bounded by the Risk Manager's aggregate open risk and free margin.
-POSITION_SIZING_SHARES = 3
+# The owner's leverage constitution (2026-11-16). The Risk Manager picks each trade's
+# leverage from 1x up to this by need, evidence, the stop and the venue's maximum.
+MAX_LEVERAGE = 30.0
+# One position's notional is at most this multiple of the capital basis; its stop-loss risk
+# is set by the Risk Manager, and the number of positions by its aggregate open risk (1%),
+# the Macro Strategist's gross cap and free margin at the chosen leverage.
+POSITION_NOTIONAL_OF_CAPITAL = 3
 # The account equity above which the Risk Manager refuses every entry (LiveRiskLimitsV1).
 HARD_MAX_ACCOUNT_EQUITY_USD = Decimal(250)
 HISTORY_LENGTH = 20
@@ -486,6 +490,7 @@ class PaperBroker:
         instrument: Instrument,
         stop: Decimal,
         take: Decimal,
+        leverage: int = 1,
     ) -> dict[str, Any] | None:
         price = book.ask * (1 + self._slip) if candidate.side == "LONG" else book.bid * (1 - self._slip)
         return {"quantity": quantity, "price": price, "order_id": "paper", "protected": True}
@@ -622,9 +627,14 @@ class LiveBroker:
         instrument: Instrument,
         stop: Decimal,
         take: Decimal,
+        leverage: int = 1,
     ) -> dict[str, Any] | None:
         store, symbol = self._store, candidate.instrument
         side = "BUY" if candidate.side == "LONG" else "SELL"
+        # The account keeps one leverage per instrument; it is set to this trade's before
+        # the order, which must name the same one.
+        if not await self._set_leverage(symbol, leverage):
+            return None
         ref = book.ask if side == "BUY" else book.bid
         # The venue turns cash into quantity at the fill price. A 0.1% margin keeps a
         # one-tick move during the request from rounding the quantity down a whole step.
@@ -667,7 +677,12 @@ class LiveBroker:
             try:
                 answer = await self._api.post_market_order(
                     signer.market_order(
-                        order_id=order_id, instrument=symbol, side=side, cash=cash, protection=protection
+                        order_id=order_id,
+                        instrument=symbol,
+                        side=side,
+                        cash=cash,
+                        protection=protection,
+                        leverage=int(leverage),
                     )
                 )
                 store.journal(
@@ -704,11 +719,10 @@ class LiveBroker:
                 if wrong_protection_side(exc):
                     continue  # the other reading of the TP/SL side comes next
                 if exc.label == "invalid_order_leverage_error" and not leverage_fixed:
-                    # The account keeps its own leverage per instrument and refuses an order
-                    # that names another one. This engine trades at 1x only, so the setting
-                    # is brought to 1x and the same order is sent once more.
+                    # The account's setting for the instrument differs from the order's:
+                    # it is set again and the same order is sent once more.
                     leverage_fixed = True
-                    if await self._set_leverage_1x(symbol):
+                    if await self._set_leverage(symbol, leverage):
                         attempts.insert(0, (chain, tpsl_side))
                         continue
                 return None
@@ -757,7 +771,17 @@ class LiveBroker:
             quantity=str(position.quantity),
             price=str(position.avg_price),
             stop_attached=position.has_stop,
+            leverage=int(leverage),
         )
+        if position.quantity > quantity * Decimal("1.1") + instrument.quantity_step:
+            # The venue sized the order differently than this program reads its API: never keep
+            # more exposure than the Risk Manager approved.
+            store.journal("entry_oversized", requested=str(quantity), opened=str(position.quantity))
+            say(
+                f"Биржа открыла {position.quantity} вместо {quantity}. Закрываю позицию и останавливаю входы."
+            )
+            await self.close({"symbol": symbol, "leverage": int(leverage)}, book, "OVERSIZED")
+            raise NeedsOperator("the venue opened a larger position than requested; it was closed")
         protected = position.has_stop
         try:
             rows = await self._api.active_tpsl(symbol)
@@ -787,9 +811,9 @@ class LiveBroker:
             "protected": protected,
         }
 
-    async def _set_leverage_1x(self, symbol: str) -> bool:
+    async def _set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
-            await self._api.set_leverage(symbol, 1)
+            await self._api.set_leverage(symbol, int(leverage))
         except EvedexError as exc:
             self._store.journal(
                 "leverage_change_failed",
@@ -799,8 +823,7 @@ class LiveBroker:
             )
             say(f"Не удалось поставить плечо 1x для {symbol}: {getattr(exc, 'label', '') or str(exc)[:120]}")
             return False
-        self._store.journal("leverage_set", symbol=symbol, leverage=1)
-        say(f"На счёте для {symbol} стояло другое плечо. Поставил 1x и отправляю заявку повторно.")
+        self._store.journal("leverage_set", symbol=symbol, leverage=int(leverage))
         return True
 
     async def _protect(self, symbol: str, position_side: str, price: Decimal, kind: str) -> bool:
@@ -894,7 +917,10 @@ class LiveBroker:
         try:
             await self._api.post_close(
                 self._signer(self._chains()[0]).close_order(
-                    order_id=order_id, instrument=symbol, quantity=quantity
+                    order_id=order_id,
+                    instrument=symbol,
+                    quantity=quantity,
+                    leverage=int(trade.get("leverage", 1)),
                 )
             )
         except (Rejected, Unknown) as exc:
@@ -942,7 +968,10 @@ class LiveBroker:
                 try:
                     answer = await self._api.post_close(
                         self._signer(chain).close_order(
-                            order_id=order_id, instrument=symbol, quantity=position.quantity
+                            order_id=order_id,
+                            instrument=symbol,
+                            quantity=position.quantity,
+                            leverage=int(trade.get("leverage", 1)),
                         )
                     )
                     self._store.state["chain_id"] = chain
@@ -1343,13 +1372,13 @@ class Trader:
         """The frozen scope inputs and limits of LiveRiskEvaluator, from this configuration."""
         config = self.config
         capital = float(config.capital_basis_usd)
-        position_cap = capital / POSITION_SIZING_SHARES
+        position_cap = capital * POSITION_NOTIONAL_OF_CAPITAL
         limits = {
             "per_trade_risk_fraction": PER_TRADE_RISK_FRACTION,
             "aggregate_open_risk_fraction": AGGREGATE_OPEN_RISK_FRACTION,
-            "max_leverage": 1.0,
+            "max_leverage": MAX_LEVERAGE,
             "per_trade_dollar_cap_usd": float(config.risk_per_trade_usd),
-            "aggregate_dollar_cap_usd": capital,
+            "aggregate_dollar_cap_usd": capital * MAX_LEVERAGE,
             "daily_loss_cap_usd": float(config.session_loss_stop_usd),
             "max_account_equity_usd": float(config.max_account_equity_usd),
             "max_position_notional_usd": round(position_cap, 2),
@@ -2117,6 +2146,7 @@ class Trader:
                     limits=limits,
                     taker_fee_bps=float(self.fee) * 1e4,
                     assessed_notional_usd=limits["max_position_notional_usd"],
+                    venue_max_leverage=instrument.max_leverage,
                     adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
             except (RiskError, EvedexError, TimeoutError, aiohttp.ClientError, OSError) as exc:
@@ -2192,7 +2222,8 @@ class Trader:
             self.halt("на счёте есть чужая позиция или заявка: " + "; ".join(foreign)[:300])
             return
         equity_before = await self.broker.equity()
-        fill = await self.broker.enter(candidate, quantity, book, instrument, stop, take)
+        leverage = max(1, int(risk_decision.leverage))
+        fill = await self.broker.enter(candidate, quantity, book, instrument, stop, take, leverage=leverage)
         if fill is None:
             return
         trade: dict[str, Any] = {
@@ -2225,6 +2256,7 @@ class Trader:
             "regime": (allocation or {}).get("regime") or "UNKNOWN",
             "decided_at_ms": risk_decision.decided_at_ms,
             "one_r_usd": str(fill["quantity"] * abs(dec(str(fill["price"])) - stop)),
+            "leverage": leverage,
             # Position management fixed for this trade's life (None: the plan as it is).
             "initial_stop": str(stop),
             "initial_quantity": str(fill["quantity"]),
@@ -2237,7 +2269,8 @@ class Trader:
         self.store.save()
         self.store.journal("trade_opened", trade=trade)
         say(
-            f"ВХОД {trade['symbol']} {trade['side']} {trade['quantity']} по {fill['price']}; "
+            f"ВХОД {trade['symbol']} {trade['side']} {trade['quantity']} по {fill['price']}, "
+            f"плечо {trade['leverage']}x; "
             f"стоп {stop}, тейк {take}. Решение: {decision.source}. Открыто позиций: {len(trades)}."
         )
         if not fill["protected"]:
