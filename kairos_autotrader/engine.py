@@ -112,6 +112,12 @@ SNAPSHOT_BARS = 200  # the indicator window of Quant Scouts' snapshot builder (p
 # Started 75-10 s before the boundary: 23 instruments on a slow line take up to ~30 s, and a
 # snapshot lives 120 s, past the review 15-40 s after the boundary.
 SNAPSHOT_LEAD_MS = (10_000, 75_000)
+# The Aggregator must answer within 60 s of the bar's close (the Router's longest review
+# window), so the scan starts soon after the close and runs its parts wide: the last
+# minute bar is on Binance within a second or two of the close.
+SCAN_AFTER_CLOSE_MS = 5_000
+BAR_CONCURRENCY = 8
+ENGINE_PROCESSES = 8
 # The strategies the Macro Strategist allocates capital to; the Risk Manager gives an entry
 # capital only through the weight of its intent's strategy id.
 STRATEGY_IDS = (HOURLY_TREND_ID,)
@@ -1793,6 +1799,7 @@ class Trader:
             now_ms,
             HOURLY_TREND_HISTORY_MS + HOUR_MS,
             fetch=self._fetch_bars,
+            concurrency=BAR_CONCURRENCY,
         )
         return (
             {by_signal[symbol]: rows for symbol, rows in bars.items()},
@@ -1872,7 +1879,10 @@ class Trader:
         if self.engine is None:
             self.store.journal("scan_error", bar=last_closed, message="the signal chain is not available")
             return [], []
+        started = time.monotonic()
+        timing: dict[str, float] = {"start_after_close_s": round((time.time() * 1000 - slot) / 1000, 2)}
         series, problems = await self._update_bars(now_ms)
+        timing["bars_s"] = round(time.monotonic() - started, 2)
         skipped = [f"{symbol}: {reason}" for symbol, reason in problems.items()]
         self._review_bars = {
             signal_symbol(instrument): [row for row in rows if row[0] < slot][-REVIEW_CONTEXT_BARS:]
@@ -1888,12 +1898,14 @@ class Trader:
                     reward_risk=self.config.reward_risk,
                     timeout_minutes=self.config.timeout_minutes,
                     price_increments={name: item.price_step for name, item in self.instruments.items()},
+                    processes=ENGINE_PROCESSES,
                 )
             except EngineError as exc:
                 say(f"Strategy Engine не дал ответа, скан пропущен: {str(exc)[:200]}")
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
                 return [], []
             skipped.extend(found.skipped)
+            timing["engine_s"] = round(time.monotonic() - started - timing["bars_s"], 2)
             if self.config.adaptive_shadow:
                 await self._observe_adaptive(series, slot)
             self._measure_early_exits(series)
@@ -1923,8 +1935,10 @@ class Trader:
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
                 return features, []
             candidates, rejected, router = routing.routed, routing.rejected, routing.settings
+        timing["done_after_close_s"] = round((time.time() * 1000 - slot) / 1000, 2)
         self.store.journal(
             "scan",
+            timing=timing,
             bar=last_closed,
             source="strategy_engine",
             signal_venue=SIGNAL_VENUE,
@@ -2035,6 +2049,7 @@ class Trader:
             # A capture still running would deliver its snapshot after the decision anyway.
             self._market_task.cancel()
         market = self._market["items"] if self._market["boundary"] == boundary else {}
+        started_after_close_s = round((time.time() * 1000 - boundary) / 1000, 2)
         try:
             result = await review_candidates(
                 self.aggregator,
@@ -2065,6 +2080,10 @@ class Trader:
             reviews=reviews,
             ingest_problems=result.ingest_problems[:20],
             market_snapshots=sorted(market),
+            timing={
+                "start_after_close_s": started_after_close_s,
+                "done_after_close_s": round((time.time() * 1000 - boundary) / 1000, 2),
+            },
         )
         picks = allowed_in_order(reviews, candidates, free_slots)
         counts = {name: sum(r["decision"] == name for r in reviews) for name in ("ALLOW", "VETO", "DEFER")}
@@ -2135,6 +2154,11 @@ class Trader:
             reason = "the Risk Manager is not available"
         if reason is None and self.risk is not None:
             scope, limits = self._risk_scope()
+            step = instrument.quantity_step
+            minimum = max(
+                instrument.min_quantity,
+                ceil_step(instrument.min_volume * Decimal("1.03") / ref, step),
+            )
             allocation = self.macro.allocation() if self.macro else None
             try:
                 outcome = await evaluate_entry(
@@ -2149,6 +2173,7 @@ class Trader:
                     taker_fee_bps=float(self.fee) * 1e4,
                     assessed_notional_usd=limits["max_position_notional_usd"],
                     venue_max_leverage=instrument.max_leverage,
+                    min_quantity=minimum,
                     adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
             except (RiskError, EvedexError, TimeoutError, aiohttp.ClientError, OSError) as exc:
@@ -2162,8 +2187,7 @@ class Trader:
                     # The Risk Manager's quantity, down to the venue's lot: never more.
                     book = await self.api.book(candidate.instrument)
                     ref = book.ask if candidate.side == "LONG" else book.bid
-                    quantity = floor_step(outcome.quantity, instrument.quantity_step)
-                    step = instrument.quantity_step
+                    quantity = floor_step(outcome.quantity, step)
                     minimum = max(
                         instrument.min_quantity,
                         ceil_step(instrument.min_volume * Decimal("1.03") / ref, step),
@@ -2489,7 +2513,7 @@ class Trader:
             # In the background, so that positions are still managed while it runs.
             self._market_task = asyncio.create_task(self.capture_market(boundary))
         slot = self.scan_slot(now_ms)
-        if self.store.state.get("last_bar") == slot or now_ms - slot < 10_000:
+        if self.store.state.get("last_bar") == slot or now_ms - slot < SCAN_AFTER_CLOSE_MS:
             return
         self.store.state["last_bar"] = slot
         self.store.save()

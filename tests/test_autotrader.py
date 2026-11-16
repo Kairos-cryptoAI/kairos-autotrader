@@ -27,6 +27,7 @@ from support import (
 
 from kairos_autotrader import brain, routing, signals, system_engine
 from kairos_autotrader.engine import (
+    SCAN_AFTER_CLOSE_MS,
     Config,
     ConfigError,
     LiveBroker,
@@ -1247,7 +1248,7 @@ def test_one_scan_per_quarter_hour_slot(tmp_path):
     trader.store.state["last_bar"] = trader.scan_slot(now) - 15 * 60_000  # the previous slot was scanned
     asyncio.run(trader.step())
     asyncio.run(trader.step())
-    waiting = now - trader.scan_slot(now) < 10_000  # the first ten seconds of a slot are left for the candle
+    waiting = now - trader.scan_slot(now) < SCAN_AFTER_CLOSE_MS  # the first seconds are left for the candle
     assert len(scans) == (0 if waiting else 1), "a slot is scanned once"
     with pytest.raises(ConfigError):
         Config(scan_minutes=5).validate()

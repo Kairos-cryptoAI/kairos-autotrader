@@ -269,33 +269,79 @@ def venue_symbol_for(signal_symbol: str) -> str | None:
 
 def decide(request: dict, venue) -> dict:
     """The Risk Manager's decision on the request with a venue measurement made by this process."""
-    from kairos_core.contracts import CandidateReviewV1, StrategicAllocation, canonical_sha256
-    from kairos_core.enums import SystemMode
-    from kairos_quant.runtime_venue_gate import PROD_SYMBOL_MAP
-    from kairos_risk.live import LiveRiskEvaluator, LiveRiskLimitsV1, LiveRiskScopeV1
+    from kairos_core.contracts import CandidateReviewV1, StrategicAllocation
+    from kairos_risk.live import LiveRiskLimitsV1
 
     review = CandidateReviewV1.model_validate(request["review"])
     allocation = (
         StrategicAllocation.model_validate(request["allocation"]) if request.get("allocation") else None
     )
     scope_in, account = request["scope"], request["account"]
-    limits = LiveRiskLimitsV1(**request["limits"])
-    adaptive_record = None
+    venue_in = request.get("venue", {})
+    base_limits = LiveRiskLimitsV1(**request["limits"])
+    limits, adaptive_record = base_limits, None
     if request.get("adaptive") is not None:
         limits, adaptive_record = _adaptive_limits(
             request["adaptive"],
-            limits,
+            base_limits,
             review,
             allocation,
             account,
             venue,
-            int(request.get("venue", {}).get("max_leverage", 1)),
+            int(venue_in.get("max_leverage", 1)),
         )
         if limits is None:
             return {
                 "refused": "adaptive risk: " + "; ".join(adaptive_record["reasons"]),
                 "adaptive": adaptive_record,
             }
+    result = _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_record)
+    decision = result.decision
+    minimum = venue_in.get("min_quantity")
+    if (
+        adaptive_record is not None
+        and minimum
+        and decision.approved
+        and 0 < decision.quantity < float(minimum)
+    ):
+        # The adaptive share sized a position below the venue's minimum lot: the share is
+        # raised just enough for that lot, only within the constitution's ceiling, and the
+        # Risk Manager decides again with it.
+        from decimal import Decimal
+
+        needed = (
+            Decimal(adaptive_record["per_trade_risk_fraction"])
+            * Decimal(str(minimum))
+            / Decimal(repr(decision.quantity))
+            * Decimal("1.02")
+        )
+        raised_limits, raised_record = _adaptive_limits(
+            request["adaptive"],
+            base_limits,
+            review,
+            allocation,
+            account,
+            venue,
+            int(venue_in.get("max_leverage", 1)),
+            needed_fraction=needed,
+        )
+        if raised_limits is None:
+            adaptive_record = {**adaptive_record, "minimum_lot": raised_record["reasons"][-1]}
+        else:
+            result = _evaluate(scope_in, account, review, allocation, venue, raised_limits, raised_record)
+            adaptive_record = raised_record
+    answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
+    if adaptive_record is not None:
+        answer["adaptive"] = adaptive_record
+    return answer
+
+
+def _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_record):
+    from kairos_core.contracts import canonical_sha256
+    from kairos_core.enums import SystemMode
+    from kairos_quant.runtime_venue_gate import PROD_SYMBOL_MAP
+    from kairos_risk.live import LiveRiskEvaluator, LiveRiskScopeV1
+
     instruments = set(scope_in["instruments"])
     scope = LiveRiskScopeV1(
         context_sha256=canonical_sha256(scope_in["context"]),
@@ -314,7 +360,7 @@ def decide(request: dict, venue) -> dict:
         account_verifiers={account["source_id"]: RunnerAccountVerifier(account["source_id"])},
         input_verifier=RunnerInputVerifier(venue),
     )
-    result = evaluator.evaluate(
+    return evaluator.evaluate(
         account,
         source_id=account["source_id"],
         review=review,
@@ -325,14 +371,18 @@ def decide(request: dict, venue) -> dict:
         raw_inputs_evidence=venue.measurement_id,
         leverage=float(adaptive_record["leverage"]) if adaptive_record else 1.0,
     )
-    answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
-    if adaptive_record is not None:
-        answer["adaptive"] = adaptive_record
-    return answer
 
 
 def _adaptive_limits(
-    adaptive: dict, limits, review, allocation, account: dict, venue, venue_max_leverage: int = 1
+    adaptive: dict,
+    limits,
+    review,
+    allocation,
+    account: dict,
+    venue,
+    venue_max_leverage: int = 1,
+    *,
+    needed_fraction=None,
 ):
     """The Risk Manager's adaptive per-trade fraction (``kairos_risk.adaptive_risk``) from the ledger."""
     from decimal import Decimal
@@ -342,6 +392,7 @@ def _adaptive_limits(
         adapt_limits,
         adaptive_leverage,
         adaptive_risk_fraction,
+        minimum_lot_fraction,
     )
     from kairos_risk.learning import UNKNOWN_REGIME, LearningLedger, TradeOutcome
 
@@ -370,6 +421,23 @@ def _adaptive_limits(
         review_priority=review.priority,
         venue_cost_bps=Decimal(str(venue.spread_bps)),
     )
+    if needed_fraction is not None:
+        raised = minimum_lot_fraction(
+            AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
+            decision,
+            needed_fraction=Decimal(str(needed_fraction)),
+            equity_usd=equity,
+            peak_equity_usd=peak,
+        )
+        if raised is None:
+            return None, {
+                "reasons": [
+                    *decision.reasons,
+                    f"the venue's minimum lot needs {Decimal(str(needed_fraction)):.6f} of equity: "
+                    "above the constitution's ceiling here",
+                ]
+            }
+        decision = raised
     # Leverage: the margin the open book and this trade at its full risk need, capped by the
     # same evidence, the stop, the venue's maximum and the constitution (kairos_risk).
     open_notional = sum(

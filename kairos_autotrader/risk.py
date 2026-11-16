@@ -245,6 +245,7 @@ async def evaluate_entry(
     assessed_notional_usd: float,
     adaptive: dict[str, Any] | None = None,
     venue_max_leverage: int = 1,
+    min_quantity: Decimal | None = None,
     runner=None,
     session: RiskSession | None = None,
 ) -> RiskOutcome:
@@ -264,6 +265,9 @@ async def evaluate_entry(
             "max_leverage": int(venue_max_leverage),
         },
     }
+    if min_quantity is not None:
+        # The venue's minimum lot: a smaller adaptive size is raised to it within the ceiling.
+        request["venue"]["min_quantity"] = str(min_quantity)
     if adaptive is not None:
         request["adaptive"] = adaptive
     if session is not None and runner is None:

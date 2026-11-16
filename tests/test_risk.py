@@ -157,6 +157,7 @@ def decide(
     exchange_clock_lead_ms=0,
     limits_=None,
     venue_max_leverage=None,
+    min_quantity=None,
 ) -> dict:
     config = RiskConfig()
     try:
@@ -173,6 +174,8 @@ def decide(
     }
     if venue_max_leverage is not None:
         request["venue"]["max_leverage"] = venue_max_leverage
+    if min_quantity is not None:
+        request["venue"]["min_quantity"] = str(min_quantity)
     if adaptive_ is not None:
         request["adaptive"] = adaptive_
     done = subprocess.run(  # nosec B603
@@ -655,3 +658,22 @@ def test_the_risk_manager_picks_the_leverage_within_the_owners_30x():
     assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
     capped = decide(adaptive_={"outcomes": []}, limits_=leveraged, venue_max_leverage=1)
     assert capped["adaptive"]["leverage"] == "1", "the venue's own maximum caps it"
+
+
+def test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_beyond():
+    base = decide(adaptive_={"outcomes": []})
+    small = base["evaluation"]["decision"]
+    fraction = Decimal(base["adaptive"]["per_trade_risk_fraction"])
+    assert small["approved"]
+    # A lot 1.5x the adaptive size fits under the 0.25 % ceiling: the share is raised for it.
+    lot = Decimal(repr(small["quantity"])) * Decimal("1.5")
+    raised = decide(adaptive_={"outcomes": []}, min_quantity=lot)
+    decision = raised["evaluation"]["decision"]
+    assert decision["approved"] and Decimal(repr(decision["quantity"])) >= lot
+    assert fraction < Decimal(raised["adaptive"]["per_trade_risk_fraction"]) <= Decimal("0.0025")
+    assert "minimum lot" in raised["adaptive"]["reasons"][-1]
+    assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
+    # A lot that would need more than the ceiling keeps the small size; the runner skips it.
+    huge = decide(adaptive_={"outcomes": []}, min_quantity=Decimal(repr(small["quantity"])) * 10)
+    assert huge["evaluation"]["decision"]["quantity"] == small["quantity"]
+    assert "ceiling" in huge["adaptive"]["minimum_lot"]
