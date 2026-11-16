@@ -30,7 +30,7 @@ from .signals import Routed
 
 WORKER = Path(__file__).with_name("aggregator_worker.py")
 # The ceiling kairos-llm registers for OpenAI; a runner budget may be lower, never higher.
-OPENAI_MONTHLY_CEILING_USD = 12.0
+OPENAI_MONTHLY_CEILING_USD = 40.0
 
 
 class AggregatorError(RuntimeError):
