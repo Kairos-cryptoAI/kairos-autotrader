@@ -276,6 +276,30 @@ def _on_tick(value: float, tick: Decimal | None, *, up: bool) -> float:
     return float((Decimal(repr(value)) / tick).to_integral_value(rounding=rounding) * tick)
 
 
+def _venue_ready(raw_intent: Any, tick: Decimal | None, setup: str) -> Any:
+    """The sleeve intent with its barriers on the venue tick and the reviewers' setup label.
+
+    A long rounds both barriers down, a short both up: the stop moves away from the entry
+    and the target toward it, so the planned risk never shrinks. The declared reward is
+    recomputed from the new target, as the engine's own model requires.
+    """
+    import dataclasses
+
+    long = str(getattr(raw_intent.side, "value", raw_intent.side)).upper() == "LONG"
+    plan = dataclasses.replace(
+        raw_intent.exit_plan,
+        stop_price=_on_tick(raw_intent.exit_plan.stop_price, tick, up=not long),
+        target_price=_on_tick(raw_intent.exit_plan.target_price, tick, up=not long),
+    )
+    reference = raw_intent.reference_price
+    return dataclasses.replace(
+        raw_intent,
+        exit_plan=plan,
+        gross_reward_bps=abs(plan.target_price - reference) / reference * 10_000,
+        metadata=tuple(sorted((*raw_intent.metadata, ("setup", setup)))),
+    )
+
+
 def _registered_bars(request: dict, candle_type: Any) -> dict:
     """A registered strategy's strict intent at one decision, from cached closed Binance bars.
 
@@ -284,8 +308,6 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
     planned risk never shrinks) and the ``setup`` label its reviewers read; the result then
     goes through the engine's own strict conversion, which binds every input bar.
     """
-    import dataclasses
-
     from kairos_strategy import registry
     from kairos_strategy.provenance import config_sha256, installed_source_tree_sha256
     from kairos_strategy.runtime import _strict_intent, canonical_closed_bars, closed_bar_to_candle
@@ -309,19 +331,8 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
             found = [intent for intent in raw if intent.decision_ts_ms == decision_ts_ms]
             intent_json = None
             if found:
-                raw_intent = found[0]
                 tick = Decimal(str(increments[symbol])) if symbol in increments else None
-                long = str(getattr(raw_intent.side, "value", raw_intent.side)).upper() == "LONG"
-                plan = raw_intent.exit_plan
-                plan = dataclasses.replace(
-                    plan,
-                    stop_price=_on_tick(plan.stop_price, tick, up=not long),
-                    # A long rounds both barriers down, a short both up: the stop away
-                    # from the entry and the target toward it.
-                    target_price=_on_tick(plan.target_price, tick, up=not long),
-                )
-                metadata = tuple(sorted((*raw_intent.metadata, ("setup", setup))))
-                adjusted = dataclasses.replace(raw_intent, exit_plan=plan, metadata=metadata)
+                adjusted = _venue_ready(found[0], tick, setup)
                 window = [bar for bar in bars if bar.close_time_ms <= decision_ts_ms]
                 strict = _strict_intent(
                     adjusted,

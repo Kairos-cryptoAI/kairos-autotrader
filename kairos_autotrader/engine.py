@@ -132,6 +132,9 @@ SNAPSHOT_LEAD_MS = (10_000, 75_000)
 SCAN_AFTER_CLOSE_MS = 5_000
 BAR_CONCURRENCY = 8
 ENGINE_PROCESSES = 8
+# The right-tail rule reads 35 days of minute bars per instrument; it runs beside the hourly
+# rules, so it gets its own, larger share of the machine's cores.
+RIGHT_TAIL_PROCESSES = 12
 # The strategies the runner can trade. ``Config.strategies`` selects among them; the Macro
 # Strategist allocates capital to the selected ones, and the Risk Manager gives an entry
 # capital only through the weight of its intent's strategy id.
@@ -1990,7 +1993,7 @@ class Trader:
                     series,
                     slot,
                     price_increments=ticks,
-                    processes=ENGINE_PROCESSES,
+                    processes=RIGHT_TAIL_PROCESSES,
                     interval_hours=self.config.right_tail_interval_hours,
                 )
             )

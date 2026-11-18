@@ -598,3 +598,36 @@ def test_the_worker_puts_both_barriers_on_the_tick_without_shrinking_the_risk():
     assert _on_tick(104.001, tick, up=True) == 104.01
     assert _on_tick(84.001, tick, up=True) == 84.01
     assert _on_tick(84.001, None, up=True) == 84.001
+
+
+def test_the_venue_tick_keeps_the_engine_intent_valid():
+    """Run in the engine's own Python: the adjusted intent must pass its model's checks."""
+    import subprocess
+
+    config = EngineConfig()
+    if not config.python.exists() or not (config.source / "kairos_strategy").exists():
+        pytest.skip("Strategy Engine checkout or environment is not present")
+    worker_dir = Path(system_engine.__file__).parent
+    script = f"""
+import sys
+sys.path[:0] = [{str(config.source)!r}, {str(worker_dir)!r}]
+from decimal import Decimal
+from kairos_core.enums import Side
+from kairos_strategy.models import ExitPlan, SleeveIntent
+from system_engine_worker import _venue_ready
+raw = SleeveIntent(
+    sleeve_id="regime_aligned_right_tail_v1", symbol="1000PEPEUSDT", side=Side.SHORT,
+    decision_ts_ms=1_000_000 * 3_600_000 - 1, entry_eligible_ts_ms=1_000_000 * 3_600_000,
+    entry_expires_ts_ms=1_000_001 * 3_600_000 - 1, reference_price=0.0037731, signal_strength=0.6,
+    gross_reward_bps=abs(0.0029333 - 0.0037731) / 0.0037731 * 10_000,
+    exit_plan=ExitPlan(stop_price=0.00398314, target_price=0.0029333, max_holding_ms=72 * 3_600_000),
+    metadata=(("atr", "0.0001"), ("strategy_version", "regime_aligned_right_tail_v1")),
+)
+ready = _venue_ready(raw, Decimal("0.000001"), "RIGHT_TAIL_TREND")
+plan = ready.exit_plan
+assert plan.stop_price == 0.003984 and plan.target_price == 0.002934, plan
+assert dict(ready.metadata)["setup"] == "RIGHT_TAIL_TREND"
+print("ok")
+"""
+    answer = subprocess.run([str(config.python), "-c", script], capture_output=True, text=True, timeout=120)
+    assert answer.returncode == 0 and answer.stdout.strip().endswith("ok"), answer.stderr[-800:]
