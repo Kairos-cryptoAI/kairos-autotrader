@@ -1429,3 +1429,32 @@ def test_the_loop_wakes_up_when_the_next_scan_is_due(tmp_path):
     assert trader.pause_s(due_s - 2) == pytest.approx(2.05), "near it: wake right when the scan is due"
     assert trader.pause_s(due_s + 0.01) == 5.0, "the next scan is a quarter-hour away"
     assert trader.pause_s(due_s - 0.01) == pytest.approx(0.06)
+
+
+def test_engine_warm_up_reads_windows_the_cache_covers_and_journals_what_it_skipped(tmp_path, monkeypatch):
+    from kairos_autotrader import engine as engine_module
+    from kairos_autotrader.system_engine import EngineConfig, TrendScan
+
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False))
+    trader.engine, trader.right_tail_pool, trader.hourly_pool = EngineConfig(), object(), object()
+    asked = {}
+
+    async def right_tail(engine, series, boundary, **kwargs):
+        asked["right_tail"] = boundary
+        return {}, ["XRPUSD: closed bars do not reach back the daily rule's history"], {}
+
+    async def hourly(engine, series, boundary, **kwargs):
+        asked["hourly"] = boundary
+        return TrendScan({}, {}, {}, {}, [])
+
+    monkeypatch.setattr(engine_module, "right_tail_scan", right_tail)
+    monkeypatch.setattr(engine_module, "hourly_trend_scan", hourly)
+    before = now_ms()
+    asyncio.run(trader._warm_pools({"SOLUSD": []}))
+    hour = 3_600_000
+    # The latest whole hour (the cache reaches back the rule's history from about now), not
+    # the rule's last 4-hourly decision, whose window can start before the cached bars.
+    assert asked["right_tail"] in {before // hour * hour, now_ms() // hour * hour}
+    assert asked["hourly"] == trader.scan_slot(before) or asked["hourly"] == trader.scan_slot(now_ms())
+    warm = {e["rule"]: e for e in journal_of(trader) if e["event"] == "engine_warm"}
+    assert warm["right_tail"]["skipped"] == 1 and warm["hourly"]["skipped"] == 0

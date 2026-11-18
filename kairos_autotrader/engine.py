@@ -82,6 +82,7 @@ from .system_engine import (
     EngineConfig,
     EngineError,
     EnginePool,
+    TrendScan,
     adaptive_shadow_scan,
     engine_revision,
     hourly_trend_scan,
@@ -1958,8 +1959,9 @@ class Trader:
                 ),
             )
         if self.right_tail_pool is not None:
-            interval_ms = int(self.config.right_tail_interval_hours) * HOUR_MS
-            boundary = now_ms - (now_ms - HOUR_MS) % interval_ms
+            # The latest whole hour, not the rule's last decision: the cached window reaches
+            # back the rule's history from about now, and the next decision reuses nearly all of it.
+            boundary = now_ms // HOUR_MS * HOUR_MS
             parts["right_tail"] = (
                 boundary,
                 right_tail_scan(
@@ -1975,12 +1977,18 @@ class Trader:
         async def timed(name: str, boundary: int, work: Any) -> None:
             started = time.monotonic()
             try:
-                await work
+                result = await work
             except EngineError as exc:
                 say(f"Прогрев движка ({name}) не удался, первый скан будет медленнее: {str(exc)[:200]}")
                 return
+            # An instrument the rule skipped was not warmed: its first scan checks its whole window.
+            skipped = result.skipped if isinstance(result, TrendScan) else result[1]
             self.store.journal(
-                "engine_warm", rule=name, boundary=boundary, seconds=round(time.monotonic() - started, 2)
+                "engine_warm",
+                rule=name,
+                boundary=boundary,
+                seconds=round(time.monotonic() - started, 2),
+                skipped=len(skipped),
             )
 
         await asyncio.gather(*(timed(name, boundary, work) for name, (boundary, work) in parts.items()))
