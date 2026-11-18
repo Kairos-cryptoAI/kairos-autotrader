@@ -8,6 +8,7 @@ JSON file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -2784,6 +2785,18 @@ class Trader:
         finally:
             if news_task is not None:
                 news_task.cancel()
+            await self.stop_engine_workers()
+
+    async def stop_engine_workers(self) -> None:
+        """End the background engine work and the persistent workers before the loop closes."""
+        for task in (self._warm_task, self._adaptive_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, EngineError):
+                    await task
+        for pool in (self.right_tail_pool, self.hourly_pool):
+            if pool is not None:
+                await pool.stop()
 
     def _heartbeat(self, started_at: str) -> None:
         """Replace ``heartbeat.json`` on every loop for the single-host alert monitor.

@@ -1393,3 +1393,28 @@ def engine_module_time():
     from kairos_autotrader import engine as engine_module
 
     return engine_module.time
+
+
+def test_run_ends_the_background_engine_work_and_stops_the_persistent_workers(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    stopped = []
+
+    class Pool:
+        def __init__(self, name):
+            self.name = name
+
+        async def stop(self):
+            stopped.append(self.name)
+
+    async def warming():
+        await asyncio.sleep(3600)
+
+    async def run():
+        trader.right_tail_pool, trader.hourly_pool = Pool("right_tail"), Pool("hourly")
+        trader._warm_task = asyncio.create_task(warming())
+        await trader.run(max_steps=1)
+        return trader._warm_task
+
+    warm = asyncio.run(run())
+    assert warm.cancelled() and sorted(stopped) == ["hourly", "right_tail"]
