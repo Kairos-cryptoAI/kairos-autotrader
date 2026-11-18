@@ -169,6 +169,7 @@ def test_the_public_endpoint_is_asked_for_exactly_one_page_of_closed_minutes():
 
     class Response:
         status = 200
+        headers: dict[str, str] = {}
 
         async def __aenter__(self):
             return self
@@ -198,6 +199,50 @@ def test_the_public_endpoint_is_asked_for_exactly_one_page_of_closed_minutes():
     Response.status = 451
     with pytest.raises(BarsError, match="HTTP 451"):
         asyncio.run(http_fetcher(Session())("SOLUSDT", T0, T0 + MINUTE))
+
+
+def test_the_fetcher_keeps_under_the_weight_budget_and_retries_a_refusal():
+    answers = [
+        (200, {"X-MBX-USED-WEIGHT-1M": "1790"}),
+        (200, {"X-MBX-USED-WEIGHT-1M": "1800"}),
+        (429, {"Retry-After": "7"}),
+        (200, {"X-MBX-USED-WEIGHT-1M": "20"}),
+        (418, {"Retry-After": "7"}),
+    ]
+    waits: list[float] = []
+    now = [122.0]  # 2 s into a minute
+
+    class Response:
+        def __init__(self, status, headers):
+            self.status, self.headers = status, headers
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def text(self):
+            return json.dumps([kline(T0)])
+
+    class Session:
+        def get(self, url, *, params, timeout):
+            return Response(*answers.pop(0))
+
+    async def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    fetch = http_fetcher(Session(), clock=lambda: now[0], sleep=sleep)
+    assert asyncio.run(fetch("SOLUSDT", T0, T0 + MINUTE)) == [kline(T0)]
+    assert asyncio.run(fetch("SOLUSDT", T0, T0 + MINUTE)) == [kline(T0)] and waits == []
+    # The budget is used up: wait for the next minute; then a 429 is retried after its Retry-After.
+    assert asyncio.run(fetch("SOLUSDT", T0, T0 + MINUTE)) == [kline(T0)]
+    assert waits == [58.5, 7.0]
+    # 418 means the IP is banned: never retried.
+    with pytest.raises(BarsError, match="HTTP 418"):
+        asyncio.run(fetch("SOLUSDT", T0, T0 + MINUTE))
+    assert waits == [58.5, 7.0]
 
 
 def test_real_quant_scouts_parser_gives_every_kline_its_contract_identity():

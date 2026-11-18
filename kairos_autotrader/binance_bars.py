@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,14 @@ from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, s
 MINUTE_MS = 60_000
 BINANCE_REST = "https://fapi.binance.com"
 KLINES_PATH = "/fapi/v1/klines"
+# Binance USD-M allows 2 400 request weight a minute per IP; a 1 000..1 500-row klines page
+# weighs 10. The fetcher keeps below this share, so a first start that downloads weeks of
+# history for many instruments waits for the next minute instead of being refused.
+WEIGHT_BUDGET_PER_MINUTE = 1_800
+# A refusal (429) is retried after the wait Binance names, at most this many times and only
+# when that wait is short; 418 (the IP is banned) is never retried.
+RATE_LIMIT_RETRIES = 3
+MAX_RETRY_AFTER_S = 65.0
 PAGE_BARS = 499  # the largest page in Binance's second-cheapest request-weight band
 OVERLAP_BARS = 5  # already cached bars that every update downloads again and compares
 WORKER_BARS = 40_000  # bars handed to one parser process
@@ -112,8 +121,22 @@ async def market_snapshots(
     return snapshots, problems
 
 
-def http_fetcher(session: aiohttp.ClientSession, *, timeout_s: float = 20.0) -> FetchPage:
-    """Download one page of closed one-minute klines, ``[start_ms, end_ms)``."""
+def http_fetcher(
+    session: aiohttp.ClientSession,
+    *,
+    timeout_s: float = 20.0,
+    base_url: str = BINANCE_REST,
+    budget: int = WEIGHT_BUDGET_PER_MINUTE,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> FetchPage:
+    """Download one page of closed one-minute klines, ``[start_ms, end_ms)``.
+
+    Binance reports the request weight used in the current minute on every answer
+    (``X-MBX-USED-WEIGHT-1M``). Once it reaches ``budget`` the next request waits for the
+    next minute; a 429 is retried after its ``Retry-After``.
+    """
+    used = {"minute": -1, "weight": 0}
 
     async def fetch(symbol: str, start_ms: int, end_ms: int) -> object:
         params = {
@@ -123,12 +146,28 @@ def http_fetcher(session: aiohttp.ClientSession, *, timeout_s: float = 20.0) -> 
             "endTime": str(end_ms - 1),
             "limit": str((end_ms - start_ms) // MINUTE_MS),
         }
-        async with session.get(
-            BINANCE_REST + KLINES_PATH, params=params, timeout=aiohttp.ClientTimeout(total=timeout_s)
-        ) as response:
-            if response.status != 200:
-                raise BarsError(f"Binance answered HTTP {response.status}")
-            return json.loads(await response.text())
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            now = clock()
+            if used["minute"] == int(now // 60) and used["weight"] >= budget:
+                await sleep(60 - now % 60 + 0.5)
+            async with session.get(
+                base_url + KLINES_PATH, params=params, timeout=aiohttp.ClientTimeout(total=timeout_s)
+            ) as response:
+                weight = response.headers.get("X-MBX-USED-WEIGHT-1M")
+                if weight is not None and weight.isdigit():
+                    used.update(minute=int(clock() // 60), weight=int(weight))
+                if response.status == 429 and attempt < RATE_LIMIT_RETRIES:
+                    try:
+                        wait = float(response.headers.get("Retry-After", "5"))
+                    except ValueError:
+                        wait = 5.0
+                    if 0 <= wait <= MAX_RETRY_AFTER_S:
+                        await sleep(wait)
+                        continue
+                if response.status != 200:
+                    raise BarsError(f"Binance answered HTTP {response.status}")
+                return json.loads(await response.text())
+        raise BarsError("Binance kept refusing with HTTP 429")
 
     return fetch
 
