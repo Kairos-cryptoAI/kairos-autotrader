@@ -69,8 +69,13 @@ RIGHT_TAIL_CODE_SHA256 = "f795c8f01d58666c5f215e5c98eabf7368e25d1ac83ff3bc7ae273
 RIGHT_TAIL_SETUP = "RIGHT_TAIL_TREND"
 # 200 complete four-hour bars (33.3 days) before the day's decision, with a day of margin.
 RIGHT_TAIL_HISTORY_MS = 35 * 24 * HOUR_MS
-# The rule decides once a day, on the hourly bar that opens at 00:00 UTC.
+# The rule decides on the hourly bar that opens at a multiple of its decision interval
+# (00:00 UTC for the daily rule), so its decision is the boundary one hour later.
 RIGHT_TAIL_DECISION_HOUR_MS = HOUR_MS
+# Decision intervals the runner accepts (hours). 24 is the frozen Trial 15 clock; a shorter
+# one reads the same 24-hour score more often (backtest 2024-01..2026-11: every 4 h about
+# 8 signals a day at +0.071 R +- 0.021, against 3.9 at +0.096 R +- 0.030 once a day).
+RIGHT_TAIL_INTERVALS = (4, 6, 8, 12, 24)
 
 
 class EngineError(RuntimeError):
@@ -506,9 +511,11 @@ async def hourly_trend_scan(
     return TrendScan(identity, features, context, intents, skipped)
 
 
-def right_tail_due(boundary_ms: int) -> bool:
-    """True at the one quarter-hour boundary a day where the daily rule decides (01:00 UTC)."""
-    return boundary_ms % (24 * HOUR_MS) == RIGHT_TAIL_DECISION_HOUR_MS
+def right_tail_due(boundary_ms: int, interval_hours: int = 24) -> bool:
+    """True at the boundaries where the rule decides: 01:00 UTC, and every ``interval_hours`` after."""
+    if interval_hours not in RIGHT_TAIL_INTERVALS:
+        raise ValueError(f"the right-tail decision interval must be one of {RIGHT_TAIL_INTERVALS}")
+    return boundary_ms % (interval_hours * HOUR_MS) == RIGHT_TAIL_DECISION_HOUR_MS
 
 
 async def right_tail_scan(
@@ -519,6 +526,7 @@ async def right_tail_scan(
     runner=None,
     processes: int = 4,
     price_increments: dict[str, Any] | None = None,
+    interval_hours: int = 24,
 ) -> tuple[dict[str, StrategyIntentV1], list[str], dict[str, str]]:
     """The daily right-tail rule at ``boundary_ms`` on closed Binance bars.
 
@@ -548,6 +556,7 @@ async def right_tail_scan(
             "strategy_id": RIGHT_TAIL_ID,
             "setup": RIGHT_TAIL_SETUP,
             "decision_ts_ms": boundary_ms - 1,
+            "config": {"decision_interval_hours": int(interval_hours)},
             "series": {signal_symbol(instrument): windows[instrument] for instrument in group},
             "price_increments": {
                 signal_symbol(instrument): str(ticks[instrument])

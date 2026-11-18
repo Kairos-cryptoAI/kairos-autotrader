@@ -77,6 +77,7 @@ from .system_engine import (
     HOURLY_TREND_ID,
     RIGHT_TAIL_HISTORY_MS,
     RIGHT_TAIL_ID,
+    RIGHT_TAIL_INTERVALS,
     EngineConfig,
     EngineError,
     adaptive_shadow_scan,
@@ -183,6 +184,8 @@ class Config:
     # A fixed position-management policy per strategy (management.Management fields), chosen
     # by an offline study; a strategy without one uses the measured policy below.
     management_policies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # How often the right-tail rule decides (hours): 24 is the frozen Trial 15 clock.
+    right_tail_interval_hours: int = 24
     capital_basis_usd: float = 100.0
     # One position's notional at most this multiple of the capital basis. The venue gate
     # measures the book's slippage for this notional, so a large account sets it to what
@@ -309,6 +312,8 @@ class Config:
             raise ConfigError(f"strategies must be a non-empty subset of {', '.join(KNOWN_STRATEGIES)}")
         if len(set(self.strategies)) != len(self.strategies):
             raise ConfigError("strategies must not repeat")
+        if self.right_tail_interval_hours not in RIGHT_TAIL_INTERVALS:
+            raise ConfigError(f"right_tail_interval_hours must be one of {RIGHT_TAIL_INTERVALS}")
         if not isinstance(self.management_policies, dict):
             raise ConfigError("management_policies must map a strategy id to a policy")
         for strategy, policy in self.management_policies.items():
@@ -1970,6 +1975,25 @@ class Trader:
             for instrument, rows in series.items()
         }
         found = None
+        daily_task = None
+        ticks = {name: item.price_step for name, item in self.instruments.items()}
+        if (
+            series
+            and RIGHT_TAIL_ID in self.config.strategies
+            and right_tail_due(slot, self.config.right_tail_interval_hours)
+        ):
+            # Alongside the hourly rules, in their own engine processes: the review window
+            # (60 s after the close) is shared by every candidate of this scan.
+            daily_task = asyncio.create_task(
+                right_tail_scan(
+                    self.engine,
+                    series,
+                    slot,
+                    price_increments=ticks,
+                    processes=ENGINE_PROCESSES,
+                    interval_hours=self.config.right_tail_interval_hours,
+                )
+            )
         if series:
             try:
                 found = await hourly_trend_scan(
@@ -1984,6 +2008,8 @@ class Trader:
             except EngineError as exc:
                 say(f"Strategy Engine не дал ответа, скан пропущен: {str(exc)[:200]}")
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
+                if daily_task is not None:
+                    daily_task.cancel()
                 return [], []
             skipped.extend(found.skipped)
             timing["engine_s"] = round(time.monotonic() - started - timing["bars_s"], 2)
@@ -2014,15 +2040,9 @@ class Trader:
                     for i, x in found.intents.items()
                 ]
         engines = {**(found.identity if found else {})}
-        if series and RIGHT_TAIL_ID in self.config.strategies and right_tail_due(slot):
+        if daily_task is not None:
             try:
-                daily, daily_skipped, daily_identity = await right_tail_scan(
-                    self.engine,
-                    series,
-                    slot,
-                    price_increments={name: item.price_step for name, item in self.instruments.items()},
-                    processes=ENGINE_PROCESSES,
-                )
+                daily, daily_skipped, daily_identity = await daily_task
             except EngineError as exc:
                 say(f"Дневная стратегия не дала ответа: {str(exc)[:200]}")
                 self.store.journal("scan_error", bar=last_closed, message=f"right tail: {str(exc)[:300]}")
@@ -2619,7 +2639,18 @@ class Trader:
         now_ms = int(time.time() * 1000)
         trades = self.trades()
         failure: Exception | None = None
-        for trade in list(trades):
+        slot = self.scan_slot(now_ms)
+        # A scan that will run goes first: its review window closes 60 s after the bar, and each
+        # open position costs venue round trips. Exchange stops protect them meanwhile, and they
+        # are managed on the next step, seconds later.
+        scan_first = (
+            self.executions is None
+            and self.store.state.get("last_bar") != slot
+            and now_ms - slot >= SCAN_AFTER_CLOSE_MS
+            and self.slot_limit() - len(trades) > 0
+            and not self.entries_blocked()
+        )
+        for trade in [] if scan_first else list(trades):
             try:
                 await self.manage(trade, now_ms)
             except (TimeoutError, EvedexError, aiohttp.ClientError) as exc:

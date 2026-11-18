@@ -122,6 +122,7 @@ def test_number_and_id_formats():
         ("max_account_equity_usd", 201),
         ("position_notional_of_capital", 3.5),
         ("position_notional_of_capital", 0.01),
+        ("right_tail_interval_hours", 5),
         ("strategies", []),
         ("strategies", ["unknown_strategy_v1"]),
         ("management_policies", {"regime_aligned_right_tail_v1": {"trail_start_r": 1.0}}),
@@ -1357,3 +1358,38 @@ def test_a_strategy_with_a_fixed_management_policy_gets_it(tmp_path):
     policy = trader.management_policy(SLOT, system_engine.RIGHT_TAIL_ID)
     assert policy is not None and (policy.trail_start_r, policy.trail_distance_r) == (1.0, 2.0)
     assert trader.management_policy(SLOT, system_engine.HOURLY_TREND_ID) is None, "no measurement yet"
+
+
+def test_a_due_scan_runs_before_positions_are_managed(tmp_path, monkeypatch):
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False, symbols=["SOLUSD"]))
+    trader.store.state["open_trades"] = [{"id": "t1", "symbol": "XRPUSD"}]
+    calls: list[str] = []
+
+    async def manage(trade, now_ms):
+        calls.append("manage")
+
+    async def scan(now_ms):
+        calls.append("scan")
+        return [], []
+
+    monkeypatch.setattr(trader, "manage", manage)
+    monkeypatch.setattr(trader, "scan", scan)
+    now = SLOT + 30_000
+    monkeypatch.setattr(engine_module_time(), "time", lambda: now / 1000)
+    asyncio.run(trader.step())
+    assert calls == ["scan"], "the review window is short; exchange stops protect the position meanwhile"
+    asyncio.run(trader.step())
+    assert calls == ["scan", "manage"], "the next step manages the position"
+
+    # With every slot taken there is no scan, so the position is managed at once.
+    calls.clear()
+    trader.store.state["last_bar"] = None
+    trader.config.max_open_positions = 1
+    asyncio.run(trader.step())
+    assert calls == ["manage"]
+
+
+def engine_module_time():
+    from kairos_autotrader import engine as engine_module
+
+    return engine_module.time

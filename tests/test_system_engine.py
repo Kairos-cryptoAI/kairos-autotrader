@@ -512,6 +512,10 @@ def test_the_daily_rule_decides_once_a_day_at_one_utc():
     assert not system_engine.right_tail_due(first)
     assert not system_engine.right_tail_due(first + HOUR_MS + QUARTER_MS)
     assert not system_engine.right_tail_due(first + 2 * HOUR_MS)
+    every_four = [h for h in range(24) if system_engine.right_tail_due(first + h * HOUR_MS, 4)]
+    assert every_four == [1, 5, 9, 13, 17, 21]
+    with pytest.raises(ValueError):
+        system_engine.right_tail_due(first + HOUR_MS, 5)
 
 
 def test_right_tail_scan_trades_only_the_pinned_rule_on_the_whole_window():
@@ -554,6 +558,7 @@ def test_right_tail_scan_trades_only_the_pinned_rule_on_the_whole_window():
         r["op"] == "registered_bars" and r["strategy_id"] == system_engine.RIGHT_TAIL_ID for r in requests
     )
     assert {r["decision_ts_ms"] for r in requests} == {boundary - 1}
+    assert {r["config"]["decision_interval_hours"] for r in requests} == {24}
     assert {s for r in requests for s in r["price_increments"]} == {"BTCUSDT"}
     assert list(intents) == ["BTCUSD"] and intents["BTCUSD"].exit_plan.max_holding_ms == 72 * HOUR_MS
     assert skipped == ["ETHUSD: closed bars do not reach back the daily rule's history"]

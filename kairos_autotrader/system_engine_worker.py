@@ -294,7 +294,8 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
     setup = str(request.get("setup") or strategy_id.upper())
     decision_ts_ms = int(request["decision_ts_ms"])
     definition = registry.get_strategy(strategy_id)
-    settings = definition.config_type()
+    # Only fields of the engine's own validated config are accepted; the identity reports it.
+    settings = definition.config_type(**dict(request.get("config") or {}))
     code_sha256 = installed_source_tree_sha256(definition.source_files)
     config_fingerprint = config_sha256(settings)
     increments = dict(request.get("price_increments") or {})
