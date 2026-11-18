@@ -221,10 +221,21 @@ def test_real_risk_manager_sizes_an_allowed_short_by_loss_at_stop():
     assert answer["evaluation"]["account_equity_usd"] == pytest.approx(109.4)
 
 
+def test_real_risk_manager_sizes_a_chop_entry_at_half_its_loss_budget():
+    normal = RiskTradeDecisionV1.model_validate(decide()["evaluation"]["decision"])
+    answer = decide(allocation_=allocation("CHOP"))
+    chop = RiskTradeDecisionV1.model_validate(answer["evaluation"]["decision"])
+    assert chop.approved and chop.rejection_reasons == ()
+    assert chop.loss_budget_usd == pytest.approx(normal.loss_budget_usd / 2)
+    assert chop.worst_case_loss_usd <= chop.loss_budget_usd and 0 < chop.quantity < normal.quantity
+    # The Macro Strategist's defensive allocation (CHOP, no strategy weight) admits nothing.
+    defensive = decide(allocation_=allocation("CHOP", weights={}))
+    assert "strategy_has_no_macro_allocation" in reasons(defensive)
+
+
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
-        ({"allocation_": allocation("CHOP")}, "macro_regime_chop"),
         ({"allocation_": allocation("BULL")}, "macro_regime_forbids_short"),
         ({"allocation_": None}, "strategic_allocation_missing"),
         ({"allocation_": allocation(weights={"BREAKOUT": 0.6})}, "strategy_has_no_macro_allocation"),
@@ -677,3 +688,22 @@ def test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_bey
     huge = decide(adaptive_={"outcomes": []}, min_quantity=Decimal(repr(small["quantity"])) * 10)
     assert huge["evaluation"]["decision"]["quantity"] == small["quantity"]
     assert "ceiling" in huge["adaptive"]["minimum_lot"]
+
+
+def test_adaptive_risk_in_chop_sizes_and_levers_for_half_the_budget():
+    leveraged = {
+        **LIMITS,
+        "max_leverage": 30.0,
+        "max_position_notional_usd": 300.0,
+        "aggregate_dollar_cap_usd": 3000.0,
+    }
+    normal = decide(adaptive_={"outcomes": []}, limits_=leveraged, venue_max_leverage=75)
+    chop = decide(
+        adaptive_={"outcomes": []}, limits_=leveraged, venue_max_leverage=75, allocation_=allocation("CHOP")
+    )
+    assert chop["adaptive"]["regime"] == "CHOP"
+    decision, before = chop["evaluation"]["decision"], normal["evaluation"]["decision"]
+    assert decision["approved"], decision["rejection_reasons"]
+    assert decision["loss_budget_usd"] == pytest.approx(before["loss_budget_usd"] / 2)
+    assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
+    assert int(chop["adaptive"]["leverage"]) <= int(normal["adaptive"]["leverage"])

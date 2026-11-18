@@ -395,6 +395,7 @@ def _adaptive_limits(
         minimum_lot_fraction,
     )
     from kairos_risk.learning import UNKNOWN_REGIME, LearningLedger, TradeOutcome
+    from kairos_risk.live import CHOP_RISK_MULTIPLIER
 
     ledger = LearningLedger(
         tuple(
@@ -446,6 +447,8 @@ def _adaptive_limits(
     reference = Decimal(str(review.intent.reference_price))
     stop_fraction = abs(reference - Decimal(str(review.intent.exit_plan.stop_price))) / reference
     loss_budget = min(equity * decision.fraction, Decimal(str(limits.per_trade_dollar_cap_usd)))
+    if regime == "CHOP":
+        loss_budget *= CHOP_RISK_MULTIPLIER  # the Risk Manager sizes a CHOP entry at half its budget
     this_notional = min(
         loss_budget / stop_fraction if stop_fraction > 0 else Decimal(0),
         Decimal(str(limits.max_position_notional_usd)),
