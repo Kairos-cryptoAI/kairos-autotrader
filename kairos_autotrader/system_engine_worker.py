@@ -300,6 +300,37 @@ def _venue_ready(raw_intent: Any, tick: Decimal | None, setup: str) -> Any:
     )
 
 
+# Closed bars this process has already rebuilt and checked, per symbol and open time, with
+# the exact cached row they came from. Only a persistent worker (``--serve``) keeps them
+# between requests; one-shot runs start empty.
+_CHECKED: dict[str, dict[int, tuple[tuple, Any, Any]]] = {}
+
+
+def _checked_bars(symbol: str, rows: list, candle_type: Any) -> tuple[list, list]:
+    """The strict closed bars of ``rows`` and their candles, reusing this process's checks.
+
+    A row that is exactly the one a bar was already rebuilt and hash-checked from reuses
+    that bar; any other row goes through ``_closed_bars`` in full. Only the symbols and
+    open times of the newest request are kept, so memory stays one window per symbol.
+    """
+    from kairos_strategy.runtime import closed_bar_to_candle
+
+    known = _CHECKED.get(symbol, {})
+    kept: dict[int, tuple[tuple, Any, Any]] = {}
+    fresh = []
+    for row in rows:
+        hit = known.get(int(row[0]))
+        if hit is not None and hit[0] == tuple(row):
+            kept[int(row[0])] = hit
+        else:
+            fresh.append(row)
+    for row, bar in zip(fresh, _closed_bars(symbol, fresh, candle_type), strict=True):
+        kept[int(row[0])] = (tuple(row), bar, closed_bar_to_candle(bar))
+    _CHECKED[symbol] = kept
+    ordered = [kept[int(row[0])] for row in rows]
+    return [item[1] for item in ordered], [item[2] for item in ordered]
+
+
 def _registered_bars(request: dict, candle_type: Any) -> dict:
     """A registered strategy's strict intent at one decision, from cached closed Binance bars.
 
@@ -321,12 +352,18 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
     code_sha256 = installed_source_tree_sha256(definition.source_files)
     config_fingerprint = config_sha256(settings)
     increments = dict(request.get("price_increments") or {})
+    for stale in set(_CHECKED) - {str(symbol) for symbol in request["series"]}:
+        del _CHECKED[stale]
     results: dict[str, dict] = {}
     for symbol, rows in request["series"].items():
         try:
-            bars = canonical_closed_bars(_closed_bars(str(symbol), rows, candle_type))
+            checked, candles = _checked_bars(str(symbol), rows, candle_type)
+            bars = canonical_closed_bars(checked)
+            by_bar = {id(bar): candle for bar, candle in zip(checked, candles, strict=True)}
             raw = registry.generate_sleeve_intents(
-                strategy_id, [closed_bar_to_candle(bar) for bar in bars], settings
+                strategy_id,
+                [by_bar.get(id(bar)) or closed_bar_to_candle(bar) for bar in bars],
+                settings,
             )
             found = [intent for intent in raw if intent.decision_ts_ms == decision_ts_ms]
             intent_json = None
@@ -359,11 +396,7 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
     return {"identity": identity, "results": results}
 
 
-def main() -> int:
-    # argv[1] is the engine's source directory. It replaces this script's own directory
-    # on the import path, so nothing from the runner package can shadow engine imports.
-    sys.path[0] = sys.argv[1]
-    request = json.load(sys.stdin)
+def _answer(request: Any) -> dict:
     try:
         from kairos_strategy.candles import Candle
 
@@ -375,10 +408,38 @@ def main() -> int:
             "registered_bars": _registered_bars,
             None: _registered,
         }
-        answer = operations[request.get("op")](request, Candle)
+        if not isinstance(request, dict):
+            raise ValueError("a request must be one JSON object")
+        return operations[request.get("op")](request, Candle)
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
-        answer = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        return {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+
+
+def _say(answer: dict) -> None:
     sys.stdout.write("\n" + MARKER + json.dumps(answer, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> int:
+    # argv[1] is the engine's source directory. It replaces this script's own directory
+    # on the import path, so nothing from the runner package can shadow engine imports.
+    sys.path[0] = sys.argv[1]
+    if "--serve" not in sys.argv[2:]:
+        _say(_answer(json.load(sys.stdin)))
+        return 0
+    # Persistent mode: one JSON request per line, one answer per request, until stdin closes.
+    # The engine stays imported and the bars it has checked are kept (see ``_CHECKED``).
+    from kairos_strategy.candles import Candle  # noqa: F401 - fail before saying ready
+
+    _say({"ready": True})
+    for line in sys.stdin:
+        if line.strip():
+            try:
+                request = json.loads(line)
+            except ValueError as exc:
+                _say({"error": f"ValueError: {str(exc)[:300]}"})
+                continue
+            _say(_answer(request))
     return 0
 
 

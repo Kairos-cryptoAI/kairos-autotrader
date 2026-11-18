@@ -80,6 +80,7 @@ from .system_engine import (
     RIGHT_TAIL_INTERVALS,
     EngineConfig,
     EngineError,
+    EnginePool,
     adaptive_shadow_scan,
     engine_revision,
     hourly_trend_scan,
@@ -1225,6 +1226,14 @@ class Trader:
         except (EngineError, BarsError, RouterError) as exc:
             self.engine = None
             say(f"Сигнальная цепочка Kairos недоступна, новых сигналов не будет: {exc}")
+        # The right-tail rule reads a 35-day window: persistent engine workers keep the bars
+        # they have checked, so a decision lands well inside the 60-second review window.
+        self.right_tail_pool: EnginePool | None = (
+            EnginePool(self.engine, RIGHT_TAIL_PROCESSES)
+            if self.engine is not None and RIGHT_TAIL_ID in config.strategies
+            else None
+        )
+        self._warm_task: asyncio.Task | None = None
         self.aggregator: AggregatorConfig | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
@@ -1904,13 +1913,40 @@ class Trader:
         """
         if self.engine is None:
             return
-        _, problems = await self._update_bars(int(time.time() * 1000))
+        series, problems = await self._update_bars(int(time.time() * 1000))
+        if self.right_tail_pool is not None and series and self._warm_task is None:
+            self._warm_task = asyncio.create_task(self._warm_right_tail(series))
         if problems:
             say(
                 "Минутная история Binance загружена не полностью ("
                 + ", ".join(f"{symbol}: {reason[:60]}" for symbol, reason in problems.items())
                 + "); повторю на скане."
             )
+
+    async def _warm_right_tail(self, series: dict[str, list[Any]]) -> None:
+        """Run the right-tail rule once at its latest past decision, only to fill the workers.
+
+        The answer is discarded: it decides nothing. The first real decision after a start
+        then checks only the bars that closed since, instead of the whole window.
+        """
+        assert self.engine is not None and self.right_tail_pool is not None
+        interval_ms = int(self.config.right_tail_interval_hours) * HOUR_MS
+        now_ms = int(time.time() * 1000)
+        boundary = now_ms - (now_ms - HOUR_MS) % interval_ms
+        started = time.monotonic()
+        try:
+            await right_tail_scan(
+                self.engine,
+                series,
+                boundary,
+                price_increments={name: item.price_step for name, item in self.instruments.items()},
+                interval_hours=self.config.right_tail_interval_hours,
+                pool=self.right_tail_pool,
+            )
+        except EngineError as exc:
+            say(f"Прогрев дневной стратегии не удался, первый её скан будет медленнее: {str(exc)[:200]}")
+            return
+        self.store.journal("right_tail_warm", boundary=boundary, seconds=round(time.monotonic() - started, 2))
 
     def _market_due(self, now_ms: int) -> int | None:
         """The boundary whose snapshot should be taken now, if any."""
@@ -1995,6 +2031,7 @@ class Trader:
                     price_increments=ticks,
                     processes=RIGHT_TAIL_PROCESSES,
                     interval_hours=self.config.right_tail_interval_hours,
+                    pool=self.right_tail_pool,
                 )
             )
         if series:

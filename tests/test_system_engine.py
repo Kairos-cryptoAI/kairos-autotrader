@@ -631,3 +631,189 @@ print("ok")
 """
     answer = subprocess.run([str(config.python), "-c", script], capture_output=True, text=True, timeout=120)
     assert answer.returncode == 0 and answer.stdout.strip().endswith("ok"), answer.stderr[-800:]
+
+
+FAKE_SERVE_WORKER = """
+import json, sys, time
+MARKER = "@@KAIROS-WORKER@@"
+assert sys.argv[2:] == ["--serve"], sys.argv
+
+
+def say(value):
+    sys.stdout.write("a library log line\\n" + MARKER + json.dumps(value) + "\\n")
+    sys.stdout.flush()
+
+
+say({"ready": True})
+count = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    count += 1
+    if request.get("op") == "die":
+        sys.exit(3)
+    if request.get("op") == "hang":
+        time.sleep(60)
+    say({"count": count, "op": request.get("op")})
+"""
+
+
+def test_engine_pool_keeps_each_worker_and_restarts_a_failed_one(tmp_path, monkeypatch):
+    import sys
+
+    script = tmp_path / "worker.py"
+    script.write_text(FAKE_SERVE_WORKER, encoding="utf-8")
+    monkeypatch.setattr(system_engine, "WORKER", script)
+    pool = system_engine.EnginePool(
+        EngineConfig(python=Path(sys.executable), source=tmp_path, timeout_s=5), 2
+    )
+
+    async def run():
+        try:
+            assert await pool.ask(0, {"op": "a"}) == {"count": 1, "op": "a"}
+            assert await pool.ask(0, {"op": "b"}) == {"count": 2, "op": "b"}  # the same process
+            assert await pool.ask(1, {"op": "c"}) == {"count": 1, "op": "c"}  # its own process
+            assert await pool.ask(2, {"op": "d"}) == {"count": 3, "op": "d"}  # index wraps to 0
+            with pytest.raises(EngineError, match="exited"):
+                await pool.ask(0, {"op": "die"})
+            assert await pool.ask(0, {"op": "e"}) == {"count": 1, "op": "e"}  # a fresh one
+            with pytest.raises(EngineError, match="TimeoutError"):
+                await pool.ask(1, {"op": "hang"})
+            assert await pool.ask(1, {"op": "f"}) == {"count": 1, "op": "f"}
+        finally:
+            await pool.stop()
+
+    asyncio.run(run())
+
+
+def right_tail_answer(request: dict) -> dict:
+    return {
+        "identity": RT_IDENTITY,
+        "results": {
+            symbol: {"decision_ts_ms": request["decision_ts_ms"], "intent": None}
+            for symbol in request["series"]
+        },
+    }
+
+
+class FakePool:
+    size = 3
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[int, list[str]]] = []
+
+    async def ask(self, index: int, request: dict) -> dict:
+        self.calls.append((index, sorted(request["series"])))
+        if self.fail:
+            raise EngineError("Strategy Engine: the worker exited")
+        return right_tail_answer(request)
+
+
+def test_right_tail_scan_sends_each_instrument_to_its_own_pool_worker():
+    history = system_engine.RIGHT_TAIL_HISTORY_MS
+    full = history // MINUTE_MS
+    boundary = (B0 // 86_400_000 + 40) * 86_400_000 + HOUR_MS
+
+    def series(*short):
+        return {
+            name: cached_bars(boundary - history + (MINUTE_MS if name in short else 0), full, name + "T")
+            for name in ("AAVEUSD", "BTCUSD", "ETHUSD", "XRPUSD")
+        }
+
+    def one_shot(config, request):
+        raise AssertionError("the pool answered")
+
+    pool = FakePool()
+    asyncio.run(system_engine.right_tail_scan(EngineConfig(), series(), boundary, runner=one_shot, pool=pool))
+    assert sorted(pool.calls) == [(0, ["AAVEUSDT", "XRPUSDT"]), (1, ["BTCUSDT"]), (2, ["ETHUSDT"])]
+    # An instrument without the whole window does not move the others to another worker.
+    pool = FakePool()
+    _, skipped, _ = asyncio.run(
+        system_engine.right_tail_scan(EngineConfig(), series("BTCUSD"), boundary, runner=one_shot, pool=pool)
+    )
+    assert sorted(pool.calls) == [(0, ["AAVEUSDT", "XRPUSDT"]), (2, ["ETHUSDT"])]
+    assert skipped == ["BTCUSD: closed bars do not reach back the daily rule's history"]
+
+
+def test_right_tail_scan_falls_back_to_a_one_shot_worker_when_the_pool_fails():
+    history = system_engine.RIGHT_TAIL_HISTORY_MS
+    full = history // MINUTE_MS
+    boundary = (B0 // 86_400_000 + 40) * 86_400_000 + HOUR_MS
+    series = {name: cached_bars(boundary - history, full, name + "T") for name in ("BTCUSD", "ETHUSD")}
+    asked = []
+
+    def one_shot(config, request):
+        asked.append(sorted(request["series"]))
+        return right_tail_answer(request)
+
+    pool = FakePool(fail=True)
+    intents, skipped, identity = asyncio.run(
+        system_engine.right_tail_scan(EngineConfig(), series, boundary, runner=one_shot, pool=pool)
+    )
+    assert sorted(pool.calls) == [(0, ["BTCUSDT"]), (1, ["ETHUSDT"])]
+    assert sorted(asked) == [["BTCUSDT"], ["ETHUSDT"]]
+    assert (intents, skipped, identity) == ({}, [], RT_IDENTITY)
+
+
+def test_real_engine_worker_reuses_only_bars_it_has_checked():
+    """Run in the engine's own Python: an unchanged row reuses its bar, a changed one is rechecked."""
+    import subprocess
+
+    config = EngineConfig()
+    if not config.python.exists() or not (config.source / "kairos_strategy").exists():
+        pytest.skip("Strategy Engine checkout or environment is not present")
+    worker_dir = Path(system_engine.__file__).parent
+    script = f"""
+import sys
+sys.path[:0] = [{str(config.source)!r}, {str(worker_dir)!r}]
+from kairos_strategy.candles import Candle
+from kairos_strategy.runtime import candle_to_closed_bar
+import system_engine_worker as w
+
+T = {T0}
+def row(i, close=100.5):
+    c = Candle(symbol="BTCUSDT", timeframe="1m", open_time_ms=T + i * 60_000,
+               close_time_ms=T + i * 60_000 + 59_999, open=100.0, high=101.0, low=99.0, close=close,
+               volume=1.0, quote_volume=100.0, taker_buy_volume=0.5, taker_buy_quote_volume=50.0)
+    sha = candle_to_closed_bar(c).bar_sha256
+    return [c.open_time_ms, 100.0, 101.0, 99.0, close, 1.0, 100.0, 0.5, 50.0, sha]
+
+rows = [row(i) for i in range(6)]
+first, candles = w._checked_bars("BTCUSDT", rows[:5], Candle)
+again, _ = w._checked_bars("BTCUSDT", rows[1:], Candle)
+assert all(a is b for a, b in zip(again[:4], first[1:])), "unchanged rows must reuse their bars"
+assert again[4].bar_sha256 == rows[5][9] and len(w._CHECKED["BTCUSDT"]) == 5
+changed = [list(r) for r in rows[1:]]
+changed[2][4] = 100.6  # the venue's value moved, the recorded identity did not
+try:
+    w._checked_bars("BTCUSDT", changed, Candle)
+except ValueError as exc:
+    assert "does not hash" in str(exc), exc
+else:
+    raise SystemExit("a changed row was not rechecked")
+print("ok")
+"""
+    answer = subprocess.run([str(config.python), "-c", script], capture_output=True, text=True, timeout=120)
+    assert answer.returncode == 0 and answer.stdout.strip().endswith("ok"), answer.stderr[-800:]
+
+
+def test_real_engine_worker_serves_until_its_input_closes():
+    config = EngineConfig()
+    if not config.python.exists() or not (config.source / "kairos_strategy").exists():
+        pytest.skip("Strategy Engine checkout or environment is not present")
+    pool = system_engine.EnginePool(config, 1)
+
+    async def run():
+        try:
+            first = await pool.ask(0, {"op": "no_such_op"})
+            second = await pool.ask(0, ["not", "an", "object"])
+            assert first["error"].startswith("KeyError") and second["error"].startswith("ValueError")
+            process = pool._processes[0]
+            assert process is not None and process.returncode is None  # errors do not end the worker
+            assert process.stdin is not None
+            process.stdin.close()
+            assert await asyncio.wait_for(process.wait(), timeout=30) == 0
+        finally:
+            await pool.stop()
+
+    asyncio.run(run())

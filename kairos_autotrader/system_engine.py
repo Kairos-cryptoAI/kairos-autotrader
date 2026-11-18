@@ -28,7 +28,15 @@ from kairos_core.contracts import StrategyIntentV1
 from pydantic import ValidationError
 
 from .evedex import Candle, Evedex, EvedexError
-from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
+from .sibling import (
+    _PASSED_ENVIRONMENT,
+    MARKER,
+    SiblingError,
+    git_revision,
+    run_worker,
+    sibling_checkout,
+    sibling_python,
+)
 from .signals import Features, signal_symbol
 
 MINUTE_MS = 60_000
@@ -518,6 +526,87 @@ def right_tail_due(boundary_ms: int, interval_hours: int = 24) -> bool:
     return boundary_ms % (interval_hours * HOUR_MS) == RIGHT_TAIL_DECISION_HOUR_MS
 
 
+class EnginePool:
+    """Persistent Strategy Engine workers (``system_engine_worker.py --serve``).
+
+    Each worker keeps the engine imported and the closed bars it has already rebuilt and
+    hash-checked, so a decision checks only the bars it has not seen (about 240 a symbol
+    every four hours instead of the whole 35-day window). A worker that fails or times
+    out is killed; the next request starts a fresh one.
+    """
+
+    def __init__(self, config: EngineConfig, size: int) -> None:
+        self.config = config
+        self._processes: list[asyncio.subprocess.Process | None] = [None] * size
+        self._locks = [asyncio.Lock() for _ in range(size)]
+
+    @property
+    def size(self) -> int:
+        return len(self._processes)
+
+    async def _read(self, process: asyncio.subprocess.Process) -> dict[str, Any]:
+        assert process.stdout is not None
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                raise EngineError("Strategy Engine: the worker exited")
+            text = line.decode("utf-8", errors="replace").strip()
+            if text.startswith(MARKER):
+                value = json.loads(text[len(MARKER) :])
+                if not isinstance(value, dict):
+                    raise EngineError("Strategy Engine: malformed worker message")
+                return value
+
+    async def _start(self, index: int) -> asyncio.subprocess.Process:
+        environment = {key: os.environ[key] for key in _PASSED_ENVIRONMENT if key in os.environ}
+        environment["PYTHONIOENCODING"] = "utf-8"
+        process = await asyncio.create_subprocess_exec(
+            str(self.config.python),
+            "-s",
+            "-B",
+            str(WORKER),
+            str(self.config.source),
+            "--serve",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=environment,
+            limit=64 * 1024 * 1024,
+        )
+        self._processes[index] = process
+        if not (await self._read(process)).get("ready"):
+            raise EngineError("Strategy Engine: the worker did not get ready")
+        return process
+
+    async def _kill(self, index: int) -> None:
+        process, self._processes[index] = self._processes[index], None
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    async def stop(self) -> None:
+        for index in range(self.size):
+            await self._kill(index)
+
+    async def ask(self, index: int, request: dict[str, Any]) -> dict[str, Any]:
+        index %= self.size
+        async with self._locks[index]:
+            try:
+                async with asyncio.timeout(self.config.timeout_s):
+                    process = self._processes[index]
+                    if process is None or process.returncode is not None:
+                        process = await self._start(index)
+                    assert process.stdin is not None
+                    process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await process.stdin.drain()
+                    return await self._read(process)
+            except (TimeoutError, OSError, ValueError, EngineError) as exc:
+                await self._kill(index)
+                if isinstance(exc, EngineError):
+                    raise
+                raise EngineError(f"Strategy Engine: {type(exc).__name__}: {str(exc)[:200]}") from exc
+
+
 async def right_tail_scan(
     config: EngineConfig,
     series: dict[str, list[list[Any]]],
@@ -527,11 +616,14 @@ async def right_tail_scan(
     processes: int = 4,
     price_increments: dict[str, Any] | None = None,
     interval_hours: int = 24,
+    pool: EnginePool | None = None,
 ) -> tuple[dict[str, StrategyIntentV1], list[str], dict[str, str]]:
     """The daily right-tail rule at ``boundary_ms`` on closed Binance bars.
 
     Returns the strict intents by EVEDEX instrument, what was skipped and the engine identity.
     An instrument whose bars do not reach the boundary or the whole history is skipped.
+    With a ``pool`` each instrument always goes to the same persistent worker, which reuses
+    the bars it has already checked; a pool failure falls back to a one-shot worker.
     """
     first_ms = boundary_ms - RIGHT_TAIL_HISTORY_MS
     windows: dict[str, list[list[Any]]] = {}
@@ -547,7 +639,13 @@ async def right_tail_scan(
     names = list(windows)
     if not names:
         return {}, skipped, {}
-    groups = [names[index::processes] for index in range(max(1, min(processes, len(names))))]
+    # A fixed worker per instrument (its place among all instruments with bars), so a
+    # persistent worker sees the same instruments every time.
+    width = pool.size if pool is not None else max(1, min(processes, len(names)))
+    places = {instrument: place for place, instrument in enumerate(sorted(series))}
+    by_worker: dict[int, list[str]] = {}
+    for instrument in names:
+        by_worker.setdefault(places[instrument] % width, []).append(instrument)
     ticks = dict(price_increments or {})
 
     def request(group: list[str]) -> dict[str, Any]:
@@ -566,7 +664,16 @@ async def right_tail_scan(
         }
 
     run = runner or _run_hourly_trend
-    answers = await asyncio.gather(*(asyncio.to_thread(run, config, request(group)) for group in groups))
+
+    async def ask_group(worker: int, group: list[str]) -> dict[str, Any]:
+        if pool is not None:
+            try:
+                return await pool.ask(worker, request(group))
+            except EngineError:
+                pass  # the one-shot worker below decides the same way, only slower
+        return await asyncio.to_thread(run, config, request(group))
+
+    answers = await asyncio.gather(*(ask_group(worker, group) for worker, group in by_worker.items()))
     identity: dict[str, str] = {}
     results: dict[str, Any] = {}
     for answer in answers:
