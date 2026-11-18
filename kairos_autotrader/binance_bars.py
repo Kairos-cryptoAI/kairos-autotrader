@@ -182,6 +182,7 @@ class ClosedBarStore:
 
     directory: Path
     _bars: dict[str, list[Bar]] = field(default_factory=dict)
+    revisions: dict[str, list[int]] = field(default_factory=dict)
 
     def _path(self, symbol: str) -> Path:
         return self.directory / f"{symbol}.1m.json"
@@ -217,23 +218,31 @@ class ClosedBarStore:
         return kept, pages
 
     @staticmethod
-    def _merge(symbol: str, kept: list[Bar], fresh: list[Bar]) -> list[Bar]:
-        """Cached bars plus freshly parsed ones; the overlap has to be identical."""
+    def _merge(symbol: str, kept: list[Bar], fresh: list[Bar]) -> tuple[list[Bar], list[int]]:
+        """Cached bars plus freshly parsed ones, and the open times of revised cached bars.
+
+        Every update downloads the newest cached bars again. Binance still settles a
+        minute's totals in the first seconds after its close, so a bar fetched right after
+        the close can come back different: the venue's later value replaces it. Only these
+        overlap bars are compared at all, so rebuilding the whole window instead would
+        trust the older bars just the same, and would cost the instrument this scan.
+        """
         known = {int(bar[0]): bar for bar in kept[-OVERLAP_BARS:]}
         merged = list(kept)
+        revised: list[int] = []
         for bar in fresh:
-            cached = known.get(int(bar[0]))
+            open_ms = int(bar[0])
+            cached = known.get(open_ms)
             if cached is not None:
                 if cached != bar:
-                    raise BarsError(
-                        f"{symbol}: the venue changed a closed bar at {int(bar[0])}; "
-                        "the cache is rebuilt on the next update"
-                    )
-            elif not merged or int(bar[0]) == int(merged[-1][0]) + MINUTE_MS:
+                    revised.append(open_ms)
+                    # The merged bars are contiguous, so a cached minute's place follows from its time.
+                    merged[len(merged) - 1 - (int(merged[-1][0]) - open_ms) // MINUTE_MS] = bar
+            elif not merged or open_ms == int(merged[-1][0]) + MINUTE_MS:
                 merged.append(bar)
             else:
-                raise BarsError(f"{symbol}: closed bars are not contiguous at {int(bar[0])}")
-        return merged
+                raise BarsError(f"{symbol}: closed bars are not contiguous at {open_ms}")
+        return merged, revised
 
     async def update(
         self,
@@ -249,9 +258,10 @@ class ClosedBarStore:
         """Bring every symbol up to the last closed minute.
 
         Returns the bars of ``[end - history, end)`` per symbol, and the reason for every
-        symbol that could not be completed. A symbol with a problem keeps its old cache,
-        except after a changed closed bar, which drops it.
+        symbol that could not be completed. A symbol with a problem keeps its old cache.
+        The cached minutes the venue revised are left in ``revisions`` until the next update.
         """
+        self.revisions = {}  # a new dict: a caller may keep the previous update's
         end_ms = now_ms // MINUTE_MS * MINUTE_MS
         first_ms = end_ms - history_ms // MINUTE_MS * MINUTE_MS
         gate = asyncio.Semaphore(concurrency)
@@ -313,15 +323,9 @@ class ClosedBarStore:
             for answer in sorted(answers, key=lambda a: int(a["start"])):
                 fresh.extend(answer["bars"])
             try:
-                merged = self._merge(symbol, kept, fresh)
+                merged, revised = self._merge(symbol, kept, fresh)
             except BarsError as exc:
                 problems[symbol] = str(exc)
-                if "changed a closed bar" in str(exc):
-                    self._bars[symbol] = []
-                    try:
-                        await asyncio.to_thread(self._save, symbol, [])
-                    except OSError:
-                        problems[symbol] += "; the cache file could not be cleared"
                 continue
             if not merged or int(merged[0][0]) != first_ms or int(merged[-1][0]) != end_ms - MINUTE_MS:
                 problems[symbol] = "closed bars do not cover the whole window"
@@ -333,5 +337,7 @@ class ClosedBarStore:
                 problems[symbol] = f"closed-bar cache could not be written: {type(exc).__name__}"
                 continue
             self._bars[symbol] = merged
+            if revised:
+                self.revisions[symbol] = revised
             result[symbol] = merged
         return result, problems

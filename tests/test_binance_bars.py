@@ -82,18 +82,23 @@ def test_an_incomplete_page_keeps_the_old_cache_and_names_the_symbol(tmp_path):
     assert problems == {} and bars["SOLUSDT"][-1][0] == T0 + 4 * MINUTE
 
 
-def test_a_revised_closed_bar_is_a_conflict_that_drops_the_cache(tmp_path):
+def test_a_newest_bar_the_venue_revised_takes_its_later_value_and_keeps_the_rest(tmp_path):
     feed = BarFeed(last_open_ms=T0 + 20 * MINUTE)
     store = ClosedBarStore(tmp_path)
-    update(store, feed, T0)
-    feed.revised = {T0 - 2 * MINUTE}
-    bars, problems = update(store, feed, T0 + 5 * MINUTE)
-    assert bars == {} and "changed a closed bar" in problems["SOLUSDT"]
-    assert json.loads((tmp_path / "SOLUSDT.1m.json").read_text()) == []
+    before, _ = update(store, feed, T0)
+    feed.revised = {T0 - 2 * MINUTE}  # settled after it was cached
     feed.asked.clear()
     bars, problems = update(store, feed, T0 + 5 * MINUTE)
     assert problems == {} and len(bars["SOLUSDT"]) == 1_200
-    assert feed.asked[0][1] == T0 + 5 * MINUTE - HISTORY, "the whole window is downloaded again"
+    assert store.revisions == {"SOLUSDT": [T0 - 2 * MINUTE]}
+    assert feed.asked == [("SOLUSDT", T0 - OVERLAP_BARS * MINUTE, T0 + 5 * MINUTE)], "no rebuild"
+    by_open = {bar[0]: bar for bar in bars["SOLUSDT"]}
+    old = {bar[0]: bar for bar in before["SOLUSDT"]}
+    assert by_open[T0 - 2 * MINUTE] != old[T0 - 2 * MINUTE], "the venue's later value"
+    assert all(by_open[t] == old[t] for t in old if t in by_open and t != T0 - 2 * MINUTE)
+    assert json.loads((tmp_path / "SOLUSDT.1m.json").read_text()) == bars["SOLUSDT"]
+    _, problems = update(store, feed, T0 + 6 * MINUTE)
+    assert problems == {} and store.revisions == {}, "the revision is reported once"
 
 
 def test_one_failing_symbol_does_not_stop_the_others(tmp_path):

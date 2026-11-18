@@ -1905,6 +1905,9 @@ class Trader:
             fetch=self._fetch_bars,
             concurrency=BAR_CONCURRENCY,
         )
+        if self.bars.revisions:
+            # Binance settled a just-closed minute after it was cached: its later value is kept.
+            self.store.journal("bars_revised", minutes=self.bars.revisions)
         return (
             {by_signal[symbol]: rows for symbol, rows in bars.items()},
             {by_signal[symbol]: reason for symbol, reason in problems.items()},

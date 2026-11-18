@@ -1145,7 +1145,7 @@ def test_scan_skips_an_instrument_without_complete_fresh_bars(tmp_path, monkeypa
     )
 
 
-def test_a_changed_closed_bar_drops_the_cache_and_trades_nothing(tmp_path, monkeypatch):
+def test_a_revised_newest_bar_is_journaled_and_the_scan_goes_on(tmp_path, monkeypatch):
     fake_parser(monkeypatch)
     fake_engine(monkeypatch)
     fake_router(monkeypatch)
@@ -1153,12 +1153,13 @@ def test_a_changed_closed_bar_drops_the_cache_and_trades_nothing(tmp_path, monke
     trader = scanning_trader(tmp_path, feed)
     assert len(asyncio.run(trader.scan(SLOT + 12_000))[1]) == 1
     feed.last_open_ms = SLOT + QUARTER - MINUTE
-    feed.revised = {SLOT - 2 * MINUTE}  # the venue now reports another close for a cached minute
-    assert asyncio.run(trader.scan(SLOT + QUARTER + 12_000)) == ([], [])
-    assert "changed a closed bar" in journal_of(trader)[-1]["skipped"][0]
-    assert json.loads((trader.store.directory / "closed-bars" / "SOLUSDT.1m.json").read_text()) == []
-    features, found = asyncio.run(trader.scan(SLOT + QUARTER + 20_000))
-    assert len(features) == 1 and len(found) == 1, "the cache is rebuilt from the venue's current bars"
+    feed.revised = {SLOT - 2 * MINUTE}  # the venue settled a minute after it was cached
+    feed.asked.clear()
+    features, found = asyncio.run(trader.scan(SLOT + QUARTER + 12_000))
+    assert len(features) == 1 and len(found) == 1, "the instrument is not lost for this scan"
+    revised = [e for e in journal_of(trader) if e["event"] == "bars_revised"]
+    assert [e["minutes"] for e in revised] == [{"SOLUSDT": [SLOT - 2 * MINUTE]}]
+    assert all(start >= SLOT - 5 * MINUTE for _, start, _ in feed.asked), "the older bars are kept"
 
 
 def test_scan_trades_nothing_when_the_engine_is_missing_fails_or_is_not_the_pinned_source(
