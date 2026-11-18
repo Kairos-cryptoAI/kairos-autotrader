@@ -62,6 +62,16 @@ HOURLY_TREND_ID = "hourly_trend_candidates_v1"
 HOURLY_TREND_CODE_SHA256 = "1390b94bcf38440efa2f3b8b466c10bc1044e60252ed7c9979b25453db9b59ad"
 HOURLY_TREND_HISTORY_MS = 504 * HOUR_MS  # how far back from a decision the rules read
 
+# The daily right-tail trend filtered by the four-hour SMA200 state (Trial 15). Registered in
+# the engine as FORWARD_FROZEN; the pin is the engine's fingerprint of its source files.
+RIGHT_TAIL_ID = "regime_aligned_right_tail_v1"
+RIGHT_TAIL_CODE_SHA256 = "f795c8f01d58666c5f215e5c98eabf7368e25d1ac83ff3bc7ae27332e0966b84"
+RIGHT_TAIL_SETUP = "RIGHT_TAIL_TREND"
+# 200 complete four-hour bars (33.3 days) before the day's decision, with a day of margin.
+RIGHT_TAIL_HISTORY_MS = 35 * 24 * HOUR_MS
+# The rule decides once a day, on the hourly bar that opens at 00:00 UTC.
+RIGHT_TAIL_DECISION_HOUR_MS = HOUR_MS
+
 
 class EngineError(RuntimeError):
     pass
@@ -494,6 +504,107 @@ async def hourly_trend_scan(
         if intent is not None:
             intents[instrument] = intent
     return TrendScan(identity, features, context, intents, skipped)
+
+
+def right_tail_due(boundary_ms: int) -> bool:
+    """True at the one quarter-hour boundary a day where the daily rule decides (01:00 UTC)."""
+    return boundary_ms % (24 * HOUR_MS) == RIGHT_TAIL_DECISION_HOUR_MS
+
+
+async def right_tail_scan(
+    config: EngineConfig,
+    series: dict[str, list[list[Any]]],
+    boundary_ms: int,
+    *,
+    runner=None,
+    processes: int = 4,
+    price_increments: dict[str, Any] | None = None,
+) -> tuple[dict[str, StrategyIntentV1], list[str], dict[str, str]]:
+    """The daily right-tail rule at ``boundary_ms`` on closed Binance bars.
+
+    Returns the strict intents by EVEDEX instrument, what was skipped and the engine identity.
+    An instrument whose bars do not reach the boundary or the whole history is skipped.
+    """
+    first_ms = boundary_ms - RIGHT_TAIL_HISTORY_MS
+    windows: dict[str, list[list[Any]]] = {}
+    skipped: list[str] = []
+    for instrument, bars in series.items():
+        window = [row for row in bars if first_ms <= row[0] < boundary_ms]
+        if not window or int(window[-1][0]) != boundary_ms - MINUTE_MS:
+            skipped.append(f"{instrument}: no fresh closed bar for the daily rule")
+        elif int(window[0][0]) != first_ms:
+            skipped.append(f"{instrument}: closed bars do not reach back the daily rule's history")
+        else:
+            windows[instrument] = window
+    names = list(windows)
+    if not names:
+        return {}, skipped, {}
+    groups = [names[index::processes] for index in range(max(1, min(processes, len(names))))]
+    ticks = dict(price_increments or {})
+
+    def request(group: list[str]) -> dict[str, Any]:
+        return {
+            "op": "registered_bars",
+            "strategy_id": RIGHT_TAIL_ID,
+            "setup": RIGHT_TAIL_SETUP,
+            "decision_ts_ms": boundary_ms - 1,
+            "series": {signal_symbol(instrument): windows[instrument] for instrument in group},
+            "price_increments": {
+                signal_symbol(instrument): str(ticks[instrument])
+                for instrument in group
+                if instrument in ticks
+            },
+        }
+
+    run = runner or _run_hourly_trend
+    answers = await asyncio.gather(*(asyncio.to_thread(run, config, request(group)) for group in groups))
+    identity: dict[str, str] = {}
+    results: dict[str, Any] = {}
+    for answer in answers:
+        found_identity, found = answer.get("identity"), answer.get("results")
+        if not isinstance(found_identity, dict) or not isinstance(found, dict):
+            raise EngineError(f"Strategy Engine worker failed: {str(answer.get('error', 'malformed'))[:200]}")
+        if found_identity.get("strategy_id") != RIGHT_TAIL_ID:
+            raise EngineError(f"unexpected strategy {found_identity.get('strategy_id')!r}")
+        if found_identity.get("strategy_code_sha256") != RIGHT_TAIL_CODE_SHA256:
+            raise EngineError(
+                "the Strategy Engine source of the right-tail rule differs from the pinned one "
+                f"({str(found_identity.get('strategy_code_sha256'))[:12]} "
+                f"instead of {RIGHT_TAIL_CODE_SHA256[:12]})"
+            )
+        if identity and {k: str(v) for k, v in found_identity.items()} != identity:
+            raise EngineError("engine processes reported different identities")
+        identity = {k: str(v) for k, v in found_identity.items()}
+        results.update(found)
+    intents: dict[str, StrategyIntentV1] = {}
+    for instrument in names:
+        symbol = signal_symbol(instrument)
+        result = results.get(symbol)
+        if not isinstance(result, dict) or "error" in result:
+            reason = str(result.get("error"))[:200] if isinstance(result, dict) else "no answer"
+            skipped.append(f"{instrument}: {reason}")
+            continue
+        if result.get("intent") is None:
+            continue
+        try:
+            intent = StrategyIntentV1.model_validate(result["intent"])
+            window = windows[instrument]
+            if intent.strategy_id != RIGHT_TAIL_ID or intent.symbol != symbol:
+                raise EngineError("intent belongs to another strategy or symbol")
+            if intent.decision_ts_ms != boundary_ms - 1:
+                raise EngineError("intent belongs to another decision")
+            if (
+                intent.provenance.strategy_code_sha256 != RIGHT_TAIL_CODE_SHA256
+                or intent.provenance.config_sha256 != identity.get("config_sha256")
+            ):
+                raise EngineError("intent provenance differs from the pinned engine identity")
+            if intent.provenance.input_bar_sha256s != tuple(row[9] for row in window):
+                raise EngineError("intent does not declare exactly the cached closed bars")
+        except (EngineError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            skipped.append(f"{instrument}: bad engine output ({type(exc).__name__}: {str(exc)[:120]})")
+            continue
+        intents[instrument] = intent
+    return intents, skipped, identity
 
 
 def hourly_trend_history(

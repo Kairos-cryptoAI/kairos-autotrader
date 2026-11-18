@@ -21,7 +21,6 @@ import aiohttp
 
 from . import system_cli
 from .engine import (
-    POSITION_NOTIONAL_OF_CAPITAL,
     Config,
     ConfigError,
     LiveBroker,
@@ -144,7 +143,7 @@ async def cmd_check(args: argparse.Namespace) -> int:
             book = await api.book(symbol)
             spread = float((book.ask - book.bid) / book.ask) * 1e4
             lot_usd = max(inst.min_quantity * book.ask, inst.min_volume)
-            share = Decimal(str(config.capital_basis_usd)) * POSITION_NOTIONAL_OF_CAPITAL
+            share = Decimal(str(config.capital_basis_usd)) * Decimal(str(config.position_notional_of_capital))
             notes = []
             if spread > config.max_spread_bps:
                 notes.append("спред сейчас шире допустимого")

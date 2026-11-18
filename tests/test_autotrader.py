@@ -111,16 +111,42 @@ def test_number_and_id_formats():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("capital_basis_usd", 101),
-        ("risk_per_trade_usd", 1.5),
-        ("session_loss_stop_usd", 11),
-        ("max_trades_per_day", 13),
+        ("capital_basis_usd", 150_001),
+        # 1% and 5% of the 100 USD default capital basis
+        ("risk_per_trade_usd", 1.01),
+        ("session_loss_stop_usd", 5.01),
+        ("max_trades_per_day", 41),
         ("max_open_positions", 11),
+        # the equity guard lies within [capital, 2 x capital]
+        ("max_account_equity_usd", 99),
+        ("max_account_equity_usd", 201),
+        ("position_notional_of_capital", 3.5),
+        ("position_notional_of_capital", 0.01),
+        ("strategies", []),
+        ("strategies", ["unknown_strategy_v1"]),
+        ("management_policies", {"regime_aligned_right_tail_v1": {"trail_start_r": 1.0}}),
     ],
 )
 def test_hard_ceilings_cannot_be_configured_away(field, value):
     config = Config()
     setattr(config, field, value)
+    with pytest.raises(ConfigError):
+        config.validate()
+
+
+def test_a_100k_account_is_configured_with_the_same_fractions():
+    config = Config()
+    config.capital_basis_usd = 100_000
+    config.risk_per_trade_usd = 250
+    config.session_loss_stop_usd = 3_000
+    config.max_account_equity_usd = 125_000
+    config.strategies = ["regime_aligned_right_tail_v1"]
+    config.position_notional_of_capital = 0.25
+    config.management_policies = {
+        "regime_aligned_right_tail_v1": {"trail_start_r": 1.0, "trail_distance_r": 2.0}
+    }
+    config.validate()
+    config.risk_per_trade_usd = 1_001
     with pytest.raises(ConfigError):
         config.validate()
 
@@ -1261,3 +1287,73 @@ def test_every_loop_replaces_the_heartbeat_for_the_alert_monitor(tmp_path):
     beat = json.loads((trader.store.directory / "heartbeat.json").read_text(encoding="utf-8"))
     assert beat["pid"] == os.getpid() and set(beat) == {"pid", "started_at", "at"}
     assert datetime.fromisoformat(beat["at"]) >= datetime.fromisoformat(beat["started_at"])
+
+
+def test_scan_trades_only_the_selected_strategies_and_runs_the_daily_rule_at_one_utc(tmp_path, monkeypatch):
+    from support import strict_intent
+
+    from kairos_autotrader import engine as engine_module
+
+    fake_parser(monkeypatch)
+    fake_engine(monkeypatch)
+    router_requests = fake_router(monkeypatch)
+    day = 24 * HOUR
+    slot = (SLOT // day + 1) * day + HOUR  # 01:00 UTC
+    daily_calls = []
+
+    async def daily(config, series, boundary_ms, **kwargs):
+        daily_calls.append(boundary_ms)
+        rows = series["SOLUSD"]
+        intent = strict_intent(
+            decision_ts_ms=boundary_ms - 1,
+            side="SHORT",
+            setup=system_engine.RIGHT_TAIL_SETUP,
+            ref_price=80.0,
+            stop=83.2,
+            take=67.2,
+            timeout_minutes=72 * 60,
+            bar_hashes=tuple(r[9] for r in rows if r[0] < boundary_ms)[-3:],
+            code_sha256=system_engine.RIGHT_TAIL_CODE_SHA256,
+            strategy_id=system_engine.RIGHT_TAIL_ID,
+        )
+        return {"SOLUSD": intent}, [], {"strategy_id": system_engine.RIGHT_TAIL_ID}
+
+    monkeypatch.setattr(engine_module, "right_tail_scan", daily)
+    feed = BarFeed(last_open_ms=slot + 2 * MINUTE)
+    trader = scanning_trader(tmp_path, feed, strategies=[system_engine.RIGHT_TAIL_ID])
+    _, found = asyncio.run(trader.scan(slot + 30_000))
+
+    assert daily_calls == [slot]
+    (c,) = found
+    assert c.intent.strategy_id == system_engine.RIGHT_TAIL_ID and c.timeout_minutes == 72 * 60
+    assert [i["strategy_id"] for i in router_requests[0]["intents"]] == [system_engine.RIGHT_TAIL_ID]
+    scan = journal_of(trader)[-1]
+    assert scan["not_traded"] == [
+        {"symbol": "SOLUSD", "side": "LONG", "strategy_id": system_engine.HOURLY_TREND_ID}
+    ], "the hourly candidate is measured, not traded"
+    assert trader.history_ms() == system_engine.RIGHT_TAIL_HISTORY_MS
+    assert trader.longest_hold_minutes() == 72 * 60
+
+    # Any other quarter hour: the daily rule is not asked, and nothing is traded.
+    router_requests.clear()
+    feed.last_open_ms = slot + QUARTER + 2 * MINUTE
+    assert asyncio.run(trader.scan(slot + QUARTER + 30_000))[1] == []
+    assert daily_calls == [slot] and router_requests == []
+
+
+def test_a_strategy_with_a_fixed_management_policy_gets_it(tmp_path):
+    trader = paper_trader(
+        tmp_path,
+        FakeVenue(),
+        Config(
+            use_llm=False,
+            symbols=["SOLUSD"],
+            strategies=[system_engine.RIGHT_TAIL_ID],
+            management_policies={
+                system_engine.RIGHT_TAIL_ID: {"trail_start_r": 1.0, "trail_distance_r": 2.0}
+            },
+        ),
+    )
+    policy = trader.management_policy(SLOT, system_engine.RIGHT_TAIL_ID)
+    assert policy is not None and (policy.trail_start_r, policy.trail_distance_r) == (1.0, 2.0)
+    assert trader.management_policy(SLOT, system_engine.HOURLY_TREND_ID) is None, "no measurement yet"

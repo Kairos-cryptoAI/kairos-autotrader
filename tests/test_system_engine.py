@@ -492,3 +492,104 @@ def test_real_engine_gives_a_strict_intent_on_bars_with_contract_identities():
         )
     )
     assert refused.features == {} and "does not hash to its recorded identity" in refused.skipped[0]
+
+
+# ---- the daily right-tail rule ------------------------------------------------------
+
+RT_IDENTITY = {
+    "strategy_id": system_engine.RIGHT_TAIL_ID,
+    "revision": "1",
+    "status": "forward_frozen",
+    "strategy_code_sha256": system_engine.RIGHT_TAIL_CODE_SHA256,
+    "config_sha256": CONFIG_SHA256,
+}
+
+
+def test_the_daily_rule_decides_once_a_day_at_one_utc():
+    day = 86_400_000
+    first = (B0 // day + 1) * day
+    assert system_engine.right_tail_due(first + HOUR_MS)
+    assert not system_engine.right_tail_due(first)
+    assert not system_engine.right_tail_due(first + HOUR_MS + QUARTER_MS)
+    assert not system_engine.right_tail_due(first + 2 * HOUR_MS)
+
+
+def test_right_tail_scan_trades_only_the_pinned_rule_on_the_whole_window():
+    history = system_engine.RIGHT_TAIL_HISTORY_MS
+    full = history // MINUTE_MS
+    boundary = (B0 // 86_400_000 + 40) * 86_400_000 + HOUR_MS
+    series = {
+        "BTCUSD": cached_bars(boundary - history, full, "BTCUSDT"),
+        "ETHUSD": cached_bars(boundary - history + MINUTE_MS, full - 1, "ETHUSDT"),  # too short
+        "XRPUSD": cached_bars(boundary - history, full, "XRPUSDT"),
+    }
+    requests = []
+
+    def runner(config, request):
+        requests.append(request)
+        results = {}
+        for symbol, rows in request["series"].items():
+            raw = strict_intent(
+                symbol=symbol,
+                decision_ts_ms=boundary - 1,
+                side="SHORT",
+                setup=system_engine.RIGHT_TAIL_SETUP,
+                ref_price=100.0,
+                stop=104.0,
+                take=84.0,
+                timeout_minutes=72 * 60,
+                bar_hashes=tuple(r[9] for r in rows),
+                code_sha256=system_engine.RIGHT_TAIL_CODE_SHA256,
+                strategy_id=system_engine.RIGHT_TAIL_ID,
+            ).model_dump(mode="json")
+            results[symbol] = {"decision_ts_ms": boundary - 1, "intent": raw if symbol == "BTCUSDT" else None}
+        return {"identity": RT_IDENTITY, "results": results}
+
+    intents, skipped, identity = asyncio.run(
+        system_engine.right_tail_scan(
+            EngineConfig(), series, boundary, runner=runner, processes=2, price_increments={"BTCUSD": "0.1"}
+        )
+    )
+    assert all(
+        r["op"] == "registered_bars" and r["strategy_id"] == system_engine.RIGHT_TAIL_ID for r in requests
+    )
+    assert {r["decision_ts_ms"] for r in requests} == {boundary - 1}
+    assert {s for r in requests for s in r["price_increments"]} == {"BTCUSDT"}
+    assert list(intents) == ["BTCUSD"] and intents["BTCUSD"].exit_plan.max_holding_ms == 72 * HOUR_MS
+    assert skipped == ["ETHUSD: closed bars do not reach back the daily rule's history"]
+    assert identity["strategy_code_sha256"] == system_engine.RIGHT_TAIL_CODE_SHA256
+
+    def other_source(config, request):
+        answer = runner(config, request)
+        return {**answer, "identity": {**answer["identity"], "strategy_code_sha256": "0" * 64}}
+
+    with pytest.raises(EngineError):
+        asyncio.run(system_engine.right_tail_scan(EngineConfig(), series, boundary, runner=other_source))
+
+    def wrong_bars(config, request):
+        answer = runner(config, request)
+        for result in answer["results"].values():
+            if result.get("intent"):
+                result["intent"]["provenance"]["input_bar_sha256s"] = ["f" * 64]
+        return answer
+
+    refused, skipped, _ = asyncio.run(
+        system_engine.right_tail_scan(EngineConfig(), series, boundary, runner=wrong_bars)
+    )
+    # A changed bar list no longer matches the intent identity: refused before it is traded.
+    assert refused == {} and any(s.startswith("BTCUSD: bad engine output") for s in skipped), skipped
+
+
+def test_the_worker_puts_both_barriers_on_the_tick_without_shrinking_the_risk():
+    from decimal import Decimal
+
+    from kairos_autotrader.system_engine_worker import _on_tick
+
+    tick = Decimal("0.01")
+    # long: stop below the entry rounds down (away), target above rounds down (toward the entry)
+    assert _on_tick(81.537, tick, up=False) == 81.53
+    assert _on_tick(90.019, tick, up=False) == 90.01
+    # short: stop above rounds up (away), target below rounds up (toward the entry)
+    assert _on_tick(104.001, tick, up=True) == 104.01
+    assert _on_tick(84.001, tick, up=True) == 84.01
+    assert _on_tick(84.001, None, up=True) == 84.001

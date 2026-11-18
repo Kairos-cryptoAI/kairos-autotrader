@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from kairos_core.contracts import StrategyIntentV1
 
 from . import brain
 from .aggregator_review import (
@@ -74,21 +75,30 @@ from .signals import SIGNAL_VENUE, Features, Routed, held_outcome, outcome, sign
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
     HOURLY_TREND_ID,
+    RIGHT_TAIL_HISTORY_MS,
+    RIGHT_TAIL_ID,
     EngineConfig,
     EngineError,
     adaptive_shadow_scan,
     engine_revision,
     hourly_trend_scan,
+    right_tail_due,
+    right_tail_scan,
     to_candles,
 )
 from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of
 from .system_rules import revisions as rules_revisions
 from .text_scouts import NewsDesk, TextScoutsError
 
-HARD_MAX_CAPITAL_USD = Decimal(100)
-HARD_MAX_RISK_PER_TRADE_USD = Decimal(1)
-HARD_MAX_SESSION_LOSS_USD = Decimal(10)
-HARD_MAX_TRADES_PER_DAY = 12
+# Hard bounds of the configuration. Dollar limits are fractions of the capital basis, so the
+# same rules hold for a 100 USD canary and a 100 000 USD account.
+HARD_MAX_CAPITAL_USD = Decimal(150_000)
+# One trade's stop-loss dollars: at most this share of the capital basis (the Risk Manager's
+# constitutional fraction is lower; this only bounds the configured dollar cap).
+HARD_MAX_RISK_PER_TRADE_OF_CAPITAL = Decimal("0.01")
+# The session's realised loss stop: at most this share of the capital basis.
+HARD_MAX_SESSION_LOSS_OF_CAPITAL = Decimal("0.05")
+HARD_MAX_TRADES_PER_DAY = 40
 HARD_MAX_OPEN_POSITIONS = 10
 # The owner's leverage constitution (2026-11-16). The Risk Manager picks each trade's
 # leverage from 1x up to this by need, evidence, the stop and the venue's maximum.
@@ -97,8 +107,11 @@ MAX_LEVERAGE = 30.0
 # is set by the Risk Manager, and the number of positions by its aggregate open risk (1%),
 # the Macro Strategist's gross cap and free margin at the chosen leverage.
 POSITION_NOTIONAL_OF_CAPITAL = 3
-# The account equity above which the Risk Manager refuses every entry (LiveRiskLimitsV1).
-HARD_MAX_ACCOUNT_EQUITY_USD = Decimal(250)
+# The configurable multiple may only be lower: a large account trades thin books.
+MIN_POSITION_NOTIONAL_OF_CAPITAL = 0.05
+# The account equity above which the Risk Manager refuses every entry (LiveRiskLimitsV1):
+# at most this multiple of the capital basis, so a bigger account is never traded unnoticed.
+HARD_MAX_ACCOUNT_EQUITY_OF_CAPITAL = Decimal(2)
 HISTORY_LENGTH = 20
 HOUR_MS = 60 * 60_000
 BAR_MS = HOUR_MS  # signals come from closed 1h bars
@@ -118,9 +131,10 @@ SNAPSHOT_LEAD_MS = (10_000, 75_000)
 SCAN_AFTER_CLOSE_MS = 5_000
 BAR_CONCURRENCY = 8
 ENGINE_PROCESSES = 8
-# The strategies the Macro Strategist allocates capital to; the Risk Manager gives an entry
+# The strategies the runner can trade. ``Config.strategies`` selects among them; the Macro
+# Strategist allocates capital to the selected ones, and the Risk Manager gives an entry
 # capital only through the weight of its intent's strategy id.
-STRATEGY_IDS = (HOURLY_TREND_ID,)
+KNOWN_STRATEGIES = (HOURLY_TREND_ID, RIGHT_TAIL_ID)
 # Config keys of earlier versions that no longer select anything.
 RETIRED_CONFIG_KEYS = {
     "risk_mode": "every entry is decided by the Kairos Risk Manager",
@@ -163,7 +177,17 @@ class Config:
             "ZECUSD",
         ]
     )
+    # The strategies whose intents are traded. hourly_trend always runs, because its state is
+    # the reviewers' market features; when it is not listed its intents are only journaled.
+    strategies: list[str] = field(default_factory=lambda: [HOURLY_TREND_ID])
+    # A fixed position-management policy per strategy (management.Management fields), chosen
+    # by an offline study; a strategy without one uses the measured policy below.
+    management_policies: dict[str, dict[str, Any]] = field(default_factory=dict)
     capital_basis_usd: float = 100.0
+    # One position's notional at most this multiple of the capital basis. The venue gate
+    # measures the book's slippage for this notional, so a large account sets it to what
+    # the thinner books can absorb (0.25 of 100 000 USD is 25 000 USD).
+    position_notional_of_capital: float = float(POSITION_NOTIONAL_OF_CAPITAL)
     risk_per_trade_usd: float = 0.25
     session_loss_stop_usd: float = 5.0
     max_trades_per_day: int = 12
@@ -259,12 +283,41 @@ class Config:
             raise ConfigError("review_timeout_s must be within 0.001..60")
         if not 0 < self.review_budget_usd <= OPENAI_MONTHLY_CEILING_USD:
             raise ConfigError(f"review_budget_usd must be within (0, {OPENAI_MONTHLY_CEILING_USD}]")
-        if not 0 < Decimal(str(self.capital_basis_usd)) <= HARD_MAX_CAPITAL_USD:
+        capital = Decimal(str(self.capital_basis_usd))
+        if not 0 < capital <= HARD_MAX_CAPITAL_USD:
             raise ConfigError(f"capital_basis_usd must be within (0, {HARD_MAX_CAPITAL_USD}]")
-        if not 0 < Decimal(str(self.risk_per_trade_usd)) <= HARD_MAX_RISK_PER_TRADE_USD:
-            raise ConfigError(f"risk_per_trade_usd must be within (0, {HARD_MAX_RISK_PER_TRADE_USD}]")
-        if not 0 < Decimal(str(self.session_loss_stop_usd)) <= HARD_MAX_SESSION_LOSS_USD:
-            raise ConfigError(f"session_loss_stop_usd must be within (0, {HARD_MAX_SESSION_LOSS_USD}]")
+        if not 0 < Decimal(str(self.risk_per_trade_usd)) <= capital * HARD_MAX_RISK_PER_TRADE_OF_CAPITAL:
+            raise ConfigError(
+                "risk_per_trade_usd must be within (0, "
+                f"{HARD_MAX_RISK_PER_TRADE_OF_CAPITAL:%} of capital_basis_usd]"
+            )
+        if not 0 < Decimal(str(self.session_loss_stop_usd)) <= capital * HARD_MAX_SESSION_LOSS_OF_CAPITAL:
+            raise ConfigError(
+                "session_loss_stop_usd must be within (0, "
+                f"{HARD_MAX_SESSION_LOSS_OF_CAPITAL:%} of capital_basis_usd]"
+            )
+        if (
+            not MIN_POSITION_NOTIONAL_OF_CAPITAL
+            <= float(self.position_notional_of_capital)
+            <= float(POSITION_NOTIONAL_OF_CAPITAL)
+        ):
+            raise ConfigError(
+                f"position_notional_of_capital must be within {MIN_POSITION_NOTIONAL_OF_CAPITAL}.."
+                f"{POSITION_NOTIONAL_OF_CAPITAL}"
+            )
+        if not self.strategies or any(s not in KNOWN_STRATEGIES for s in self.strategies):
+            raise ConfigError(f"strategies must be a non-empty subset of {', '.join(KNOWN_STRATEGIES)}")
+        if len(set(self.strategies)) != len(self.strategies):
+            raise ConfigError("strategies must not repeat")
+        if not isinstance(self.management_policies, dict):
+            raise ConfigError("management_policies must map a strategy id to a policy")
+        for strategy, policy in self.management_policies.items():
+            if strategy not in KNOWN_STRATEGIES or not isinstance(policy, dict):
+                raise ConfigError(f"management_policies: unknown strategy or malformed policy for {strategy}")
+            try:
+                Management.from_dict({"name": f"{strategy}-fixed", **policy})
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"management_policies[{strategy}]: {exc}") from exc
         if not 1 <= int(self.max_trades_per_day) <= HARD_MAX_TRADES_PER_DAY:
             raise ConfigError(f"max_trades_per_day must be within 1..{HARD_MAX_TRADES_PER_DAY}")
         if not 1 <= int(self.max_open_positions) <= HARD_MAX_OPEN_POSITIONS:
@@ -281,8 +334,12 @@ class Config:
             raise ConfigError("macro_refresh_hours must be within 1..24")
         if self.management not in ("measured", "off"):
             raise ConfigError("management must be measured or off")
-        if not 0 < Decimal(str(self.max_account_equity_usd)) <= HARD_MAX_ACCOUNT_EQUITY_USD:
-            raise ConfigError(f"max_account_equity_usd must be within (0, {HARD_MAX_ACCOUNT_EQUITY_USD}]")
+        ceiling = capital * HARD_MAX_ACCOUNT_EQUITY_OF_CAPITAL
+        if not capital <= Decimal(str(self.max_account_equity_usd)) <= ceiling:
+            raise ConfigError(
+                "max_account_equity_usd must be within [capital_basis_usd, "
+                f"{HARD_MAX_ACCOUNT_EQUITY_OF_CAPITAL} x capital_basis_usd]"
+            )
         if self.review_mode not in ("probability", "aggregator"):
             raise ConfigError("review_mode must be probability or aggregator")
         if self.executor not in ("runner", "execution_engine"):
@@ -1176,7 +1233,10 @@ class Trader:
             try:
                 rules.check_macro()
                 self.macro = MacroDesk(
-                    store, rules, STRATEGY_IDS, refresh_ms=int(float(config.macro_refresh_hours) * 3_600_000)
+                    store,
+                    rules,
+                    tuple(config.strategies),
+                    refresh_ms=int(float(config.macro_refresh_hours) * 3_600_000),
                 )
             except RulesError as exc:
                 say(f"Macro Strategist отключён: {exc}")
@@ -1201,7 +1261,7 @@ class Trader:
                     python=Path(config.execution_python),
                     session_config=Path(config.execution_session_config),
                     # arm window + longest holding + terminal reconciliation, with margin
-                    max_session_s=config.timeout_minutes * 60 + 3_600,
+                    max_session_s=self.longest_hold_minutes() * 60 + 3_600,
                 ),
                 store,
             )
@@ -1380,7 +1440,7 @@ class Trader:
         """The frozen scope inputs and limits of LiveRiskEvaluator, from this configuration."""
         config = self.config
         capital = float(config.capital_basis_usd)
-        position_cap = capital * POSITION_NOTIONAL_OF_CAPITAL
+        position_cap = capital * float(config.position_notional_of_capital)
         limits = {
             "per_trade_risk_fraction": PER_TRADE_RISK_FRACTION,
             "aggregate_open_risk_fraction": AGGREGATE_OPEN_RISK_FRACTION,
@@ -1562,10 +1622,31 @@ class Trader:
                 say(f"Execution Engine: прошу досрочно закрыть позицию — {reason}.")
         return session is not None
 
-    def management_policy(self, now_ms: int) -> Management | None:
-        """The measured management policy for new trades (re-read every ten minutes)."""
+    def history_ms(self) -> int:
+        """How far back the closed-bar cache must reach for the selected strategies."""
+        need = HOURLY_TREND_HISTORY_MS
+        if RIGHT_TAIL_ID in self.config.strategies:
+            need = max(need, RIGHT_TAIL_HISTORY_MS)
+        return need
+
+    def longest_hold_minutes(self) -> int:
+        """The longest holding time any selected strategy plans (72 h for the daily rule)."""
+        longest = int(self.config.timeout_minutes)
+        if RIGHT_TAIL_ID in self.config.strategies:
+            longest = max(longest, 72 * 60)
+        return longest
+
+    def management_policy(self, now_ms: int, strategy_id: str | None = None) -> Management | None:
+        """The management policy for a new trade of ``strategy_id``.
+
+        A strategy with a fixed policy in the configuration gets it; otherwise the measured
+        policy (re-read every ten minutes), which the replay of the hourly rules selects.
+        """
         if self.config.management == "off":
             return None
+        fixed = self.config.management_policies.get(strategy_id or "")
+        if fixed is not None:
+            return Management.from_dict({"name": f"{strategy_id}-fixed", **fixed})
         loaded_at, policy, reason = self._policy
         if now_ms - loaded_at >= 600_000:
             policy, reason = load_policy(
@@ -1797,7 +1878,7 @@ class Trader:
             self.quant,
             list(by_signal),
             now_ms,
-            HOURLY_TREND_HISTORY_MS + HOUR_MS,
+            self.history_ms() + HOUR_MS,
             fetch=self._fetch_bars,
             concurrency=BAR_CONCURRENCY,
         )
@@ -1921,11 +2002,51 @@ class Trader:
         candidates: list[Routed] = []
         rejected: list[dict[str, Any]] = []
         router: dict[str, Any] = {}
+        intents: dict[str, StrategyIntentV1] = {}
+        shadow: list[dict[str, Any]] = []
         if found and found.intents:
+            if HOURLY_TREND_ID in self.config.strategies:
+                intents.update(found.intents)
+            else:
+                # Not traded: recorded so the hourly rules keep being measured.
+                shadow = [
+                    {"symbol": i, "side": x.side.value, "strategy_id": x.strategy_id}
+                    for i, x in found.intents.items()
+                ]
+        engines = {**(found.identity if found else {})}
+        if series and RIGHT_TAIL_ID in self.config.strategies and right_tail_due(slot):
+            try:
+                daily, daily_skipped, daily_identity = await right_tail_scan(
+                    self.engine,
+                    series,
+                    slot,
+                    price_increments={name: item.price_step for name, item in self.instruments.items()},
+                    processes=ENGINE_PROCESSES,
+                )
+            except EngineError as exc:
+                say(f"Дневная стратегия не дала ответа: {str(exc)[:200]}")
+                self.store.journal("scan_error", bar=last_closed, message=f"right tail: {str(exc)[:300]}")
+            else:
+                skipped.extend(daily_skipped)
+                engines["right_tail"] = json.dumps(daily_identity, sort_keys=True)
+                for instrument, intent in daily.items():
+                    replaced = intents.get(instrument)
+                    if replaced is not None:
+                        # One position per instrument: the daily rule's candidate is reviewed.
+                        shadow.append(
+                            {
+                                "symbol": instrument,
+                                "side": replaced.side.value,
+                                "strategy_id": replaced.strategy_id,
+                            }
+                        )
+                    intents[instrument] = intent
+                timing["right_tail_s"] = round(time.monotonic() - started, 2)
+        if intents:
             try:
                 routing = await route_intents(
                     self.router,
-                    found.intents,
+                    intents,
                     signals=self.news.raw_signals() if self.news else [],
                     now_ms=int(time.time() * 1000),
                     review_timeout_ms=int(self.config.review_timeout_s * 1000),
@@ -1942,12 +2063,13 @@ class Trader:
             bar=last_closed,
             source="strategy_engine",
             signal_venue=SIGNAL_VENUE,
-            engine={**(found.identity if found else {}), **self._signal_revisions},
+            engine={**engines, **self._signal_revisions},
             router=router,
             features=[{**f.as_dict(), **self._extras.get(f.symbol, {})} for f in features],
             candidates=[c.record() for c in candidates],
             rejected=rejected,
             skipped=skipped,
+            not_traded=shadow,
         )
         return features, candidates
 
@@ -2215,7 +2337,9 @@ class Trader:
                     context={
                         # What the runner needs to judge an early exit and to measure it later.
                         "instrument": candidate.instrument,
-                        "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
+                        "management": (lambda p: p.as_dict() if p else None)(
+                            self.management_policy(now_ms, candidate.intent.strategy_id)
+                        ),
                         "side": candidate.side,
                         "regime": (allocation or {}).get("regime") or "UNKNOWN",
                         "decided_at_ms": risk_decision.decided_at_ms,
@@ -2286,7 +2410,9 @@ class Trader:
             # Position management fixed for this trade's life (None: the plan as it is).
             "initial_stop": str(stop),
             "initial_quantity": str(fill["quantity"]),
-            "management": (lambda p: p.as_dict() if p else None)(self.management_policy(now_ms)),
+            "management": (lambda p: p.as_dict() if p else None)(
+                self.management_policy(now_ms, candidate.intent.strategy_id)
+            ),
         }
         for other in trades:
             other["solo"] = False

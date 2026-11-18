@@ -269,6 +269,84 @@ def _hourly_trend_history_step(request: dict, candle_type: Any) -> dict:
     return {"identity": asdict(hourly_trend_source_identity(settings)), "results": results}
 
 
+def _on_tick(value: float, tick: Decimal | None, *, up: bool) -> float:
+    if tick is None or tick <= 0:
+        return value
+    rounding = "ROUND_CEILING" if up else "ROUND_FLOOR"
+    return float((Decimal(repr(value)) / tick).to_integral_value(rounding=rounding) * tick)
+
+
+def _registered_bars(request: dict, candle_type: Any) -> dict:
+    """A registered strategy's strict intent at one decision, from cached closed Binance bars.
+
+    The strategy's own generator decides on the closed-bar window. The runner adds only the
+    venue's price tick (the stop moves away from the entry, the target toward it, so the
+    planned risk never shrinks) and the ``setup`` label its reviewers read; the result then
+    goes through the engine's own strict conversion, which binds every input bar.
+    """
+    import dataclasses
+
+    from kairos_strategy import registry
+    from kairos_strategy.provenance import config_sha256, installed_source_tree_sha256
+    from kairos_strategy.runtime import _strict_intent, canonical_closed_bars, closed_bar_to_candle
+
+    strategy_id = str(request["strategy_id"])
+    setup = str(request.get("setup") or strategy_id.upper())
+    decision_ts_ms = int(request["decision_ts_ms"])
+    definition = registry.get_strategy(strategy_id)
+    settings = definition.config_type()
+    code_sha256 = installed_source_tree_sha256(definition.source_files)
+    config_fingerprint = config_sha256(settings)
+    increments = dict(request.get("price_increments") or {})
+    results: dict[str, dict] = {}
+    for symbol, rows in request["series"].items():
+        try:
+            bars = canonical_closed_bars(_closed_bars(str(symbol), rows, candle_type))
+            raw = registry.generate_sleeve_intents(
+                strategy_id, [closed_bar_to_candle(bar) for bar in bars], settings
+            )
+            found = [intent for intent in raw if intent.decision_ts_ms == decision_ts_ms]
+            intent_json = None
+            if found:
+                raw_intent = found[0]
+                tick = Decimal(str(increments[symbol])) if symbol in increments else None
+                long = str(getattr(raw_intent.side, "value", raw_intent.side)).upper() == "LONG"
+                plan = raw_intent.exit_plan
+                plan = dataclasses.replace(
+                    plan,
+                    stop_price=_on_tick(plan.stop_price, tick, up=not long),
+                    # A long rounds both barriers down, a short both up: the stop away
+                    # from the entry and the target toward it.
+                    target_price=_on_tick(plan.target_price, tick, up=not long),
+                )
+                metadata = tuple(sorted((*raw_intent.metadata, ("setup", setup))))
+                adjusted = dataclasses.replace(raw_intent, exit_plan=plan, metadata=metadata)
+                window = [bar for bar in bars if bar.close_time_ms <= decision_ts_ms]
+                strict = _strict_intent(
+                    adjusted,
+                    strategy_revision=definition.revision,
+                    code_sha256=code_sha256,
+                    config_fingerprint=config_fingerprint,
+                    input_bars=window,
+                )
+                intent_json = strict.model_dump(mode="json")
+            results[symbol] = {
+                "decision_ts_ms": decision_ts_ms,
+                "input_bar_count": len(bars),
+                "intent": intent_json,
+            }
+        except Exception as exc:  # noqa: BLE001 - one broken symbol must not hide the others
+            results[symbol] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    identity = {
+        "strategy_id": strategy_id,
+        "revision": str(definition.revision),
+        "status": str(getattr(definition.status, "value", definition.status)),
+        "strategy_code_sha256": code_sha256,
+        "config_sha256": config_fingerprint,
+    }
+    return {"identity": identity, "results": results}
+
+
 def main() -> int:
     # argv[1] is the engine's source directory. It replaces this script's own directory
     # on the import path, so nothing from the runner package can shadow engine imports.
@@ -282,6 +360,7 @@ def main() -> int:
             "adaptive_bars": _adaptive_bars,
             "hourly_trend_history": _hourly_trend_history,
             "hourly_trend_history_step": _hourly_trend_history_step,
+            "registered_bars": _registered_bars,
             None: _registered,
         }
         answer = operations[request.get("op")](request, Candle)
