@@ -264,7 +264,7 @@ def test_real_review_runs_the_aggregator_brain_through_the_budgeted_gateway(tmp_
     assert (vetoed["decision"], vetoed["tier"], vetoed["model"]["model"]) == (
         "VETO",
         "CONFLICT",
-        "gpt-6.1-sol",
+        "gpt-6.2-sol",
     )
     assert allowed["context"]["sources"] == {
         "closed_bars": "AVAILABLE",
