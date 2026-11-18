@@ -2849,4 +2849,15 @@ class Trader:
             if self.store.flag("STOP") and not self.trades():
                 say("Найден файл STOP, позиций нет. Останавливаюсь.")
                 return
-            await asyncio.sleep(self.config.poll_seconds if max_steps is None else 0)
+            await asyncio.sleep(self.pause_s(time.time()) if max_steps is None else 0)
+
+    def pause_s(self, now_s: float) -> float:
+        """Seconds until the next loop: the poll interval, or less to start a scan on time.
+
+        The review window closes 60 s after the bar, so the scan starts right when its
+        bar has had ``SCAN_AFTER_CLOSE_MS`` to reach Binance, not up to a poll later.
+        """
+        scan_ms = int(self.config.scan_minutes) * 60_000
+        now_ms = now_s * 1000
+        due_ms = (now_ms - SCAN_AFTER_CLOSE_MS) // scan_ms * scan_ms + scan_ms + SCAN_AFTER_CLOSE_MS
+        return max(0.05, min(float(self.config.poll_seconds), (due_ms - now_ms) / 1000 + 0.05))

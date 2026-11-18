@@ -1419,3 +1419,13 @@ def test_run_ends_the_background_engine_work_and_stops_the_persistent_workers(tm
 
     warm = asyncio.run(run())
     assert warm.cancelled() and sorted(stopped) == ["hourly", "right_tail"]
+
+
+def test_the_loop_wakes_up_when_the_next_scan_is_due(tmp_path):
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False, poll_seconds=5.0))
+    slot_s = 1_795_008_600  # a quarter-hour close
+    due_s = slot_s + SCAN_AFTER_CLOSE_MS / 1000
+    assert trader.pause_s(slot_s - 60) == 5.0, "far from a close: the poll interval"
+    assert trader.pause_s(due_s - 2) == pytest.approx(2.05), "near it: wake right when the scan is due"
+    assert trader.pause_s(due_s + 0.01) == 5.0, "the next scan is a quarter-hour away"
+    assert trader.pause_s(due_s - 0.01) == pytest.approx(0.06)
