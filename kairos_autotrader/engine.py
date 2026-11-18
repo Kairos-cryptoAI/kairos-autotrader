@@ -1233,7 +1233,12 @@ class Trader:
             if self.engine is not None and RIGHT_TAIL_ID in config.strategies
             else None
         )
+        # The hourly rules read 21 days every scan and give the reviewers their features.
+        self.hourly_pool: EnginePool | None = (
+            EnginePool(self.engine, ENGINE_PROCESSES) if self.engine is not None else None
+        )
         self._warm_task: asyncio.Task | None = None
+        self._adaptive_task: asyncio.Task | None = None
         self.aggregator: AggregatorConfig | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
@@ -1914,8 +1919,8 @@ class Trader:
         if self.engine is None:
             return
         series, problems = await self._update_bars(int(time.time() * 1000))
-        if self.right_tail_pool is not None and series and self._warm_task is None:
-            self._warm_task = asyncio.create_task(self._warm_right_tail(series))
+        if series and self._warm_task is None:
+            self._warm_task = asyncio.create_task(self._warm_pools(series))
         if problems:
             say(
                 "Минутная история Binance загружена не полностью ("
@@ -1923,30 +1928,58 @@ class Trader:
                 + "); повторю на скане."
             )
 
-    async def _warm_right_tail(self, series: dict[str, list[Any]]) -> None:
-        """Run the right-tail rule once at its latest past decision, only to fill the workers.
+    async def _warm_pools(self, series: dict[str, list[Any]]) -> None:
+        """Run each pooled rule once at its latest past decision, only to fill the workers.
 
-        The answer is discarded: it decides nothing. The first real decision after a start
+        The answers are discarded: they decide nothing. The first real scan after a start
         then checks only the bars that closed since, instead of the whole window.
         """
-        assert self.engine is not None and self.right_tail_pool is not None
-        interval_ms = int(self.config.right_tail_interval_hours) * HOUR_MS
+        assert self.engine is not None
+        engine = self.engine
         now_ms = int(time.time() * 1000)
-        boundary = now_ms - (now_ms - HOUR_MS) % interval_ms
-        started = time.monotonic()
-        try:
-            await right_tail_scan(
-                self.engine,
-                series,
+        ticks = {name: item.price_step for name, item in self.instruments.items()}
+        parts: dict[str, tuple[int, Any]] = {}
+        if self.hourly_pool is not None:
+            boundary = self.scan_slot(now_ms)
+            parts["hourly"] = (
                 boundary,
-                price_increments={name: item.price_step for name, item in self.instruments.items()},
-                interval_hours=self.config.right_tail_interval_hours,
-                pool=self.right_tail_pool,
+                hourly_trend_scan(
+                    engine,
+                    series,
+                    boundary,
+                    reward_risk=self.config.reward_risk,
+                    timeout_minutes=self.config.timeout_minutes,
+                    price_increments=ticks,
+                    pool=self.hourly_pool,
+                ),
             )
-        except EngineError as exc:
-            say(f"Прогрев дневной стратегии не удался, первый её скан будет медленнее: {str(exc)[:200]}")
-            return
-        self.store.journal("right_tail_warm", boundary=boundary, seconds=round(time.monotonic() - started, 2))
+        if self.right_tail_pool is not None:
+            interval_ms = int(self.config.right_tail_interval_hours) * HOUR_MS
+            boundary = now_ms - (now_ms - HOUR_MS) % interval_ms
+            parts["right_tail"] = (
+                boundary,
+                right_tail_scan(
+                    engine,
+                    series,
+                    boundary,
+                    price_increments=ticks,
+                    interval_hours=self.config.right_tail_interval_hours,
+                    pool=self.right_tail_pool,
+                ),
+            )
+
+        async def timed(name: str, boundary: int, work: Any) -> None:
+            started = time.monotonic()
+            try:
+                await work
+            except EngineError as exc:
+                say(f"Прогрев движка ({name}) не удался, первый скан будет медленнее: {str(exc)[:200]}")
+                return
+            self.store.journal(
+                "engine_warm", rule=name, boundary=boundary, seconds=round(time.monotonic() - started, 2)
+            )
+
+        await asyncio.gather(*(timed(name, boundary, work) for name, (boundary, work) in parts.items()))
 
     def _market_due(self, now_ms: int) -> int | None:
         """The boundary whose snapshot should be taken now, if any."""
@@ -2044,6 +2077,7 @@ class Trader:
                     timeout_minutes=self.config.timeout_minutes,
                     price_increments={name: item.price_step for name, item in self.instruments.items()},
                     processes=ENGINE_PROCESSES,
+                    pool=self.hourly_pool,
                 )
             except EngineError as exc:
                 say(f"Strategy Engine не дал ответа, скан пропущен: {str(exc)[:200]}")
@@ -2053,8 +2087,9 @@ class Trader:
                 return [], []
             skipped.extend(found.skipped)
             timing["engine_s"] = round(time.monotonic() - started - timing["bars_s"], 2)
-            if self.config.adaptive_shadow:
-                await self._observe_adaptive(series, slot)
+            if self.config.adaptive_shadow and (self._adaptive_task is None or self._adaptive_task.done()):
+                # Only observed, never traded: it must not take time from the review window.
+                self._adaptive_task = asyncio.create_task(self._observe_adaptive(series, slot))
             self._measure_early_exits(series)
         try:
             metrics = await self.api.metrics()

@@ -171,10 +171,11 @@ def _hourly_trend_bars(request: dict, candle_type: Any) -> dict:
     # Only fields of the engine's own validated config are accepted; the identity reports it.
     config = HourlyTrendCandidatesConfig(**dict(request.get("config") or {}))
     increments = dict(request.get("price_increments") or {})
+    _forget_others(request)
     results: dict[str, dict] = {}
     for symbol, rows in request["series"].items():
         try:
-            bars = _closed_bars(str(symbol), rows, candle_type)
+            bars, _ = _checked_bars(str(symbol), rows, candle_type)
             tick = increments.get(symbol)
             evaluation = evaluate_hourly_trend_closed_bars(
                 bars, config, price_increment=None if tick is None else Decimal(str(tick))
@@ -331,6 +332,12 @@ def _checked_bars(symbol: str, rows: list, candle_type: Any) -> tuple[list, list
     return [item[1] for item in ordered], [item[2] for item in ordered]
 
 
+def _forget_others(request: dict) -> None:
+    """Drop the checked bars of symbols this request does not carry (see ``_CHECKED``)."""
+    for stale in set(_CHECKED) - {str(symbol) for symbol in request["series"]}:
+        del _CHECKED[stale]
+
+
 def _registered_bars(request: dict, candle_type: Any) -> dict:
     """A registered strategy's strict intent at one decision, from cached closed Binance bars.
 
@@ -352,8 +359,7 @@ def _registered_bars(request: dict, candle_type: Any) -> dict:
     code_sha256 = installed_source_tree_sha256(definition.source_files)
     config_fingerprint = config_sha256(settings)
     increments = dict(request.get("price_increments") or {})
-    for stale in set(_CHECKED) - {str(symbol) for symbol in request["series"]}:
-        del _CHECKED[stale]
+    _forget_others(request)
     results: dict[str, dict] = {}
     for symbol, rows in request["series"].items():
         try:

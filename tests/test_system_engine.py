@@ -817,3 +817,59 @@ def test_real_engine_worker_serves_until_its_input_closes():
             await pool.stop()
 
     asyncio.run(run())
+
+
+def test_hourly_scan_uses_its_pool_workers_and_falls_back_when_one_fails():
+    boundary = (B0 // HOUR_MS + 600) * HOUR_MS
+    full = HOURLY_TREND_HISTORY_MS // MINUTE_MS
+    names = ("AAVEUSD", "BTCUSD", "ETHUSD", "XRPUSD")
+    series = {name: cached_bars(boundary - HOURLY_TREND_HISTORY_MS, full, name + "T") for name in names}
+
+    def answer(request):
+        results = {}
+        for symbol, rows in request["series"].items():
+            decision = int(rows[-1][0]) + MINUTE_MS - 1
+            state = engine_state(symbol, decision)
+            results[symbol] = {"decision_ts_ms": decision, "state": state, "intent": None}
+        return {"identity": IDENTITY, "results": results}
+
+    class Pool:
+        size = 3
+
+        def __init__(self, broken=()):
+            self.broken, self.calls = set(broken), []
+
+        async def ask(self, index, request):
+            assert request["op"] == "hourly_trend_bars"
+            self.calls.append((index, sorted(request["series"])))
+            if index in self.broken:
+                raise EngineError("Strategy Engine: the worker exited")
+            return answer(request)
+
+    one_shot = []
+
+    def runner(config, request):
+        one_shot.append(sorted(request["series"]))
+        return answer(request)
+
+    def scan(pool):
+        return asyncio.run(
+            system_engine.hourly_trend_scan(
+                EngineConfig(),
+                series,
+                boundary,
+                reward_risk=1.5,
+                timeout_minutes=720,
+                runner=runner,
+                pool=pool,
+            )
+        )
+
+    pool = Pool()
+    found = scan(pool)
+    assert sorted(pool.calls) == [(0, ["AAVEUSDT", "XRPUSDT"]), (1, ["BTCUSDT"]), (2, ["ETHUSDT"])]
+    assert one_shot == [] and sorted(found.features) == sorted(names) and found.skipped == []
+    # A failed worker's instruments are decided by a one-shot worker; the others stay pooled.
+    pool = Pool(broken={1})
+    found = scan(pool)
+    assert one_shot == [["BTCUSDT"]] and sorted(found.features) == sorted(names)

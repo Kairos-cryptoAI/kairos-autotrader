@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -424,6 +425,39 @@ class TrendScan:
     skipped: list[str]
 
 
+def _by_worker(names: list[str], series: dict[str, Any], width: int) -> dict[int, list[str]]:
+    """A fixed worker per instrument: its place among all instruments with bars.
+
+    So a persistent worker sees the same instruments every time, and an instrument that
+    is skipped once does not move the others to workers that have not checked their bars.
+    """
+    places = {instrument: place for place, instrument in enumerate(sorted(series))}
+    by_worker: dict[int, list[str]] = {}
+    for instrument in names:
+        by_worker.setdefault(places[instrument] % width, []).append(instrument)
+    return by_worker
+
+
+async def _ask_workers(
+    config: EngineConfig,
+    by_worker: dict[int, list[str]],
+    request: Callable[[list[str]], dict[str, Any]],
+    run: Callable[[EngineConfig, dict[str, Any]], dict[str, Any]],
+    pool: EnginePool | None,
+) -> list[dict[str, Any]]:
+    """Every group's answer, from its persistent worker, or a one-shot worker if that fails."""
+
+    async def ask_group(worker: int, group: list[str]) -> dict[str, Any]:
+        if pool is not None:
+            try:
+                return await pool.ask(worker, request(group))
+            except EngineError:
+                pass  # the one-shot worker below decides the same way, only slower
+        return await asyncio.to_thread(run, config, request(group))
+
+    return list(await asyncio.gather(*(ask_group(worker, group) for worker, group in by_worker.items())))
+
+
 async def hourly_trend_scan(
     config: EngineConfig,
     series: dict[str, list[list[Any]]],
@@ -434,6 +468,7 @@ async def hourly_trend_scan(
     runner=None,
     processes: int = 4,
     price_increments: dict[str, Any] | None = None,
+    pool: EnginePool | None = None,
 ) -> TrendScan:
     """Run the live rules for the decision at ``boundary_ms`` on closed Binance bars.
 
@@ -442,6 +477,8 @@ async def hourly_trend_scan(
     history is late. Building some 30 000 strict bars per symbol takes about a second,
     so the symbols are spread over a few engine processes. ``price_increments`` (EVEDEX
     instrument to its price tick) makes the rules place stop and target on that tick.
+    With a ``pool`` each instrument always goes to the same persistent worker, which only
+    checks the bars that closed since its last answer.
     """
     first_ms = boundary_ms - HOURLY_TREND_HISTORY_MS
     windows: dict[str, list[list[Any]]] = {}
@@ -457,7 +494,7 @@ async def hourly_trend_scan(
             windows[instrument] = window
     run = runner or _run_hourly_trend
     names = list(windows)
-    groups = [names[index::processes] for index in range(max(1, min(processes, len(names))))]
+    width = pool.size if pool is not None else max(1, min(processes, len(names)))
     tuning = hourly_trend_config(reward_risk=reward_risk, timeout_minutes=timeout_minutes)
     ticks = dict(price_increments or {})
 
@@ -473,7 +510,7 @@ async def hourly_trend_scan(
             },
         }
 
-    answers = await asyncio.gather(*(asyncio.to_thread(run, config, request(group)) for group in groups))
+    answers = await _ask_workers(config, _by_worker(names, series, width), request, run, pool)
     identity: dict[str, str] = {}
     results: dict[str, Any] = {}
     for answer in answers:
@@ -639,13 +676,7 @@ async def right_tail_scan(
     names = list(windows)
     if not names:
         return {}, skipped, {}
-    # A fixed worker per instrument (its place among all instruments with bars), so a
-    # persistent worker sees the same instruments every time.
     width = pool.size if pool is not None else max(1, min(processes, len(names)))
-    places = {instrument: place for place, instrument in enumerate(sorted(series))}
-    by_worker: dict[int, list[str]] = {}
-    for instrument in names:
-        by_worker.setdefault(places[instrument] % width, []).append(instrument)
     ticks = dict(price_increments or {})
 
     def request(group: list[str]) -> dict[str, Any]:
@@ -664,16 +695,7 @@ async def right_tail_scan(
         }
 
     run = runner or _run_hourly_trend
-
-    async def ask_group(worker: int, group: list[str]) -> dict[str, Any]:
-        if pool is not None:
-            try:
-                return await pool.ask(worker, request(group))
-            except EngineError:
-                pass  # the one-shot worker below decides the same way, only slower
-        return await asyncio.to_thread(run, config, request(group))
-
-    answers = await asyncio.gather(*(ask_group(worker, group) for worker, group in by_worker.items()))
+    answers = await _ask_workers(config, _by_worker(names, series, width), request, run, pool)
     identity: dict[str, str] = {}
     results: dict[str, Any] = {}
     for answer in answers:
