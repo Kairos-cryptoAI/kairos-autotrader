@@ -819,6 +819,166 @@ def test_real_engine_worker_serves_until_its_input_closes():
     asyncio.run(run())
 
 
+def load_worker_module():
+    """``system_engine_worker`` imports only the standard library at module level."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("held_worker", Path(system_engine.WORKER))
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_held_window_refers_to_the_held_rows_and_sends_the_newest_again():
+    rows = cached_bars(T0, 100, "BTCUSDT")
+    window = system_engine.held_window(rows, rows[89][0])
+    assert window is not None
+    # Everything after the held rows, and the last ten held minutes, which Binance may still settle.
+    assert window["tail"] == rows[80:] and window["count"] == 100 and window["first_open_ms"] == T0
+    assert window["head_sha256"] == system_engine.held_digest(rows[:80])
+    assert system_engine.held_window(rows, rows[0][0] - 3 * HOUR_MS)["tail"] == rows, "nothing held in range"
+    assert system_engine.held_window(rows[:50] + rows[51:], rows[89][0]) is None, "a gap is sent in full"
+    assert system_engine.held_window([], T0) is None
+
+
+def test_the_worker_rebuilds_a_held_window_or_asks_for_it_in_full():
+    worker = load_worker_module()
+    rows = cached_bars(T0, 100, "BTCUSDT")
+    worker._CHECKED["BTCUSDT"] = {int(row[0]): (tuple(row), None, None) for row in rows[:90]}
+    request = {
+        "op": "registered_bars",
+        "series": {
+            "BTCUSDT": system_engine.held_window(rows, rows[89][0]),
+            "ETHUSDT": cached_bars(T0, 3, "ETHUSDT"),
+        },
+    }
+    expanded = worker._expand(request)
+    assert expanded["series"]["BTCUSDT"] == rows
+    assert expanded["series"]["ETHUSDT"] == cached_bars(T0, 3, "ETHUSDT")
+    full = worker._expand({"op": "x", "series": {"A": rows}})
+    assert full["series"]["A"] is rows, "full rows pass as they are"
+    changed = dict(worker._CHECKED["BTCUSDT"])
+    changed[T0] = (tuple([*rows[0][:9], "another identity"]), None, None)
+    worker._CHECKED["BTCUSDT"] = changed
+    with pytest.raises(worker._MissingBars):
+        worker._expand(request)  # the held rows are not the ones the runner refers to
+    del changed[T0 + 5 * MINUTE_MS]
+    worker._CHECKED["BTCUSDT"] = {k: v for k, v in changed.items() if k != T0}
+    with pytest.raises(worker._MissingBars):
+        worker._expand(request)
+
+
+FAKE_HOLDING_WORKER = """
+import hashlib, json, sys
+MARKER = "@@KAIROS-WORKER@@"
+held = {}
+
+
+def say(value):
+    sys.stdout.write(MARKER + json.dumps(value) + "\\n")
+    sys.stdout.flush()
+
+
+say({"ready": True})
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("forget"):
+        held.clear()
+    if request.get("op") == "die":
+        sys.exit(3)
+    sent, full = {}, {}
+    for symbol, value in request["series"].items():
+        if isinstance(value, dict):
+            known = held.get(symbol, {})
+            first, size = value["first_open_ms"], value["count"] - len(value["tail"])
+            head = [known.get(first + i * 60000) for i in range(size)]
+            digest = hashlib.sha256("".join(str(r[9]) for r in head if r).encode()).hexdigest()
+            if None in head or digest != value["head_sha256"]:
+                say({"missing_bars": True, "symbol": symbol})
+                break
+            full[symbol] = head + value["tail"]
+            sent[symbol] = len(value["tail"])
+        else:
+            full[symbol] = value
+            sent[symbol] = "full"
+    else:
+        for symbol, rows in full.items():
+            held[symbol] = {row[0]: row for row in rows}
+        say({"results": {s: {"rows": len(r), "last": r[-1][0]} for s, r in full.items()}, "sent": sent})
+"""
+
+
+def test_engine_pool_sends_only_new_bars_to_a_worker_that_holds_the_rest(tmp_path, monkeypatch):
+    import sys
+
+    script = tmp_path / "worker.py"
+    script.write_text(FAKE_HOLDING_WORKER, encoding="utf-8")
+    monkeypatch.setattr(system_engine, "WORKER", script)
+    config = EngineConfig(python=Path(sys.executable), source=tmp_path, timeout_s=10)
+    pool = system_engine.EnginePool(config, 1)
+    rows = cached_bars(T0, 600, "BTCUSDT")
+
+    def request(first, last):
+        return {"op": "registered_bars", "series": {"BTCUSDT": rows[first:last]}}
+
+    async def run():
+        try:
+            first = await pool.ask(0, request(0, 300))
+            assert first["sent"] == {"BTCUSDT": "full"} and first["results"]["BTCUSDT"]["rows"] == 300
+            later = await pool.ask(0, request(60, 360))  # an hour later: 60 new minutes, 10 sent again
+            assert later["sent"] == {"BTCUSDT": 70} and later["results"]["BTCUSDT"]["last"] == rows[359][0]
+            again = await pool.ask(0, {**request(120, 420), "forget": True})  # lost them: all again
+            assert again["sent"] == {"BTCUSDT": "full"} and again["results"]["BTCUSDT"]["rows"] == 300
+            with pytest.raises(EngineError):
+                await pool.ask(0, {"op": "die", "series": {}})
+            fresh = await pool.ask(0, request(180, 480))  # a restarted worker holds nothing
+            assert fresh["sent"] == {"BTCUSDT": "full"}
+            other = await pool.ask(0, {"op": "hourly_trend_history", "series": {"BTCUSDT": rows[200:500]}})
+            assert other["sent"] == {"BTCUSDT": "full"}, "only the ops whose bars a worker keeps"
+        finally:
+            await pool.stop()
+
+    asyncio.run(run())
+
+
+def test_real_engine_worker_hashes_a_window_as_the_engine_does():
+    """Run in the engine's own Python: the cached window hash equals the engine's own."""
+    import subprocess
+
+    config = EngineConfig()
+    if not config.python.exists() or not (config.source / "kairos_strategy").exists():
+        pytest.skip("Strategy Engine checkout or environment is not present")
+    worker_dir = Path(system_engine.__file__).parent
+    script = f"""
+import sys
+sys.path[:0] = [{str(config.source)!r}, {str(worker_dir)!r}]
+from kairos_strategy import runtime
+from kairos_strategy.candles import Candle
+import system_engine_worker as w
+
+original = runtime._window_sha256
+assert w._install_window_hash(Candle) and runtime._window_sha256 is w._window_sha256
+T = {T0}
+bars = [
+    runtime.candle_to_closed_bar(Candle(
+        symbol="SOLUSDT", timeframe="1m", open_time_ms=T + i * 60_000, close_time_ms=T + i * 60_000 + 59_999,
+        open=80.0 + i / 7, high=81.0 + i / 7, low=79.0 + i / 11, close=80.5 + i / 11, volume=1.0 + i,
+        quote_volume=80.0 * (1 + i), taker_buy_volume=0.5, taker_buy_quote_volume=40.0))
+    for i in range(300)
+]
+assert w._window_sha256(bars[:200]) == original(bars[:200])
+assert w._window_sha256(bars[60:260]) == original(bars[60:260]), "the reused bytes of a later window"
+assert set(w._WINDOW_BYTES["SOLUSDT"]) == {{bar.bar_sha256 for bar in bars[60:260]}}, "only the latest window"
+held = {{"first_open_ms": T, "count": 2, "head_sha256": "", "tail": []}}
+answer = w._answer({{"op": "registered_bars", "series": {{"XUSDT": held}}}})
+assert answer == {{"missing_bars": True, "symbol": "XUSDT"}}, answer
+print("ok")
+"""
+    answer = subprocess.run([str(config.python), "-c", script], capture_output=True, text=True, timeout=120)
+    assert answer.returncode == 0 and answer.stdout.strip().endswith("ok"), answer.stderr[-800:]
+
+
 def test_hourly_scan_uses_its_pool_workers_and_falls_back_when_one_fails():
     boundary = (B0 // HOUR_MS + 600) * HOUR_MS
     full = HOURLY_TREND_HISTORY_MS // MINUTE_MS

@@ -18,6 +18,7 @@ Nothing here places orders or needs a key.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -563,19 +564,54 @@ def right_tail_due(boundary_ms: int, interval_hours: int = 24) -> bool:
     return boundary_ms % (interval_hours * HOUR_MS) == RIGHT_TAIL_DECISION_HOUR_MS
 
 
+# Requests whose closed bars a persistent worker keeps (see ``EnginePool``).
+HELD_BAR_OPS = frozenset({"hourly_trend_bars", "registered_bars"})
+# The newest minutes are always sent again: Binance may still settle a just-closed bar.
+RESEND_TAIL_MS = 10 * MINUTE_MS
+
+
+def held_window(rows: list[list[Any]], newest_held_ms: int) -> dict[str, Any] | None:
+    """A contiguous window as a reference to the rows a worker holds, plus the rows after them.
+
+    The worker rebuilds the window from its own rows and the ``tail``, and checks the
+    ``head_sha256`` of the rows it supplies against the recorded identity of every bar
+    (its ``bar_sha256``). ``None`` when the window cannot be sent this way.
+    """
+    if not rows or int(rows[-1][0]) - int(rows[0][0]) != (len(rows) - 1) * MINUTE_MS:
+        return None
+    first = int(rows[0][0])
+    cut = max(0, min(len(rows), (newest_held_ms - RESEND_TAIL_MS - first) // MINUTE_MS + 1))
+    return {
+        "first_open_ms": first,
+        "count": len(rows),
+        "head_sha256": held_digest(rows[:cut]),
+        "tail": rows[cut:],
+    }
+
+
+def held_digest(rows: list[list[Any]]) -> str:
+    """The SHA-256 of the rows' recorded bar identities, in order."""
+    return hashlib.sha256("".join(str(row[9]) for row in rows).encode()).hexdigest()
+
+
 class EnginePool:
     """Persistent Strategy Engine workers (``system_engine_worker.py --serve``).
 
     Each worker keeps the engine imported and the closed bars it has already rebuilt and
     hash-checked, so a decision checks only the bars it has not seen (about 240 a symbol
-    every four hours instead of the whole 35-day window). A worker that fails or times
-    out is killed; the next request starts a fresh one.
+    every four hours instead of the whole 35-day window). The bars a worker already holds
+    are not sent again either: the request refers to them (``held_window``), which spares
+    encoding and piping some 300 MB of JSON at a four-hour decision. A worker that no
+    longer holds them answers ``missing_bars`` and gets the whole window. A worker that
+    fails or times out is killed; the next request starts a fresh one.
     """
 
     def __init__(self, config: EngineConfig, size: int) -> None:
         self.config = config
         self._processes: list[asyncio.subprocess.Process | None] = [None] * size
         self._locks = [asyncio.Lock() for _ in range(size)]
+        # Per worker: the newest open time of every symbol whose window it holds.
+        self._held: list[dict[str, int]] = [{} for _ in range(size)]
 
     @property
     def size(self) -> int:
@@ -616,6 +652,7 @@ class EnginePool:
         return process
 
     async def _kill(self, index: int) -> None:
+        self._held[index] = {}
         process, self._processes[index] = self._processes[index], None
         if process is not None and process.returncode is None:
             process.kill()
@@ -630,18 +667,52 @@ class EnginePool:
         async with self._locks[index]:
             try:
                 async with asyncio.timeout(self.config.timeout_s):
-                    process = self._processes[index]
-                    if process is None or process.returncode is not None:
-                        process = await self._start(index)
-                    assert process.stdin is not None
-                    process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
-                    await process.stdin.drain()
-                    return await self._read(process)
+                    sent = self._compact(index, request)
+                    answer = await self._exchange(index, sent)
+                    if sent is not request and answer.get("missing_bars"):
+                        self._held[index] = {}
+                        answer = await self._exchange(index, request)
+                    self._held[index] = self._holding(request, answer)
+                    return answer
             except (TimeoutError, OSError, ValueError, EngineError) as exc:
                 await self._kill(index)
                 if isinstance(exc, EngineError):
                     raise
                 raise EngineError(f"Strategy Engine: {type(exc).__name__}: {str(exc)[:200]}") from exc
+
+    async def _exchange(self, index: int, request: Any) -> dict[str, Any]:
+        process = self._processes[index]
+        if process is None or process.returncode is not None:
+            process = await self._start(index)
+        assert process.stdin is not None
+        process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+        return await self._read(process)
+
+    def _compact(self, index: int, request: Any) -> Any:
+        """The request with every window this worker holds sent as a ``held_window``."""
+        if not isinstance(request, dict) or request.get("op") not in HELD_BAR_OPS:
+            return request
+        held = self._held[index]
+        series: dict[str, Any] = {}
+        for symbol, rows in request["series"].items():
+            window = held_window(rows, held[symbol]) if symbol in held else None
+            series[symbol] = rows if window is None else window
+        return {**request, "series": series}
+
+    @staticmethod
+    def _holding(request: Any, answer: dict[str, Any]) -> dict[str, int]:
+        """What the worker holds after answering: the windows it checked without an error."""
+        results = answer.get("results")
+        if not isinstance(results, dict) or not isinstance(request, dict):
+            return {}
+        if request.get("op") not in HELD_BAR_OPS:
+            return {}
+        return {
+            symbol: int(rows[-1][0])
+            for symbol, rows in request["series"].items()
+            if rows and isinstance(results.get(symbol), dict) and "error" not in results[symbol]
+        }
 
 
 async def right_tail_scan(

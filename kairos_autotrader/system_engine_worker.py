@@ -27,6 +27,12 @@ stdout: {"identity": {"strategy_id", "revision", "strategy_code_sha256", "config
                                  "intent": <StrategyIntentV1 as JSON> | null}
                                 | {"error": "..."}}}
 
+A persistent worker (``--serve``) keeps the bars it has checked. The runner then sends a
+window it already holds as a reference, ``{"first_open_ms", "count", "head_sha256", "tail"}``:
+the window's first ``count - len(tail)`` rows come from this process, and their recorded bar
+identities have to hash to ``head_sha256``. A window it cannot rebuild that way is answered
+with ``{"missing_bars": true}``, and the runner sends it in full.
+
 The same rules over a whole history, research ``SleeveIntent`` output, for the replay:
 
 stdin:  {"op": "hourly_trend_history", "series": {"SOLUSDT": [[...], ...]}, "config": {...}}
@@ -35,6 +41,7 @@ stdout: {"identity": {...}, "results": {"SOLUSDT": {"intents": [...]} | {"error"
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -332,6 +339,108 @@ def _checked_bars(symbol: str, rows: list, candle_type: Any) -> tuple[list, list
     return [item[1] for item in ordered], [item[2] for item in ordered]
 
 
+class _MissingBars(Exception):
+    """A request refers to closed bars this process does not hold (any more)."""
+
+
+def _expand(request: dict) -> dict:
+    """The request with every held window (see the module docstring) rebuilt into its rows."""
+    series = request.get("series")
+    if not isinstance(series, dict) or not any(isinstance(value, dict) for value in series.values()):
+        return request
+    full: dict[str, Any] = {}
+    for symbol, value in series.items():
+        if not isinstance(value, dict):
+            full[symbol] = value
+            continue
+        first, count, tail = int(value["first_open_ms"]), int(value["count"]), list(value["tail"])
+        known = _CHECKED.get(str(symbol), {})
+        head = []
+        for place in range(count - len(tail)):
+            hit = known.get(first + place * MINUTE_MS)
+            if hit is None:
+                raise _MissingBars(str(symbol))
+            head.append(list(hit[0]))
+        digest = hashlib.sha256("".join(str(row[9]) for row in head).encode()).hexdigest()
+        if digest != value["head_sha256"]:
+            raise _MissingBars(str(symbol))
+        rows = head + tail
+        if any(int(row[0]) != first + place * MINUTE_MS for place, row in enumerate(rows)):
+            raise _MissingBars(str(symbol))
+        full[symbol] = rows
+    return {**request, "series": full}
+
+
+_WINDOW_BYTES: dict[str, dict[str, bytes]] = {}
+
+
+def _window_sha256(bars: Any) -> str:
+    """The engine's ``runtime._window_sha256``, reusing each bar's canonical bytes.
+
+    The engine hashes ``{"bars": [identity payload, ...]}`` in its canonical JSON, which is
+    the payloads' own canonical JSON joined by commas; a 35-day window takes some 2 s to
+    encode every time. Only the bars of the latest window of a symbol are kept, keyed by
+    their recorded identity. ``_install_window_hash`` checks the equality first.
+    """
+    from kairos_strategy.provenance import canonical_json_bytes
+
+    bars = list(bars)
+    symbol = str(bars[0].symbol) if bars else ""
+    known = _WINDOW_BYTES.get(symbol, {})
+    kept: dict[str, bytes] = {}
+    digest = hashlib.sha256(b'{"bars":[')
+    for place, bar in enumerate(bars):
+        key = bar.bar_sha256
+        part = known.get(key) if key is not None else None
+        if part is None:
+            part = canonical_json_bytes(bar.identity_payload())
+        if key is not None:
+            kept[key] = part
+        if place:
+            digest.update(b",")
+        digest.update(part)
+    digest.update(b"]}")
+    _WINDOW_BYTES[symbol] = kept
+    return digest.hexdigest()
+
+
+def _install_window_hash(candle_type: Any) -> bool:
+    """Use ``_window_sha256`` in the engine's strict conversion if it gives the engine's value."""
+    from kairos_strategy import runtime
+
+    original = runtime._window_sha256
+    if original is _window_sha256:
+        return True
+    try:
+        bars = [
+            runtime.candle_to_closed_bar(
+                candle_type(
+                    symbol="CHECKUSDT",
+                    timeframe="1m",
+                    open_time_ms=place * MINUTE_MS,
+                    close_time_ms=place * MINUTE_MS + MINUTE_MS - 1,
+                    open=1.5,
+                    high=2.25,
+                    low=1.0,
+                    close=2.0 + place / 8,
+                    volume=1.0 + place,
+                    quote_volume=2.5,
+                    taker_buy_volume=0.5,
+                    taker_buy_quote_volume=1.25,
+                )
+            )
+            for place in range(3)
+        ]
+        same = _window_sha256(bars) == original(bars) and _window_sha256(bars[1:]) == original(bars[1:])
+    except Exception:  # noqa: BLE001 - the engine's own function stays in place
+        same = False
+    finally:
+        _WINDOW_BYTES.pop("CHECKUSDT", None)
+    if same:
+        runtime._window_sha256 = _window_sha256
+    return same
+
+
 def _forget_others(request: dict) -> None:
     """Drop the checked bars of symbols this request does not carry (see ``_CHECKED``)."""
     for stale in set(_CHECKED) - {str(symbol) for symbol in request["series"]}:
@@ -416,7 +525,9 @@ def _answer(request: Any) -> dict:
         }
         if not isinstance(request, dict):
             raise ValueError("a request must be one JSON object")
-        return operations[request.get("op")](request, Candle)
+        return operations[request.get("op")](_expand(request), Candle)
+    except _MissingBars as exc:
+        return {"missing_bars": True, "symbol": str(exc)}
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
         return {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
 
@@ -435,7 +546,9 @@ def main() -> int:
         return 0
     # Persistent mode: one JSON request per line, one answer per request, until stdin closes.
     # The engine stays imported and the bars it has checked are kept (see ``_CHECKED``).
-    from kairos_strategy.candles import Candle  # noqa: F401 - fail before saying ready
+    from kairos_strategy.candles import Candle
+
+    _install_window_hash(Candle)
 
     _say({"ready": True})
     for line in sys.stdin:
