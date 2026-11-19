@@ -16,7 +16,7 @@ manifest, release evidence and readiness statements.
 | Strategy | Strategy Engine emits a `StrategyIntentV1` with the side, stop, target, expiry and bar identities. The runner checks the strategy source and the bars it supplied. |
 | Review | Router assigns the tier, evidence and deadline. Aggregator assembles the context and returns ALLOW, VETO or DEFER through the LLM gateway. The default profile also records the runner's probability review for comparison. |
 | Allocation and risk | Macro Strategist allocates capital by regime. Quant Scouts measures EVEDEX and Binance venue quality. Risk Manager requires an Aggregator ALLOW, usable allocation and account evidence, then determines size and leverage within its limits. |
-| Execution | Paper mode simulates fills. In live mode, `executor="runner"` places a market IOC entry with exchange-side protection. With `executor="execution_engine"`, a separately provisioned Execution Engine production session checks the registered strategy and its own risk limits, enters with a bounded limit order and reconciles the result. |
+| Execution | Paper mode simulates fills. Every live entry goes to the Execution Engine portfolio broker with a validated Risk decision, quantity, leverage, stop and target. Execution journals each request and places a limit order bounded by the approved price. |
 
 Workers exchange JSON with the runner and load the corresponding sibling checkouts.
 The runner keeps its own `state.json`, `journal.jsonl` and Aggregator budget ledger.
@@ -29,10 +29,10 @@ implementation to its Kairos contracts.
 The [example](config.example.json) selects 23 instruments, a capital basis of 100 USD,
 a 0.25 USD per-trade risk cap, a 5 USD session loss stop and a 40 USD monthly
 Aggregator budget. With no config file the runner selects ten instruments and a
-12 USD review budget. Both use `hourly_trend_candidates_v1` for entries by default.
+12 USD review budget and `hourly_trend_candidates_v1` for entries. The example
+enables both the hourly and right-tail rules with a shared portfolio risk budget.
 
-To evaluate right-tail entries, include `regime_aligned_right_tail_v1` in
-`strategies`. Its default decision interval is 24 hours. Supported settings for
+The `regime_aligned_right_tail_v1` strategy has a default decision interval of 24 hours. Supported settings for
 `right_tail_interval_hours` are 4, 6, 8, 12 and 24. Hourly features are still
 calculated for review when only right-tail is selected. A strategy can use its
 own fixed `management_policies` override. The example supplies no override.
@@ -41,8 +41,8 @@ The runner accepts up to 150,000 USD of configured capital. The dollar risk cap 
 be set up to 1% of that basis, and the session loss stop up to 5%. Risk Manager
 further limits the risk at the stop to 0.25% of equity per trade and 1% across open
 positions. It may reduce size or refuse an entry. The runner permits up to ten open
-positions and forty entries per day. Live mode starts with one slot until the first
-completed round trip. Risk Manager sets leverage within the venue and policy limits,
+positions and forty entries per day. The signed 100 USD profile limits the pilot to
+twelve entries per day. Risk Manager sets leverage within the venue and policy limits,
 up to 30×. See [the configuration and validation](kairos_autotrader/engine.py).
 
 ## Run from a checkout
@@ -66,7 +66,10 @@ uv run --locked kairos-autotrader report --runtime-dir ../runtime/paper --outcom
 
 `check` reads market and account data. `scan --no-llm` inspects candidates without
 model calls. A paper run with model review uses live market data and simulates orders.
-For real orders, prepare a separate configuration and runtime directory, then run
+For real orders, configure `execution_profile` with the path to the operator-signed
+Execution portfolio profile. Relative paths start at the configuration file. The profile
+binds the venue account, wallet, instrument universe, size and loss limits, entry
+deadline, runner directory and persistent Execution journal. Then run
 
 ```sh
 uv run --locked kairos-autotrader run --mode live --confirm-real-orders --config config.json --runtime-dir ../runtime/live --api-key-file /path/to/evedex-api-key --wallet-key-file /path/to/wallet-key --openai-key-file /path/to/openai-key
@@ -74,13 +77,19 @@ uv run --locked kairos-autotrader report --config config.json --runtime-dir ../r
 ```
 
 A `STOP` file in the runtime directory stops new entries and lets the runner manage
-open positions to exit. A `CLOSE` file requests immediate closure. Execution Engine
-sessions also require the [production session setup](https://github.com/Kairos-cryptoAI/kairos-execution-engine/blob/main/docs/PRODUCTION-SESSION.md).
+open positions to exit. A `CLOSE` file requests immediate closure of owned positions.
+The signed deadline stops new entries while open trades continue to settlement.
+`--new-session` starts a new reporting period and preserves live loss controls.
+The historical `runner` executor name selects the portfolio broker. Configuration
+for the retired `execution_engine` single-trade path is supported by the report.
 
 ## Reading trade results
 
 The report groups closes by live or paper mode and by the source of their PnL. Each
-row shows the recorded exit initiator. A disappearing position has unknown origin.
+row shows the recorded exit initiator. With the signed profile the report also reads
+the account-wide pilot balance, net transfers, conservative loss and counts of open
+positions, closed trades and attributed outcomes from the Execution journal.
+A disappearing position has unknown origin.
 For earlier live trades the balance delta includes any manual trading, transfers and
 funding during the trade. Overlapping positions have price estimates. The learning
 ledger admits a live result only with attributed execution accounting, a system exit

@@ -5,45 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 
 import pytest
 
-from kairos_autotrader import brain
 from kairos_autotrader.engine import Config, ConfigError
-from tests.test_autotrader import FakeVenue, candidate, journal_of, live_trader
-
-
-def _fake_execution(tmp_path, monkeypatch, *, outcome: str, delay_s: float = 0.0):
-    """A stand-in ``kairos_execution.production_session_cli`` on the child's import path."""
-    package = tmp_path / "fake-execution" / "kairos_execution"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
-    (package / "production_session_cli.py").write_text(
-        "import json, sys, time\n"
-        f"time.sleep({delay_s})\n"
-        "args = sys.argv\n"
-        "candidate = json.loads(open(args[args.index('--candidate') + 1], encoding='utf-8').read())\n"
-        "assert set(candidate) == {'review', 'allocation', 'system_mode', 'per_trade_risk_fraction'}\n"
-        f"print(json.dumps({{'outcome': {outcome!r}, 'trade_id': 'a' * 64, 'detail': 'synthetic'}}))\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fake-execution"))
-    config = tmp_path / "session.json"
-    config.write_text("{}", encoding="utf-8")
-    return dict(
-        executor="execution_engine", execution_python=sys.executable, execution_session_config=str(config)
-    )
-
-
-def _wait_for(trader, *, seconds=20.0):
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        if not trader._follow_execution():
-            return
-        time.sleep(0.2)
-    raise AssertionError("the session did not finish")
+from tests.test_autotrader import FakeVenue, journal_of, live_trader
 
 
 def _real_review(monkeypatch):
@@ -61,48 +27,75 @@ def _real_review(monkeypatch):
 def test_execution_engine_executor_needs_both_paths():
     with pytest.raises(ConfigError, match="execution_python"):
         Config(executor="execution_engine").validate()
-    with pytest.raises(ConfigError, match="runner or execution_engine"):
+    with pytest.raises(ConfigError, match="execution_portfolio"):
         Config(executor="other").validate()
 
 
-def test_an_approved_entry_is_handed_over_and_nothing_else_opens_meanwhile(tmp_path, monkeypatch):
-    reviewed = _real_review(monkeypatch)
-    venue = FakeVenue()
-    trader = live_trader(
-        tmp_path, venue, **_fake_execution(tmp_path, monkeypatch, outcome="CLOSED_AND_ACCOUNTED", delay_s=1.0)
+@pytest.mark.parametrize("config", [{}, {"executor": "runner"}, {"execution_profile": "missing.json"}])
+def test_live_cli_without_verified_profile_cannot_read_keys_or_touch_the_venue(tmp_path, config, monkeypatch):
+    from types import SimpleNamespace
+
+    from kairos_autotrader import __main__ as cli
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "load_secrets", lambda *a, **kw: pytest.fail("read credentials without a profile")
     )
-    asyncio.run(trader.start())
-    entry = candidate()
-    asyncio.run(trader.try_enter(entry, brain.control_decision([entry])))
-    assert not venue.market_bodies, "the runner places no order itself"
-    session = trader.store.state["execution_session"]
-    assert session["candidate"] == entry.id
-    handed = json.loads(open(session["candidate_file"], encoding="utf-8").read())
-    assert handed["review"] == reviewed.model_dump(mode="json") and handed["system_mode"] == "NORMAL"
-    assert trader._follow_execution() is True, "while the session runs no new entry is considered"
-    _wait_for(trader)
-    finished = [e for e in journal_of(trader) if e["event"] == "execution_session_finished"]
-    assert finished and finished[-1]["outcome"] == "CLOSED_AND_ACCOUNTED"
-    assert "execution_session" not in trader.store.state and not trader.store.state.get("halted")
+    args = SimpleNamespace(config=path, runtime_dir=tmp_path / "runtime")
+    with pytest.raises(ConfigError, match="profile"):
+        asyncio.run(cli.build_trader(args, None, "live"))
+    assert not args.runtime_dir.exists()
 
 
-def test_an_unresolved_session_halts_new_entries(tmp_path, monkeypatch):
-    _real_review(monkeypatch)
+def test_close_report_survives_a_crash_on_either_side_of_the_journal_append(tmp_path):
+    from kairos_autotrader.engine import Store
+
+    for already_appended in (False, True):
+        store = Store(tmp_path / str(already_appended))
+        row = {"id": "order", "close_report_id": "live:order", "trade_id": "first"}
+        store.state["pending_close_report"] = row
+        store.save()
+        if already_appended:
+            store.journal("trade_closed", **row)
+        restored = Store(store.directory)
+        restored.publish_close(recovering=True)
+        assert "pending_close_report" not in Store(store.directory).state
+        rows = (store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        assert [json.loads(s)["trade_id"] for s in rows] == ["first"]
+
+
+@pytest.mark.parametrize("receipt", [None, "partial", '{"outcome":"UNRESOLVED"}'])
+def test_unresolved_legacy_handoff_blocks_all_new_entries_and_writes(tmp_path, receipt):
+    from kairos_autotrader.engine import NeedsOperator
+
     venue = FakeVenue()
-    trader = live_trader(tmp_path, venue, **_fake_execution(tmp_path, monkeypatch, outcome="UNRESOLVED"))
+    trader = live_trader(tmp_path, venue)
+    folder = trader.store.directory / "execution"
+    folder.mkdir()
+    path = folder / "old.result.json"
+    if receipt is not None:
+        path.write_text(receipt, encoding="utf-8")
+    trader.store.state["execution_session"] = {"result_file": str(path), "candidate": "old"}
+    with pytest.raises(NeedsOperator, match="legacy"):
+        asyncio.run(trader.start(new_session=True))
+    assert trader.store.state["execution_session"]["candidate"] == "old"
+    assert not venue.market_bodies and not venue.close_bodies
+
+
+def test_legacy_terminal_receipt_is_archived_once_without_restarting_its_session(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    folder = trader.store.directory / "execution"
+    folder.mkdir()
+    path = folder / "old.result.json"
+    path.write_text('{"outcome":"CLOSED_AND_ACCOUNTED","trade_id":"old-trade"}', encoding="utf-8")
+    trader.store.state["execution_session"] = {"result_file": str(path), "candidate": "old"}
     asyncio.run(trader.start())
-    entry = candidate()
-    asyncio.run(trader.try_enter(entry, brain.control_decision([entry])))
-    _wait_for(trader)
-    assert "Execution Engine" in str(trader.store.state.get("halted"))
-
-
-def test_paper_mode_keeps_the_runner_as_executor(tmp_path, monkeypatch):
-    from tests.test_autotrader import paper_trader
-
-    cfg = Config(**{"use_llm": False, **_fake_execution(tmp_path, monkeypatch, outcome="REFUSED")})
-    trader = paper_trader(tmp_path, FakeVenue(), cfg)
-    assert trader.executions is None
+    asyncio.run(trader.start())
+    (event,) = [r for r in journal_of(trader) if r["event"] == "execution_session_finished"]
+    assert event["candidate"] == "old" and event["trade_id"] == "old-trade"
+    assert not trader.store.state.get("execution_session") and not venue.market_bodies
 
 
 def test_report_reads_the_execution_engines_closed_trades(tmp_path, monkeypatch, capsys):
@@ -313,24 +306,6 @@ def test_adaptive_strategy_is_observed_measured_and_never_traded(tmp_path, monke
     outcomes = trader.learning_outcomes()
     assert len(outcomes) == 1 and outcomes[0]["source"] == "REPLAY"
     assert outcomes[0]["strategy_id"] == "adaptive_pullback_range_v1" and float(outcomes[0]["r_multiple"]) > 1
-
-
-def test_stale_readiness_receipts_stop_the_entry_before_any_session(tmp_path, monkeypatch):
-    _real_review(monkeypatch)
-    venue = FakeVenue()
-    trader = live_trader(
-        tmp_path, venue, **_fake_execution(tmp_path, monkeypatch, outcome="CLOSED_AND_ACCOUNTED")
-    )
-    refusing = json.dumps({"ok": False, "error": "facts are missing"})
-    (tmp_path / "fake-execution" / "kairos_execution" / "production_setup.py").write_text(
-        f"import sys\nprint({refusing!r})\nsys.exit(1)\n", encoding="utf-8"
-    )
-    asyncio.run(trader.start())
-    entry = candidate()
-    asyncio.run(trader.try_enter(entry, brain.control_decision([entry])))
-    assert "execution_session" not in trader.store.state and not venue.market_bodies
-    skipped = [e for e in journal_of(trader) if e["event"] == "entry_skipped"][-1]
-    assert "receipts could not be refreshed" in skipped["reason"] and "facts are missing" in skipped["reason"]
 
 
 def test_a_briefly_locked_heartbeat_is_written_on_retry(tmp_path, monkeypatch):

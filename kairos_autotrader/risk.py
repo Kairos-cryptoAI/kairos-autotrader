@@ -13,7 +13,6 @@ the Risk Manager's code decides. Nothing here places orders.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -23,6 +22,8 @@ from pathlib import Path
 from typing import Any
 
 from kairos_core.contracts import RiskTradeDecisionV1
+from kairos_execution.portfolio_broker import LIVE_ACCOUNT_SOURCE as LIVE_ACCOUNT_SOURCE
+from kairos_execution.portfolio_broker import account_id_for as account_id_for
 from pydantic import ValidationError
 
 from .sibling import (
@@ -40,7 +41,6 @@ WORKER = Path(__file__).with_name("risk_worker.py")
 PER_TRADE_RISK_FRACTION = 0.0025
 AGGREGATE_OPEN_RISK_FRACTION = 0.01
 MIN_NOTIONAL_USD = 1.0
-LIVE_ACCOUNT_SOURCE = "evedex-prod-runner-session"
 PAPER_ACCOUNT_SOURCE = "kairos-autotrader-paper-ledger"
 
 
@@ -69,11 +69,6 @@ class RiskConfig:
 
 def risk_revisions(config: RiskConfig) -> dict[str, str]:
     return {"risk_manager": git_revision(config.risk_source, "kairos_risk")}
-
-
-def account_id_for(wallet_address: str) -> str:
-    """A stable, non-secret account identity: a hash of the wallet address."""
-    return "evedex-prod-" + hashlib.sha256(wallet_address.lower().encode()).hexdigest()[:20]
 
 
 def _constant(value: dict[str, Any]) -> Callable[[], Awaitable[dict[str, Any]]]:

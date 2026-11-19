@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import sys
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from kairos_autotrader import brain
 from kairos_autotrader.engine import REGIME_EXIT_MIN_SAMPLES, Config, Store, regime_exit_reason
 from kairos_autotrader.signals import Candle, held_outcome
 from kairos_autotrader.system_rules import MacroDesk, RulesConfig
-from tests.test_autotrader import FakeVenue, candidate, enter, journal_of, live_trader, only, paper_trader
+from tests.test_autotrader import FakeVenue, enter, journal_of, only, paper_trader
 from tests.test_execution_session import _real_review
 from tests.test_system_rules import MacroWorker, refresh
 
@@ -149,53 +146,3 @@ def test_early_exits_switch_themselves_off_when_they_cost_more_than_holding(tmp_
     trader.config.regime_exit = False
     trader.store.state["early_exit_stats"] = {}
     assert trader._regime_exit("LONG", "BULL", 0) is None, "the owner can switch them off"
-
-
-def _fake_execution_waiting_for_exit(tmp_path, monkeypatch):
-    """A stand-in session that closes only after the runner writes its exit request."""
-    package = tmp_path / "fake-execution" / "kairos_execution"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
-    (package / "production_session_cli.py").write_text(
-        "import json, os, sys, time\n"
-        "args = sys.argv\n"
-        "request = args[args.index('--exit-request') + 1]\n"
-        "deadline = time.time() + 20\n"
-        "while not os.path.exists(request) and time.time() < deadline:\n"
-        "    time.sleep(0.05)\n"
-        "reason = open(request, encoding='utf-8').read().strip()\n"
-        "print(json.dumps({'outcome': 'CLOSED_AND_ACCOUNTED', 'trade_id': 'a' * 64, 'detail': 'ok',\n"
-        "                  'r_multiple': '-0.2', 'exit_reason': 'TIMEOUT', 'early_exit': reason}))\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fake-execution"))
-    config = tmp_path / "session.json"
-    config.write_text("{}", encoding="utf-8")
-    return dict(
-        executor="execution_engine", execution_python=sys.executable, execution_session_config=str(config)
-    )
-
-
-def test_execution_session_is_asked_to_close_when_the_regime_turns(tmp_path, monkeypatch):
-    _real_review(monkeypatch)
-    trader = live_trader(tmp_path, FakeVenue(), **_fake_execution_waiting_for_exit(tmp_path, monkeypatch))
-    asyncio.run(trader.start())
-    entry = candidate()
-    asyncio.run(trader.try_enter(entry, brain.control_decision([entry])))
-    session = trader.store.state["execution_session"]
-    assert session["side"] == "LONG" and session["plan"]["signal_symbol"] == entry.intent.symbol
-    assert trader._follow_execution() is True, "no macro: nothing is asked"
-    trader.macro = Macro("BEAR", int(session["decided_at_ms"]) + 1)
-    assert trader._follow_execution() is True
-    assert "BEAR opposes the open LONG" in open(session["exit_request_file"], encoding="utf-8").read()
-    deadline = time.time() + 20
-    while trader._follow_execution() and time.time() < deadline:
-        time.sleep(0.1)
-    events = journal_of(trader)
-    asked = [e for e in events if e["event"] == "regime_exit_requested"]
-    finished = [e for e in events if e["event"] == "execution_session_finished"][-1]
-    assert len(asked) == 1 and finished["early_exit"] == asked[0]["reason"]
-    (plan,) = trader.store.state["early_exit_pending"]
-    assert plan["exit_r"] == "-0.2" and plan["id"] == "a" * 64
-    assert json.loads(json.dumps(plan))["side"] == "LONG"

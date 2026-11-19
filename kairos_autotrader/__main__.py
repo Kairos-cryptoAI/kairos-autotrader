@@ -10,14 +10,20 @@ import argparse
 import asyncio
 import json
 import re
+import sqlite3
 import sys
 import tempfile
 import time
 from collections import Counter
 from decimal import Decimal
+from itertools import chain
 from pathlib import Path
 
 import aiohttp
+from kairos_execution.one_canary_account import EvedexCanaryAccountSource
+from kairos_execution.portfolio_journal import PortfolioJournal, PortfolioJournalError
+from kairos_execution.portfolio_performance import read_pilot_status
+from kairos_execution.portfolio_profile import load_portfolio_profile
 
 from . import system_cli
 from .engine import (
@@ -182,29 +188,74 @@ async def build_trader(args: argparse.Namespace, session: aiohttp.ClientSession,
     config = Config.load(args.config)
     if getattr(args, "no_llm", False):
         config.use_llm = False
+    profile = None
+    if mode == "live":
+        if config.executor == "execution_engine" or not config.execution_profile:
+            raise ConfigError("live execution needs execution_portfolio and a signed execution_profile")
+        try:
+            profile = load_portfolio_profile(Path(config.execution_profile))
+        except (ValueError, OSError) as exc:
+            raise ConfigError("cannot verify the signed portfolio execution profile") from exc
+        if set(config.symbols) != set(profile.symbols):
+            raise ConfigError("configured instruments differ from the signed portfolio profile")
+        if (
+            config.capital_basis_usd != profile.capital_usd
+            or config.capital_basis_usd * config.position_notional_of_capital > profile.max_notional_usd
+            or Decimal(str(config.risk_per_trade_usd)) > Decimal(profile.max_trade_loss_usd)
+            or config.session_loss_stop_usd > profile.max_session_loss_usd
+            or config.max_trades_per_day > profile.max_daily_entries
+            or config.max_open_positions > profile.max_positions
+        ):
+            raise ConfigError("configured limits exceed or differ from the signed portfolio mandate")
+        if args.runtime_dir.resolve() != profile.runner_runtime_dir:
+            raise ConfigError("live runtime directory differs from the signed portfolio profile")
     secrets = load_secrets(args, need_trading=mode == "live")
-    store = Store(args.runtime_dir)
     api = Evedex(session, secrets["api_key"])
     instruments = await api.instruments()
     fee = await api.taker_fee()
-    if mode == "live":
-        if secrets["wallet"] is None:
-            raise SecretError("live mode needs the wallet key")
-        broker: PaperBroker | LiveBroker = LiveBroker(api, store, config, secrets["wallet"])
-    else:
-        broker = PaperBroker(store, config, fee)
-    if config.use_llm and not secrets["openai"]:
-        say("Ключ нейросети не задан: решения принимает только алгоритм.")
-    return Trader(
-        api=api,
-        session=session,
-        store=store,
-        config=config,
-        broker=broker,
-        fee=fee,
-        instruments=instruments,
-        openai_key=secrets["openai"] if config.use_llm else None,
-    )
+    journal = None
+    try:
+        if profile is not None:
+            if not secrets["wallet"] or not secrets["api_key"]:
+                raise SecretError("live mode requires both EVEDEX credentials")
+            journal = PortfolioJournal(
+                profile.journal_path,
+                account_id=profile.account_id,
+                symbols=profile.symbols,
+                max_positions=profile.max_positions,
+            )
+            # Read the runner snapshot only after acquiring the account's writer lease.
+            store = Store(args.runtime_dir)
+            broker: PaperBroker | LiveBroker = LiveBroker(
+                api,
+                store,
+                config,
+                secrets["wallet"],
+                journal=journal,
+                profile=profile,
+                account_source_reader=EvedexCanaryAccountSource(
+                    api_key=secrets["api_key"], expected_account_id=profile.remote_account_id
+                ),
+            )
+        else:
+            store = Store(args.runtime_dir)
+            broker = PaperBroker(store, config, fee)
+        if config.use_llm and not secrets["openai"]:
+            say("Ключ нейросети не задан: решения принимает только алгоритм.")
+        return Trader(
+            api=api,
+            session=session,
+            store=store,
+            config=config,
+            broker=broker,
+            fee=fee,
+            instruments=instruments,
+            openai_key=secrets["openai"] if config.use_llm else None,
+        )
+    except BaseException:
+        if journal is not None:
+            journal.close()
+        raise
 
 
 async def cmd_run(args: argparse.Namespace) -> int:
@@ -213,20 +264,19 @@ async def cmd_run(args: argparse.Namespace) -> int:
         return 2
     async with aiohttp.ClientSession(trust_env=True) as session:
         trader = await build_trader(args, session, args.mode)
-        if args.new_session:
-            trader.store.state.pop("session", None)
-            trader.store.state.pop("halted", None)
         say("Остановить входы: создайте файл STOP в папке запуска. Закрыть позицию сейчас: файл CLOSE.")
         try:
-            await trader.run(max_steps=args.max_steps)
+            await trader.run(max_steps=args.max_steps, new_session=args.new_session)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            if isinstance(trader.broker, LiveBroker):
+                trader.broker.release()
             left = trader.trades()
             if left:
                 say(
                     f"ВНИМАНИЕ: открытых позиций осталось: {len(left)} "
-                    f"({', '.join(t['symbol'] for t in left)}). Стоп и тейк стоят на бирже; "
+                    f"({', '.join(t['symbol'] for t in left)}). Проверьте защитные заявки; "
                     "запустите программу снова, чтобы она продолжила их вести."
                 )
     return 0
@@ -236,30 +286,33 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     async with aiohttp.ClientSession(trust_env=True) as session:
         args.runtime_dir = args.runtime_dir or Path(tempfile.mkdtemp(prefix="kairos-scan-"))
         trader = await build_trader(args, session, "paper")
-        features, candidates = await trader.scan(int(time.time() * 1000))
-        for f in features:
+        try:
+            features, candidates = await trader.scan(int(time.time() * 1000))
+            for f in features:
+                say(
+                    f"{f.symbol}: цена {f.price:g}, тренд 4ч {f.trend}, RSI {f.rsi:.0f}, "
+                    f"ATR {f.atr_pct:.2f}%, за 24ч {f.change_24h_pct:+.2f}%"
+                )
+            if not candidates:
+                say("Сигналов на последнем закрытом баре нет.")
+                return 0
+            for c in candidates:
+                say(
+                    f"СИГНАЛ {c.instrument} {c.side} {c.setup}: цена Binance {c.reference_price:g}, "
+                    f"стоп {c.stop:g}, тейк {c.take:g}, обзор {c.route.review_tier.value}"
+                )
+            decision = await trader.decide(features, candidates, trader.config.max_open_positions)
             say(
-                f"{f.symbol}: цена {f.price:g}, тренд 4ч {f.trend}, RSI {f.rsi:.0f}, "
-                f"ATR {f.atr_pct:.2f}%, за 24ч {f.change_24h_pct:+.2f}%"
+                f"Решение ({decision.source}): {decision.action} {', '.join(decision.picks)} "
+                f"| {decision.reason[:300]}"
             )
-        if not candidates:
-            say("Сигналов на последнем закрытом баре нет.")
-            return 0
-        for c in candidates:
-            say(
-                f"СИГНАЛ {c.instrument} {c.side} {c.setup}: цена Binance {c.reference_price:g}, "
-                f"стоп {c.stop:g}, тейк {c.take:g}, обзор {c.route.review_tier.value}"
-            )
-        decision = await trader.decide(features, candidates, trader.config.max_open_positions)
-        say(
-            f"Решение ({decision.source}): {decision.action} {', '.join(decision.picks)} "
-            f"| {decision.reason[:300]}"
-        )
-        for verdict in decision.verdicts:
-            say(
-                f"  {verdict['candidate_id']}: {verdict['verdict']} {verdict['confidence']:.2f} "
-                f"— {verdict['reason'][:200]}"
-            )
+            for verdict in decision.verdicts:
+                say(
+                    f"  {verdict['candidate_id']}: {verdict['verdict']} {verdict['confidence']:.2f} "
+                    f"— {verdict['reason'][:200]}"
+                )
+        finally:
+            await trader.stop_engine_workers()
     return 0
 
 
@@ -281,7 +334,32 @@ def _report_execution(config_path: Path | None) -> None:
     if config_path is None:
         return
     config = Config.load(config_path)
-    if config.executor != "execution_engine":
+    if config.execution_profile:
+        try:
+            profile = load_portfolio_profile(Path(config.execution_profile))
+            status = read_pilot_status(profile.journal_path)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            say(f"Статус пилота недоступен: {str(exc)[:160]}")
+        else:
+            if status:
+                say(
+                    f"Пилот EVEDEX, последнее наблюдение {status['observed_at']}. "
+                    f"Начальный баланс {status['baseline']}, текущий {status['funding_balance']}, "
+                    f"чистые переводы {status['external_flow']}, "
+                    f"результат счёта {status['account_result']} USDT."
+                )
+                say(
+                    f"Открытых позиций {status['open_positions']}, закрытий {status['total_closures']}, "
+                    f"с подтверждённым результатом системы {status['attributed_closures']}. "
+                    f"Убыток с открытым риском {status['adverse_loss']} USDT, "
+                    f"стоп {bool(status['stopped'])}, "
+                    f"неясных операций {status['unresolved_effects']}, "
+                    f"входы до {status['entry_deadline_utc']}."
+                )
+                say("Расходы на модели оплачиваются отдельно от результата счёта EVEDEX.")
+            else:
+                say("Пилот EVEDEX: подтверждённого начального баланса пока нет.")
+    if not (config.execution_python and config.execution_session_config):
         return
     from .execution_session import closed_trades
 
@@ -294,7 +372,7 @@ def _report_execution(config_path: Path | None) -> None:
     r_values = [Decimal(t["r_multiple"]) for t in trades if t.get("r_multiple") is not None]
     wins = sum(Decimal(t["net_pnl_usd"]) > 0 for t in trades)
     say(
-        f"Execution Engine (единый журнал): сделок закрыто {len(trades)}, в плюс {wins}, "
+        f"Execution Engine (архив одиночных сессий): сделок закрыто {len(trades)}, в плюс {wins}, "
         f"итог {net:+.4f} USDT"
         + (f", средний результат {sum(r_values) / len(r_values):+.3f} R." if r_values else ".")
     )
@@ -347,6 +425,9 @@ async def cmd_report(args: argparse.Namespace) -> int:
         say("Журнал пуст.")
         return 0
     closed = recorded_closes(records)
+    for record in records:
+        if record.get("event") == "legacy_position_flat_unattributed":
+            say(f"Прежняя позиция {record.get('symbol')} подтверждена закрытой. PnL и инициатор неизвестны.")
     decisions = [r for r in records if r["event"] == "decision"]
     say(f"Закрытия в журнале runner: {len(closed)}.")
     totals: dict[tuple[str, str], Decimal] = {}
@@ -366,11 +447,11 @@ async def cmd_report(args: argparse.Namespace) -> int:
     # trades, transfers and open risk; grouping avoids mixing paper with real money.
     observed_session: dict | None = None
     latest = None
-    for r in [*records, {"event": "session_start"}]:
+    for r in chain(records, ({"event": "session_start"},)):
         if r.get("event") == "session_start":
             if observed_session and observed_session.get("equity") is not None and latest is not None:
                 say(
-                    f"Баланс сессии {observed_session.get('mode', 'unknown')} ({observed_session['ts'][:19]}): "
+                    f"Баланс {observed_session.get('mode', 'unknown')} ({observed_session['ts'][:19]}): "
                     f"{Decimal(observed_session['equity']):.4f} -> {Decimal(latest):.4f} USDT."
                 )
             observed_session, latest = r, None
@@ -530,7 +611,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--no-llm", action="store_true", help="algorithm only, for comparison")
     run.add_argument("--confirm-real-orders", action="store_true")
     run.add_argument(
-        "--new-session", action="store_true", help="reset the session loss baseline and any halt"
+        "--new-session",
+        action="store_true",
+        help="start a reporting session; live risk limits and halts persist",
     )
     run.add_argument("--max-steps", type=int, help=argparse.SUPPRESS)
     add_secret_args(run)
@@ -538,7 +621,9 @@ def main(argv: list[str] | None = None) -> int:
     report = sub.add_parser("report", help="summary of the journal")
     report.add_argument("--runtime-dir", type=Path, required=True)
     report.add_argument("--outcomes", action="store_true", help="also evaluate every signal on later candles")
-    report.add_argument("--config", type=Path, help="with executor execution_engine: its closed trades too")
+    report.add_argument(
+        "--config", type=Path, help="read portfolio status and any configured historical report"
+    )
     report.add_argument("--ledger", action="store_true", help="also the learning ledger, cell by cell")
 
     extra = system_cli.add_parsers(sub)
@@ -551,7 +636,15 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(command(args))
     except KeyboardInterrupt:
         return 130
-    except (ConfigError, SecretError, EvedexError, EngineError, TextScoutsError, OSError) as exc:
+    except (
+        ConfigError,
+        SecretError,
+        EvedexError,
+        EngineError,
+        PortfolioJournalError,
+        TextScoutsError,
+        OSError,
+    ) as exc:
         say(f"Остановлено: {exc}")
         return 2
 

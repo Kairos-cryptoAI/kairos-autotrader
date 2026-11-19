@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import os
 import re
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -43,7 +42,6 @@ from kairos_autotrader.evedex import (
     Instrument,
     OrderSigner,
     Position,
-    Rejected,
     Unknown,
     eth_number,
     new_order_id,
@@ -289,12 +287,6 @@ def test_control_decision_takes_best_score():
 # ---- engine against a fake venue ----------------------------------------------
 
 
-def signature_error() -> Rejected:
-    return Rejected(
-        "refused", status=400, body=json.dumps({"label": "invalid_signature_error", "message": "x"})
-    )
-
-
 class FakeVenue:
     def __init__(self) -> None:
         self.funding = Decimal("109.42")
@@ -304,19 +296,8 @@ class FakeVenue:
         self.tpsl: list[dict] = []
         self.market_bodies: list[dict] = []
         self.close_bodies: list[dict] = []
-        self.tpsl_bodies: list[dict] = []
         self.cancelled: list[str] = []
-        self.accept_chains = {"42161", "161803"}
-        self.attach_stop = True
-        self.unknown_entry = False
-        self.reject_tpsl = False
         self.close_pnl = Decimal("-0.20")
-        self.position_reads = 0
-        self.account_leverage: dict[str, int] = {}
-        self.leverage_calls: list[tuple[str, int]] = []
-        self.leverage_locked = False
-        self.close_chains = {"42161", "161803"}
-        self.tpsl_reject_label = "forbidden_error"
         self.books: dict[str, tuple[Decimal, Decimal]] = {}
 
     async def book(self, symbol):
@@ -333,103 +314,108 @@ class FakeVenue:
         return self.funding, self.funding
 
     async def positions(self):
-        self.position_reads += 1
         return list(self.position_list)
 
     async def open_orders(self):
         return list(self.orders_open)
 
-    async def order(self, order_id):
-        return None
-
-    async def active_tpsl(self, instrument=None):
-        return [row for row in self.tpsl if instrument in (None, row["instrument"])]
-
-    async def post_market_order(self, body):
-        self.market_bodies.append(body)
-        if body["chainId"] not in self.accept_chains:
-            raise signature_error()
-        symbol = body["instrument"]
-        if self.account_leverage.get(symbol, 1) != body["leverage"]:
-            raise Rejected(
-                "refused",
-                status=400,
-                body=json.dumps(
-                    {"label": "invalid_order_leverage_error", "error": "Invalid order leverage - 10 !== 1"}
-                ),
-            )
-        ask = self.books.get(symbol, (self.bid, self.ask))[1]
-        quantity = (Decimal(body["cashQuantity"]) / ask).quantize(Decimal("0.1"))
-        self.position_list = [p for p in self.position_list if p.instrument != symbol]
-        self.position_list.append(Position(symbol, body["side"], quantity, ask, self.attach_stop))
-        if self.attach_stop:
-            self.tpsl += [
-                {
-                    "id": f"{symbol}-t{i}",
-                    "instrument": symbol,
-                    "type": item["type"],
-                    "price": item.get("price"),
-                    "status": "active",
-                }
-                for i, item in enumerate(body.get("tpsl", []))
-            ]
-        if self.unknown_entry:
-            raise Unknown("timeout")
-        return {"id": body["id"], "status": "FILLED"}
-
-    async def post_close(self, body):
-        self.close_bodies.append(body)
-        if body["chainId"] not in self.close_chains:
-            raise signature_error()
-        self.position_list = [p for p in self.position_list if p.instrument != body["instrument"]]
-        self.funding += self.close_pnl
-        return {"id": body["id"]}
-
-    async def post_tpsl(self, body):
-        self.tpsl_bodies.append(body)
-        if self.reject_tpsl:
-            if self.tpsl_reject_label != "side" or body["side"] == "BUY":
-                label = (
-                    "stop_loss_price_above_last_price_error"
-                    if self.tpsl_reject_label == "side"
-                    else self.tpsl_reject_label
-                )
-                raise Rejected("refused", status=400, body=json.dumps({"label": label, "error": ""}))
-        self.tpsl.append(
-            {
-                "id": f"s{len(self.tpsl)}",
-                "instrument": body["instrument"],
-                "type": body["type"],
-                "price": body.get("price"),
-                "status": "active",
-            }
-        )
-        return {"id": "s", "status": "active"}
-
-    async def set_leverage(self, instrument, leverage):
-        self.leverage_calls.append((instrument, leverage))
-        if self.leverage_locked:
-            raise Rejected(
-                "refused",
-                status=400,
-                body=json.dumps({"label": "insufficient_funds_to_reduce_leverage_error"}),
-            )
-        self.account_leverage[instrument] = leverage
-
-    async def cancel_tpsl(self, instrument, tpsl_id):
-        self.cancelled.append(tpsl_id)
-        self.tpsl = [row for row in self.tpsl if row["id"] != tpsl_id]
+    async def active_tpsl(self):
+        return list(self.tpsl)
 
     def venue_exit(self, pnl: str, symbol: str = "SOLUSD") -> None:
         self.position_list = [p for p in self.position_list if p.instrument != symbol]
         self.funding += Decimal(pnl)
 
 
+class FakePortfolio(LiveBroker):
+    """Observe the runner-to-Execution contract without signing or submitting a request."""
+
+    account_id = "evedex-prod-test"
+    entry_deadline_utc = datetime.max.replace(tzinfo=UTC)
+
+    async def refresh_performance(self, *, force=False):
+        pass
+
+    def __init__(self, venue):
+        self.venue = venue
+        self.receipt = {"pnl_basis": "unknown", "net_pnl": None, "exit_origin": "unknown"}
+        self.baseline = venue.funding
+        self.flow = Decimal(0)
+
+    def pilot_status(self):
+        return {
+            "started_at": datetime.now(UTC).date().isoformat(),
+            "funding_balance": str(self.venue.funding),
+            "baseline": str(self.baseline),
+            "external_flow": str(self.flow),
+            "stopped": self.baseline - (self.venue.funding - self.flow) >= 5,
+        }
+
+    async def reconcile_start(self, trades, pending):
+        own = {trade["symbol"] for trade in trades}
+        if pending or await self.foreign_exposure(own):
+            raise NeedsOperator("unowned position or pending entry")
+
+    async def prepare_admission(self, own):
+        if await self.foreign_exposure(own):
+            raise NeedsOperator("unexpected exposure")
+        return self.venue.funding
+
+    async def equity(self):
+        return self.venue.funding
+
+    async def available(self):
+        return self.venue.funding
+
+    async def account_reads(self):
+        return *await self.venue.balance(), await self.venue.positions(), await self.venue.open_orders()
+
+    async def foreign_exposure(self, own):
+        return (
+            [p.instrument for p in await self.venue.positions() if p.instrument not in own]
+            + self.venue.orders_open
+            + self.venue.tpsl
+        )
+
+    async def position_open(self, trade):
+        return any(p.instrument == trade["symbol"] for p in await self.venue.positions())
+
+    async def enter(self, candidate, quantity, book, instrument, stop, take, *, leverage, decision):
+        self.venue.market_bodies.append(
+            {
+                "candidate": candidate.id,
+                "decision_id": decision.decision_id,
+                "trade_id": decision.trade_id,
+                "quantity": quantity,
+                "leverage": leverage,
+                "stop": stop,
+                "take": take,
+            }
+        )
+        side = "BUY" if candidate.side == "LONG" else "SELL"
+        price = book.ask if side == "BUY" else book.bid
+        self.venue.position_list.append(Position(instrument.name, side, quantity, price, True, "stop-test"))
+        return {
+            "quantity": quantity,
+            "price": price,
+            "trade_id": decision.trade_id,
+            "order_id": f"test-{instrument.name}",
+            "protected": True,
+        }
+
+    async def close(self, trade, book, reason):
+        self.venue.close_bodies.append({"quantity": trade["quantity"], "leverage": trade["leverage"]})
+        self.venue.venue_exit(str(self.venue.close_pnl), trade["symbol"])
+
+    async def settle(self, trade):
+        return self.receipt
+
+
 def live_trader(tmp_path, venue: FakeVenue, **config) -> Trader:
     cfg = Config(**{"use_llm": False, "cooldown_minutes": 0, "exit_confirm_polls": 1, **config})
     cfg.validate()
     store = Store(tmp_path / "rt")
-    broker = LiveBroker(venue, store, cfg, TEST_KEY, settle_seconds=0, cache_seconds=0)
+    broker = FakePortfolio(venue)
     return Trader(
         api=venue,
         session=None,
@@ -468,20 +454,20 @@ def enter(trader: Trader) -> None:
     asyncio.run(trader.try_enter(candidate(), brain.control_decision([candidate()])))
 
 
-def test_live_entry_sends_protected_order_and_records_trade(tmp_path):
+def test_live_handoff_preserves_the_risk_identity_quantity_and_exit_plan(tmp_path):
     venue = FakeVenue()
     trader = live_trader(tmp_path, venue)
     asyncio.run(trader.start())
     enter(trader)
-    body = venue.market_bodies[0]
-    assert body["side"] == "BUY" and body["timeInForce"] == "IOC" and body["leverage"] == 1
-    assert Decimal(body["cashQuantity"]) <= Decimal(100)
-    assert [p["type"] for p in body["tpsl"]] == ["stop-loss", "take-profit"]
-    assert body["tpsl"][0]["price"] == "81.5" and body["tpsl"][0]["quantity"] == "0"
+    (handoff,) = venue.market_bodies
     trade = only(trader)
-    assert trade["symbol"] == "SOLUSD" and trade["quantity"] == "0.2"
-    assert trader.store.state["chain_id"] == 42161 and "pending_entry" not in trader.store.state
-    assert not venue.tpsl_bodies and not trader.store.state.get("halted")
+    assert trade["execution_provider"] == "execution_portfolio"
+    assert trade["risk_trade_id"] == trade["trade_id"] == handoff["trade_id"]
+    assert trade["risk_decision_id"] == handoff["decision_id"]
+    assert trade["quantity"] == str(handoff["quantity"]) == "0.2"
+    assert trade["order_id"] == trade["id"]
+    assert (trade["stop"], trade["take"]) == (str(handoff["stop"]), str(handoff["take"]))
+    assert trade["intent_id"] == handoff["candidate"]
 
 
 def test_venue_exit_is_accounted_from_balance_and_leftovers_cancelled(tmp_path):
@@ -492,66 +478,13 @@ def test_venue_exit_is_accounted_from_balance_and_leftovers_cancelled(tmp_path):
     venue.venue_exit("0.31")
     asyncio.run(trader.manage(only(trader), now_ms()))
     assert only(trader) is None
-    assert sorted(venue.cancelled) == ["SOLUSD-t0", "SOLUSD-t1"] and not venue.close_bodies
+    assert not venue.close_bodies
     closed = [
         json.loads(line)
         for line in (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
         if '"trade_closed"' in line
     ][0]
     assert closed["reason"] == "VENUE_EXIT" and Decimal(closed["pnl_usd"]) == Decimal("0.31")
-
-
-def test_second_signing_chain_is_tried_after_invalid_signature(tmp_path):
-    venue = FakeVenue()
-    venue.accept_chains = {"161803"}
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert [b["chainId"] for b in venue.market_bodies] == ["42161", "161803"]
-    assert venue.market_bodies[0]["id"] != venue.market_bodies[1]["id"]
-    assert trader.store.state["chain_id"] == 161803 and only(trader)
-
-
-def test_rejection_on_every_chain_leaves_no_trade(tmp_path):
-    venue = FakeVenue()
-    venue.accept_chains = set()
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert len(venue.market_bodies) == 2 and not only(trader)
-    assert "pending_entry" not in trader.store.state and not venue.position_list
-
-
-def test_unprotected_fill_is_closed_and_entries_halt(tmp_path):
-    venue = FakeVenue()
-    venue.attach_stop, venue.reject_tpsl = False, True
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert len(venue.close_bodies) == 1 and not venue.position_list
-    assert only(trader) is None and trader.store.state["halted"]
-    assert trader.entries_blocked()
-
-
-def test_missing_attachment_is_repaired_with_separate_stop(tmp_path):
-    venue = FakeVenue()
-    venue.attach_stop = False
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert [b["type"] for b in venue.tpsl_bodies] == ["stop-loss", "take-profit"]
-    assert venue.tpsl_bodies[0]["quantity"] == "0" and not venue.close_bodies
-    assert only(trader) and not trader.store.state.get("halted")
-
-
-def test_unknown_entry_answer_is_reconciled_from_positions(tmp_path):
-    venue = FakeVenue()
-    venue.unknown_entry = True
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert len(venue.market_bodies) == 1, "an unknown outcome must never be retried"
-    assert only(trader)["quantity"] == "0.2"
 
 
 def test_timeout_closes_position_with_reduce_only_order(tmp_path):
@@ -582,12 +515,12 @@ def test_foreign_position_blocks_trading(tmp_path):
     venue = FakeVenue()
     venue.position_list = [Position("ETHUSD", "BUY", Decimal("0.01"), Decimal("2000"))]
     trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    assert trader.store.state["halted"] and trader.entries_blocked()
-    assert not venue.market_bodies and not venue.close_bodies, "foreign exposure must not be touched"
+    with pytest.raises(NeedsOperator):
+        asyncio.run(trader.start())
+    assert not trader.trades() and not venue.market_bodies and not venue.close_bodies
 
 
-def test_crash_between_order_and_bookkeeping_is_recovered(tmp_path):
+def test_an_old_pending_entry_cannot_adopt_or_close_a_position(tmp_path):
     venue = FakeVenue()
     trader = live_trader(tmp_path, venue)
     asyncio.run(trader.start())
@@ -602,9 +535,48 @@ def test_crash_between_order_and_bookkeeping_is_recovered(tmp_path):
     trader.store.save()
     venue.position_list = [Position("SOLUSD", "BUY", Decimal("0.2"), Decimal("82.35"), False)]
     restarted = live_trader(tmp_path, venue)
-    asyncio.run(restarted.start())
-    assert only(restarted)["symbol"] == "SOLUSD"
-    assert [b["type"] for b in venue.tpsl_bodies] == ["stop-loss"], "a recovered position must get a stop"
+    with pytest.raises(NeedsOperator, match="pending"):
+        asyncio.run(restarted.start())
+    assert restarted.store.state["pending_entry"] and not restarted.trades()
+    assert not venue.close_bodies and not venue.market_bodies
+
+
+def test_two_flat_snapshots_archive_a_legacy_trade_without_guessing_its_pnl(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue, poll_seconds=2)
+    trader.store.state["open_trade"] = {"id": "old", "symbol": "SOLUSD", "candidate": {"id": "c"}}
+    asyncio.run(trader.start())
+    assert not trader.trades()
+    (archived,) = [r for r in journal_of(trader) if r["event"] == "legacy_position_flat_unattributed"]
+    assert archived["pnl_usd"] is None and archived["exit_origin"] == "unknown"
+    assert not venue.market_bodies and not venue.close_bodies
+
+
+def test_new_live_session_preserves_the_budget_halt_and_open_records(tmp_path):
+    trader = live_trader(tmp_path, FakeVenue())
+    asyncio.run(trader.start())
+    before = dict(trader.store.state["session"])
+    trader.store.state["halted"] = "earlier loss"
+    trader.store.state["round_trips"] = 2
+    asyncio.run(trader.start(new_session=True))
+    assert trader.store.state["session"]["start_equity"] == before["start_equity"]
+    assert trader.store.state["session"]["started_at"] == before["started_at"]
+    assert trader.store.state["round_trips"] == 2 and trader.store.state["halted"] == "earlier loss"
+    assert trader.store.state["session"]["reporting_started_at"]
+
+
+def test_entry_deadline_stops_new_risk_and_keeps_managing_open_positions(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    enter(trader)
+    trade = only(trader)
+    trader.broker.entry_deadline_utc = datetime.now(UTC) - timedelta(seconds=1)
+    asyncio.run(trader.try_enter(link_candidate(), brain.control_decision([link_candidate()])))
+    assert len(venue.market_bodies) == 1 and trader.entries_blocked() == "signed entry window ended"
+    trade["deadline_ms"] = 0
+    asyncio.run(trader.step())
+    assert len(venue.close_bodies) == 1 and not trader.trades()
 
 
 def test_session_loss_limit_halts_entries(tmp_path):
@@ -615,7 +587,59 @@ def test_session_loss_limit_halts_entries(tmp_path):
     enter(trader)
     trade = only(trader)
     asyncio.run(trader.manage(trade, trade["deadline_ms"] + 1))
-    assert "лимита" in trader.store.state["halted"]
+    assert trader.entries_blocked() == "portfolio loss stop or unavailable performance baseline"
+
+
+@pytest.mark.parametrize("unknown_effect", [False, True])
+def test_failure_to_admit_a_new_trade_keeps_existing_trades_managed(tmp_path, unknown_effect):
+    from kairos_execution.one_canary_account import CanaryAccountError
+
+    venue = FakeVenue()
+    two_books(venue)
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    enter(trader)
+    if unknown_effect:
+
+        async def fail(*args, **kwargs):
+            raise Unknown("order acknowledgement was lost")
+
+        trader.broker.enter = fail
+    else:
+
+        async def unavailable(own):
+            raise CanaryAccountError("cash-flow observation unavailable")
+
+        trader.broker.prepare_admission = unavailable
+    link = link_candidate()
+    asyncio.run(trader.try_enter(link, brain.control_decision([link])))
+    assert len(trader.trades()) == 1 and bool(trader.store.state.get("halted")) == unknown_effect
+    only(trader)["deadline_ms"] = 0
+    trader.store.state["last_bar"] = trader.scan_slot(now_ms())
+    asyncio.run(trader.step())
+    assert len(venue.close_bodies) == 1 and not trader.trades()
+
+
+def test_old_estimates_and_cash_withdrawal_do_not_trigger_a_portfolio_loss(tmp_path):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    trader.store.state["session"] = {"start_equity": "170", "realized_usd": "-7"}
+    trader.store.state["day"] = {
+        "date": datetime.now(UTC).date().isoformat(),
+        "start_equity": "170",
+        "peak_equity": "170",
+        "realized_usd": "-7",
+        "trades": 0,
+    }
+    asyncio.run(trader.start())
+    enter(trader)
+    trader.broker.flow = Decimal("-6")
+    venue.venue_exit("-6.1")
+    asyncio.run(trader.manage(only(trader), now_ms()))
+    assert trader.entries_blocked() is None
+    evidence = asyncio.run(trader._account_evidence())
+    assert evidence["daily_realized_pnl_usd"] == pytest.approx(-0.10)
+    assert evidence["day_start_equity_usd"] == pytest.approx(103.42)
 
 
 def test_daily_trade_limit_and_stop_file(tmp_path):
@@ -741,18 +765,15 @@ def test_one_scan_can_open_two_positions_but_never_two_in_one_instrument(tmp_pat
     assert len(trader.store.state["open_trades"]) == 2 and "entry_skipped" in events(trader)
 
 
-def test_live_allows_one_position_until_the_first_full_trade(tmp_path):
+def test_signed_portfolio_can_accept_two_distinct_positions_on_a_fresh_state(tmp_path):
     venue = FakeVenue()
     two_books(venue)
     trader = live_trader(tmp_path, venue, max_open_positions=3)
     asyncio.run(trader.start())
-    assert trader.slot_limit() == 1
+    assert trader.slot_limit() == 3
     enter(trader)
     asyncio.run(trader.try_enter(link_candidate(), brain.control_decision([link_candidate()])))
-    assert len(venue.market_bodies) == 1, "no second position before one trade has gone the full circle"
-    venue.venue_exit("0.31")
-    asyncio.run(trader.manage(only(trader), now_ms()))
-    assert trader.slot_limit() == 3
+    assert len(venue.market_bodies) == len(trader.trades()) == 2
 
 
 def test_overlapping_live_trades_are_accounted_from_prices(tmp_path):
@@ -774,10 +795,10 @@ def test_overlapping_live_trades_are_accounted_from_prices(tmp_path):
         for line in (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
         if '"trade_closed"' in line
     ][0]
-    assert closed["pnl_exact"] is False and closed["exit_price"] == sol["take"]
+    assert closed["pnl_exact"] is False and Decimal(closed["exit_price"]) == venue.bid
+    assert closed["pnl_basis"] == "price_estimate" and closed["exit_origin"] == "unknown"
     assert Decimal("0.20") < Decimal(closed["pnl_usd"]) < Decimal("0.26")
     assert [t["symbol"] for t in trader.store.state["open_trades"]] == ["LINKUSD"]
-    assert venue.cancelled == ["SOLUSD-t0", "SOLUSD-t1"], "only the closed instrument's orders are cancelled"
     assert "last_flat_equity" not in trader.store.state["session"]
 
 
@@ -834,80 +855,7 @@ def test_one_failing_position_does_not_stop_the_others_being_managed(tmp_path):
     )
 
 
-def test_routine_position_checks_share_one_read_and_writes_force_a_fresh_one(tmp_path):
-    venue = FakeVenue()
-    cfg = Config(use_llm=False)
-    store = Store(tmp_path / "rt")
-    broker = LiveBroker(venue, store, cfg, TEST_KEY, settle_seconds=0, cache_seconds=60)
-    trade = {"symbol": "SOLUSD"}
-    venue.position_list = [Position("SOLUSD", "BUY", Decimal("0.2"), Decimal("82.35"), True)]
-    assert asyncio.run(broker.position_open(trade)) and asyncio.run(broker.position_open(trade))
-    assert venue.position_reads == 1
-    venue.position_list = []
-    assert asyncio.run(broker.position("SOLUSD")) is None, "a direct read is never served from the cache"
-    assert venue.position_reads == 2
-
-
-def test_stop_refused_for_one_side_reading_is_placed_with_the_other(tmp_path):
-    venue = FakeVenue()
-    venue.attach_stop, venue.reject_tpsl, venue.tpsl_reject_label = False, True, "side"
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert [b["side"] for b in venue.tpsl_bodies] == ["BUY", "SELL", "SELL"], (
-        "stop: BUY refused, SELL accepted; take: SELL"
-    )
-    assert trader.store.state["tpsl_side_mode"] == "closing" and not trader.store.state.get("halted")
-    assert only(trader) and not venue.close_bodies
-
-
-def test_entry_cash_carries_a_small_margin_against_rounding_down(tmp_path):
-    venue = FakeVenue()
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    cash = Decimal(venue.market_bodies[0]["cashQuantity"])
-    assert Decimal("0.2") * venue.ask < cash <= Decimal("0.2") * venue.ask * Decimal("1.002")
-
-
-def test_close_falls_back_to_the_other_signing_chain(tmp_path):
-    venue = FakeVenue()
-    venue.unknown_entry = True  # the entry answer is lost, so no chain has been confirmed yet
-    venue.close_chains = {"161803"}
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert "chain_id" not in trader.store.state
-    trade = only(trader)
-    asyncio.run(trader.manage(trade, trade["deadline_ms"] + 1))
-    assert [b["chainId"] for b in venue.close_bodies] == ["42161", "161803"]
-    assert only(trader) is None and trader.store.state["chain_id"] == 161803
-
-
-def test_instrument_leverage_is_set_to_the_trades_before_the_order(tmp_path):
-    venue = FakeVenue()
-    venue.account_leverage["SOLUSD"] = 10
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert venue.leverage_calls == [("SOLUSD", 1)] and len(venue.market_bodies) == 1
-    assert venue.market_bodies[0]["leverage"] == 1
-    assert only(trader)["symbol"] == "SOLUSD" and only(trader)["leverage"] == 1
-    assert "leverage_set" in events(trader) and not trader.store.state.get("halted")
-
-
-def test_leverage_that_cannot_be_changed_leaves_no_trade_and_no_order(tmp_path):
-    venue = FakeVenue()
-    venue.account_leverage["SOLUSD"], venue.leverage_locked = 10, True
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    assert venue.leverage_calls == [("SOLUSD", 1)] and not venue.market_bodies, "nothing is sent"
-    assert only(trader) is None and "leverage_change_failed" in events(trader)
-    assert "pending_entry" not in trader.store.state
-
-
-def test_the_risk_managers_leverage_is_used_for_the_order_and_the_close(tmp_path, monkeypatch):
+def test_runner_passes_adaptive_leverage_to_the_single_portfolio_owner(tmp_path, monkeypatch):
     from support import approve_entries
 
     approve_entries(monkeypatch, leverage=5.0)
@@ -916,28 +864,9 @@ def test_the_risk_managers_leverage_is_used_for_the_order_and_the_close(tmp_path
     asyncio.run(trader.start())
     enter(trader)
     trade = only(trader)
-    assert venue.leverage_calls == [("SOLUSD", 5)] and venue.market_bodies[0]["leverage"] == 5
-    assert trade["leverage"] == 5
-    trade["deadline_ms"] = 0
-    asyncio.run(trader.manage(trade, now_ms()))
-    assert venue.close_bodies and venue.close_bodies[-1]["leverage"] == 5
-
-
-def test_a_position_larger_than_requested_is_closed_at_once(tmp_path):
-    venue = FakeVenue()
-    original = venue.post_market_order
-
-    async def doubled(body):
-        answer = await original(body)
-        venue.position_list = [dataclasses.replace(p, quantity=p.quantity * 3) for p in venue.position_list]
-        return answer
-
-    venue.post_market_order = doubled
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    with pytest.raises(NeedsOperator, match="larger position"):
-        enter(trader)
-    assert venue.close_bodies and not venue.position_list and "entry_oversized" in events(trader)
+    assert venue.market_bodies[0]["leverage"] == trade["leverage"] == 5
+    asyncio.run(trader.manage(trade, trade["deadline_ms"] + 1))
+    assert venue.close_bodies[-1]["leverage"] == 5
 
 
 def test_one_empty_position_answer_does_not_end_a_trade_or_cancel_its_protection(tmp_path):
@@ -956,7 +885,7 @@ def test_one_empty_position_answer_does_not_end_a_trade_or_cancel_its_protection
     venue.venue_exit("0.31")
     for _ in range(3):
         asyncio.run(trader.manage(only(trader), now_ms())) if only(trader) else None
-    assert only(trader) is None and sorted(venue.cancelled) == ["SOLUSD-t0", "SOLUSD-t1"]
+    assert only(trader) is None and "trade_closed" in events(trader)
 
 
 # ---- model call glue and secrets ---------------------------------------------

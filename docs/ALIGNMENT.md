@@ -6,6 +6,13 @@ It is a map of work, not a readiness claim. Revisions are the `main` heads on th
 Updated 2026-11-14: step 4, and the plan beyond the removal of duplicates, which follows
 the owner's end goal in `kairos/docs/PHILOSOPHY.md` (branch `docs/philosophy-20261114`).
 
+## Portfolio execution update, 2026-11-19
+
+The current runner delegates all live orders to `kairos_execution.portfolio_broker`.
+The Execution Engine owns the portfolio journal, venue transport, account authorization
+and settlement. The runner passes each Risk decision to that broker. The single-trade
+session and direct runner order paths described in the dated tables below are historical.
+
 ## Correction of an earlier reading
 
 `StrategyIntentV1.venue` is `Literal["BINANCE_UM"]`

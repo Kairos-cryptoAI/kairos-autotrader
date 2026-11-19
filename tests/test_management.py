@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import random
 import time
 from decimal import Decimal
@@ -26,7 +25,7 @@ from kairos_autotrader.management import (
     write_policy,
 )
 from kairos_autotrader.signals import Candle, outcome
-from tests.test_autotrader import SOL, FakeVenue, enter, journal_of, live_trader, only, paper_trader
+from tests.test_autotrader import SOL, FakeVenue, enter, journal_of, only, paper_trader
 from tests.test_execution_session import _real_review
 
 TRAIL = Management("trail", trail_start_r=1.0, trail_distance_r=0.5)
@@ -230,86 +229,6 @@ def test_without_a_proven_policy_nothing_is_managed(tmp_path, monkeypatch):
     off = paper_trader(tmp_path / "off", FakeVenue(), Config(use_llm=False, management="off"))
     _write_policy(off, TRAIL)
     assert off.management_policy(int(time.time() * 1000)) is None
-
-
-class PartialVenue(FakeVenue):
-    async def post_close(self, body):
-        self.close_bodies.append(body)
-        quantity = Decimal(body["quantity"])
-        kept = []
-        for position in self.position_list:
-            if position.instrument == body["instrument"] and position.quantity > quantity:
-                kept.append(dataclasses.replace(position, quantity=position.quantity - quantity))
-            elif position.instrument != body["instrument"]:
-                kept.append(position)
-        self.position_list = kept
-        return {"id": body["id"]}
-
-
-def test_live_stop_move_places_the_new_stop_before_cancelling_the_old(tmp_path, monkeypatch):
-    _real_review(monkeypatch)
-    venue = PartialVenue()
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    trade = only(trader)
-    old = [row for row in venue.tpsl if row["type"] == "stop-loss"]
-    assert old and old[0]["price"] == trade["stop"]
-    new = Decimal(trade["stop"]) + Decimal("0.5")
-    assert asyncio.run(trader.broker.move_stop(trade, new)) is True
-    stops = [row for row in venue.tpsl if row["type"] == "stop-loss"]
-    assert [Decimal(row["price"]) for row in stops] == [new] and venue.cancelled == [old[0]["id"]]
-    with pytest.raises(ValueError):
-        asyncio.run(trader.broker.move_stop(trade, new - Decimal("1")))
-    venue.reject_tpsl = True
-    assert asyncio.run(trader.broker.move_stop(trade, new + Decimal("0.1"))) is False
-    kept = [Decimal(r["price"]) for r in venue.tpsl if r["type"] == "stop-loss"]
-    assert trade["stop"] == str(new) and kept == [new], "a refused new stop leaves the old one in place"
-    venue.reject_tpsl = False
-    venue.tpsl.append({"id": "x", "instrument": "SOLUSD", "type": "stop-loss", "status": "active"})
-    assert asyncio.run(trader.broker.move_stop(trade, new + Decimal("0.2"))) is True
-    assert "x" not in venue.cancelled, "a stop whose price is unreadable is never removed"
-
-
-def test_live_partial_close_reduces_the_position_and_keeps_protection(tmp_path, monkeypatch):
-    _real_review(monkeypatch)
-    venue = PartialVenue()
-    trader = live_trader(tmp_path, venue)
-    asyncio.run(trader.start())
-    enter(trader)
-    trade = only(trader)
-    before = Decimal(trade["quantity"])
-    price = asyncio.run(trader.broker.partial_close(trade, Book(0, venue.bid, venue.ask), Decimal("0.1")))
-    assert price == venue.bid and Decimal(trade["quantity"]) == before - Decimal("0.1")
-    assert Decimal(venue.close_bodies[-1]["quantity"]) == Decimal("0.1")
-    assert any(row["type"] == "stop-loss" for row in venue.tpsl), "the stop still covers the rest"
-    assert json.loads(json.dumps(trade))["quantity"] == str(before - Decimal("0.1"))
-
-
-def test_execution_session_gets_a_soft_managed_stop_over_its_hard_plan_stop(tmp_path, monkeypatch):
-    from tests.test_regime_exit import _fake_execution_waiting_for_exit
-
-    _real_review(monkeypatch)
-    venue = FakeVenue()
-    trader = live_trader(tmp_path, venue, **_fake_execution_waiting_for_exit(tmp_path, monkeypatch))
-    _write_policy(trader, Management("trail", trail_start_r=0.5, trail_distance_r=0.5))
-    asyncio.run(trader.start())
-    enter(trader)
-    session = trader.store.state["execution_session"]
-    assert session["management"]["name"] == "trail" and session["instrument"] == "SOLUSD"
-    entry, stop0 = Decimal(session["plan"]["entry"]), Decimal(session["plan"]["stop"])
-    risk = entry - stop0
-    venue.bid, venue.ask = entry + risk * Decimal("1.2"), entry + risk * Decimal("1.2") + Decimal("0.02")
-    asyncio.run(trader._manage_execution(int(time.time() * 1000)))
-    managed = Decimal(session["managed_stop"])
-    assert managed > entry and not session.get("exit_requested"), "moved, not yet crossed"
-    venue.bid, venue.ask = managed - Decimal("0.01"), managed + Decimal("0.01")
-    asyncio.run(trader._manage_execution(int(time.time() * 1000)))
-    assert "managed stop" in open(session["exit_request_file"], encoding="utf-8").read()
-    deadline = time.time() + 20
-    while trader._follow_execution() and time.time() < deadline:
-        time.sleep(0.1)
-    assert [e for e in journal_of(trader) if e["event"] == "managed_stop_exit_requested"]
 
 
 def test_adding_to_an_open_position_stays_refused_with_the_measured_verdict(tmp_path, monkeypatch):

@@ -1,6 +1,10 @@
 {
-  "_comment": "Пример для 23 инструментов с капиталом 100 USD и часовой стратегией по умолчанию. Right-tail включается через strategies. Допустимые настройки и ограничения Risk Manager описаны в README.md и docs/OPERATOR-GUIDE-RU.md.",
+  "_comment": "Портфель из 23 инструментов с капиталом 100 USD. Часовые и right-tail сигналы используют общий бюджет риска. Настройки описаны в README.md и docs/OPERATOR-GUIDE-RU.md.",
   "symbols": ["BTCUSD", "ETHUSD", "HYPEUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "LINKUSD", "SUIUSD", "AAVEUSD", "ZECUSD", "ENAUSD", "1000PEPEUSD", "LTCUSD", "TRXUSD", "ARBUSD", "TAOUSD", "APTUSD", "1000BONKUSD", "VIRTUALUSD", "BCHUSD", "OPUSD", "DOTUSD", "AVAXUSD"],
+  "executor": "execution_portfolio",
+  "strategies": ["hourly_trend_candidates_v1", "regime_aligned_right_tail_v1"],
+  "execution_profile": "../execution-portfolio/owner.json",
+  "position_notional_of_capital": 0.25,
   "capital_basis_usd": 100,
   "risk_per_trade_usd": 0.25,
   "session_loss_stop_usd": 5,
