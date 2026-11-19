@@ -1,145 +1,84 @@
 # kairos-autotrader
 
-**Live runner.** One process that runs the Kairos layers on EVEDEX with real orders. It
-exists because no deployment profile of the service stack reaches a real venue: the
-pinned Execution, Risk and Router releases reject `LIVE` by configuration and PAPER is
-restricted to the EVEDEX DEV profile. The runner is the place where a reviewed candidate
-becomes one real, protected, 1x market order and is managed to its exit.
+The Kairos runner evaluates strategies on closed Binance USD-M minute bars, reviews
+their signals, and manages positions on EVEDEX. Paper and live runs use the same
+strategy, review and risk policies. Live orders require explicit confirmation.
+The [operator guide](docs/OPERATOR-GUIDE-RU.md) covers configuration, position
+management and the historical studies in Russian. The
+[Kairos project](https://github.com/Kairos-cryptoAI/kairos) maintains the service-stack
+manifest, release evidence and readiness statements.
 
-As in the Kairos design, the signal is computed on closed Binance USD-M one-minute bars
-and the order is placed on EVEDEX. Between the layers the runner passes the Kairos
-contracts themselves (`kairos-core`, pinned): `StrategyIntentV1` from the Strategy Engine
-and `CandidateRouteV1` from the Router.
+## From a closed bar to a position
 
-It is not a claim of readiness or profitability. The meta-repository's readiness flags
-stay `false`; nothing here changes them.
+| Stage | What the runner uses |
+| --- | --- |
+| Market data | Quant Scouts validates public Binance minute bars. The runner caches them in `closed-bars`, rechecks the most recent five and records revisions. Text Scouts supplies dated news evidence. |
+| Strategy | Strategy Engine emits a `StrategyIntentV1` with the side, stop, target, expiry and bar identities. The runner checks the strategy source and the bars it supplied. |
+| Review | Router assigns the tier, evidence and deadline. Aggregator assembles the context and returns ALLOW, VETO or DEFER through the LLM gateway. The default profile also records the runner's probability review for comparison. |
+| Allocation and risk | Macro Strategist allocates capital by regime. Quant Scouts measures EVEDEX and Binance venue quality. Risk Manager requires an Aggregator ALLOW, usable allocation and account evidence, then determines size and leverage within its limits. |
+| Execution | Paper mode simulates fills. In live mode, `executor="runner"` places a market IOC entry with exchange-side protection. With `executor="execution_engine"`, a separately provisioned Execution Engine production session checks the registered strategy and its own risk limits, enters with a bounded limit order and reconciles the result. |
 
-## What runs where
+Workers exchange JSON with the runner and load the corresponding sibling checkouts.
+The runner keeps its own `state.json`, `journal.jsonl` and Aggregator budget ledger.
+The probability reviewer, Macro and Text Scouts model calls have separate accounting
+from the Aggregator gateway. The [alignment notes](docs/ALIGNMENT.md) trace the
+implementation to its Kairos contracts.
 
-The runner does not copy code from the layer repositories. Each layer is executed
-unchanged, in that repository's own locked environment, by a small worker script that
-exchanges JSON with the runner ([`kairos_autotrader/sibling.py`](kairos_autotrader/sibling.py)).
+## Profiles and limits
 
-| layer | repository | used by the runner | mode |
-| --- | --- | --- | --- |
-| 1B Text Scouts | `kairos-text-scouts` | sources, normaliser, freshness bound, deduplicator, relevance filter, sentiment prompt, schema and signal transform, local fallback | live: evidence for reviewers |
-| 1A Quant Scouts | `kairos-quant-scouts` | `long_gap_recovery.parse_page`: a Binance kline page becomes strict `ClosedBarEventV1` bars only if it is complete, ordered and gap-free | live: every signal bar passes it |
-| 2 Router | `kairos-router` | `SignalWindow` text aggregation, `CandidateRouterPolicy.build` → `CandidateRouteV1` (tier, review deadline, exact evidence ids) | live: every candidate is routed; a rejected one is dropped |
-| 3 Aggregator | `kairos-aggregator` | `CandidateContextStore` → `DecisionContextV1`, `CandidateReviewBrain.review_with_context` → `CandidateReviewV1`, model calls through `kairos-llm`'s `BudgetedLLMGateway` | shadow by default (`review_mode`) |
-| 4 Macro Strategist | `kairos-macro-strategist` | allocation prompt, context assembler, `AllocationOutput`, defensive fallback, shock detector | live: an allocation every `macro_refresh_hours` (6) and after shocks |
-| 5 Risk Manager | `kairos-risk-manager` | `LiveRiskEvaluator`: every admission gate, the sizing and the `RiskTradeDecisionV1`, on a PROD `VenueQualityV1` measured by Quant Scouts' `build_venue_quality` just before the decision; `learning.LearningLedger` and `adaptive_risk` (the share of the per-trade ceiling and the leverage, from evidence) | live: decides every entry; the runner trades its quantity or less |
-| 6 Execution | `kairos-execution-engine` | `production_session_cli`: one automatically armed trade on the production path (`executor = "execution_engine"`), its closed-trade journal (`production_report`) | live when the owner configures it; otherwise the runner's own broker |
-| Strategy Engine | `kairos-strategy-engine` | `kairos_strategy.hourly_trend` through its strict adapter: closed Binance bars in, `StrategyIntentV1` out, pinned by the package's own source identity; registered sleeve generators | live: every candidate comes from it; registered sleeves in shadow only (`shadow`, `engine-replay`) |
+The [example](config.example.json) selects 23 instruments, a capital basis of 100 USD,
+a 0.25 USD per-trade risk cap, a 5 USD session loss stop and a 40 USD monthly
+Aggregator budget. With no config file the runner selects ten instruments and a
+12 USD review budget. Both use `hourly_trend_candidates_v1` for entries by default.
 
-Owned by the runner itself:
+To evaluate right-tail entries, include `regime_aligned_right_tail_v1` in
+`strategies`. Its default decision interval is 24 hours. Supported settings for
+`right_tail_interval_hours` are 4, 6, 8, 12 and 24. Hourly features are still
+calculated for review when only right-tail is selected. A strategy can use its
+own fixed `management_policies` override. The example supplies no override.
 
-- `signals.py` — a routed candidate is the Router's `CandidateRouteV1` (with the
-  engine's `StrategyIntentV1` inside) plus the EVEDEX instrument it is traded on. Side,
-  stop, target and timeout are read from the contract every time; journal records keep
-  identities and a few readable fields, because one intent is about 2 MB.
-- `binance_bars.py` — downloads public Binance kline pages and keeps the closed-bar
-  cache; each update re-downloads the last cached minutes and refuses a changed bar.
-- `system_engine.py` — the bridge to the engine and the pin. Every scan (`scan_minutes`,
-  four times an hour) asks the engine; an engine whose source differs from the pinned one
-  is refused, and so is an intent that does not declare exactly the cached bars.
-- `routing.py` — the bridge to the Router; a route around another intent is refused.
-- `brain.py` — a single probability review of all candidates (the default reviewer).
-- `evedex.py` — EVEDEX REST client and EIP-712 order signing, byte-compatible with
-  `@evedex/exchange-bot-sdk` 1.2.11 (fixture-tested).
-- `engine.py` — the loop: scan, decide, size, enter with exchange-side stop and target,
-  manage, account; hard ceilings as code constants; file-based state and journal. An open
-  position closes early when a newer Macro regime opposes it (`regime_exit`); each early
-  exit is measured against holding the plan, and they switch themselves off after 20
-  measurements if they cost more than they save.
-- `management.py` — break-even, trailing stops and partial exits, measured on the live
-  rules' replayed signals against the plan (`engine-replay` writes
-  `management-policy.json`) and applied only when proven; a stop only moves toward less
-  risk, and the new stop is on the venue before the old one is cancelled. Adding to an
-  open winner is measured the same way and stays refused unless proven.
-- `execution_session.py` — the hand-over to the Execution Engine and the early-exit
-  request file of a running session.
+The runner accepts up to 150,000 USD of configured capital. The dollar risk cap can
+be set up to 1% of that basis, and the session loss stop up to 5%. Risk Manager
+further limits the risk at the stop to 0.25% of equity per trade and 1% across open
+positions. It may reduce size or refuse an entry. The runner permits up to ten open
+positions and forty entries per day. Live mode starts with one slot until the first
+completed round trip. Risk Manager sets leverage within the venue and policy limits,
+up to 30×. See [the configuration and validation](kairos_autotrader/engine.py).
 
-## Known deviations from the Kairos contracts
+## Run from a checkout
 
-These are tracked, not hidden. See
-[`docs/ALIGNMENT.md`](docs/ALIGNMENT.md) for the file-level map and the order of removal.
-
-- The default reviewer (`brain.py`, `review_mode="probability"`) is the runner's own and
-  has no counterpart in the design; it, Text Scouts' extraction and the Macro call still
-  call the provider directly. The Aggregator review runs in a worker per scan, not in
-  `CandidateReviewService` on the bus, and its budget is a JSON ledger
-  (`<runtime-dir>/llm-budget.json`), not the Postgres ledger of `kairos-persistence`.
-- Routes come from the Router's pure policy. The time checks of
-  `RouterService._candidate_rejection` are restated in `router_worker.py`, because the
-  pinned service refuses LIVE routing by configuration.
-- Closed bars come from Binance's public REST klines through the Quant Scouts parser, not
-  from the Quant Scouts collector's durable stream. The `MarketSnapshot` for a review is
-  built from REST data, so its liquidation totals stay at zero. There is no
-  `VenueQualityV1`; the entry check bounds the distance between the EVEDEX price and the
-  Binance reference instead.
-- `LiveRiskEvaluator` needs a registered account verifier and input verifier; the
-  Risk Manager ships none. The runner registers its own (`risk_worker.py`): the account
-  evidence is what it read from EVEDEX with its session plus its trade ledger, and the
-  trust boundary is the runner process. In paper mode the evidence is the paper ledger,
-  so the decision's LIVE/PROD labels describe the evaluated policy, not a real account.
-- The evaluator runs with `require_instrument_rules=False`: the intent's exit prices are
-  Binance prices and are not on EVEDEX's price tick, which the authenticated-rules mode
-  rejects. The runner floors the quantity to the venue's lot and refuses a size below
-  the minimum lot instead.
-- Only instruments in Quant Scouts' PROD symbol map can be measured for
-  `VenueQualityV1`, so only they can be traded. Since `kairos-quant-scouts` `6bd59a3` the
-  map holds all ten configured instruments; a symbol added to `symbols` but not to the
-  map is recorded and refused.
-- State is two files, not the transactional inbox/outbox and execution journal.
-- The candidate rules are an isolated research package of the Strategy Engine, not a
-  registered or promoted sleeve.
-
-## Local development
+Use Python 3.11 or later and the uv version pinned in [pyproject.toml](pyproject.toml).
+Check out the required sibling repositories under the same parent directory and run
+`uv sync --locked` in each Python checkout used by a worker. For a wheel installation
+set `KAIROS_WORKSPACE_ROOT` to that parent directory. Run these commands from this
+repository. Supply your own key files outside the checkout wherever a command uses
+`/path/to/`. Use separate directories for paper, shadow and live state.
 
 ```sh
 uv sync --locked
-uv run --locked python -m kairos_autotrader check
-uv run --locked python -m kairos_autotrader scan --no-llm
-uv run --locked python -m kairos_autotrader run --mode paper --no-llm --runtime-dir <dir>
+uv run --locked kairos-autotrader check --api-key-file /path/to/evedex-api-key --wallet-key-file /path/to/wallet-key
+uv run --locked kairos-autotrader scan --no-llm --config config.example.json
+uv run --locked kairos-autotrader shadow --runtime-dir ../runtime/shadow
+uv run --locked kairos-autotrader engine-replay --runtime-dir ../runtime/replay --days 45
+uv run --locked kairos-autotrader run --mode paper --config config.example.json --runtime-dir ../runtime/paper --openai-key-file /path/to/openai-key
+uv run --locked kairos-autotrader report --runtime-dir ../runtime/paper --outcomes
 ```
 
-Layer workers need the sibling repositories checked out next to this one, each with its
-own `uv sync --locked` environment. A missing sibling disables that layer with a message;
-tests that start real sibling code are skipped where it is absent.
-
-`kairos-quant-scouts` must contain the ten-pair PROD map (commit `6bd59a3`, branch
-`prod-symbol-map-ten-20261113`, until it is on `main`); with the original five pairs only
-BTC, ETH, SOL and XRP of the configured list can be traded.
-`kairos-aggregator` must contain the bounded review prompt (commit `34963c2`, branch
-`bounded-review-prompt-20261113`, until it is on `main`); without it every Aggregator
-review of an hourly_trend candidate fails at the provider and ends as DEFER.
-`kairos-strategy-engine` must contain the strict `kairos_strategy.hourly_trend` adapter
-(commit `7096bfc`, branch `hourly-trend-strict-adapter-20261112`, until it is on `main`).
-Without it, with a different source of that package, or without the `kairos-quant-scouts`
-and `kairos-router` environments, the runner manages open positions and opens nothing.
-The first start downloads three weeks of Binance minute bars per instrument (about a
-minute and a half for ten instruments) into `<runtime-dir>/closed-bars`.
-
-Real orders require `run --mode live --confirm-real-orders` and key files supplied by the
-operator. Keys are read at start and are never printed, logged or written. The operator
-guide (Russian) is [`docs/OPERATOR-GUIDE-RU.md`](docs/OPERATOR-GUIDE-RU.md).
-
-## Checks
+`check` reads market and account data. `scan --no-llm` inspects candidates without
+model calls. A paper run with model review uses live market data and simulates orders.
+For real orders, prepare a separate configuration and runtime directory, then run
 
 ```sh
-make all
+uv run --locked kairos-autotrader run --mode live --confirm-real-orders --config config.json --runtime-dir ../runtime/live --api-key-file /path/to/evedex-api-key --wallet-key-file /path/to/wallet-key --openai-key-file /path/to/openai-key
+uv run --locked kairos-autotrader report --config config.json --runtime-dir ../runtime/live --ledger
 ```
 
-runs Ruff, Ruff format, mypy, Bandit, the network-free test suite and the package build,
-the same gates as every Kairos Python repository.
+A `STOP` file in the runtime directory stops new entries and lets the runner manage
+open positions to exit. A `CLOSE` file requests immediate closure. Execution Engine
+sessions also require the [production session setup](https://github.com/Kairos-cryptoAI/kairos-execution-engine/blob/main/docs/PRODUCTION-SESSION.md).
 
-## Safety boundaries
+## Development checks
 
-- Hard ceilings are constants in `engine.py`: capital basis 100 USDT, risk per trade
-  1 USDT, session loss 10 USDT, 12 trades a day, 3 open positions, leverage 1x.
-- Writes to the venue are never retried. A 4xx is a refusal with no effect; a timeout or
-  5xx is an unknown outcome that is reconciled from positions before anything else.
-- An entry without an accepted exchange stop is closed at once and entries halt.
-- No withdraw or transfer schema exists in the signer.
-- Models receive typed evidence only. They can allow or veto an offered candidate; they
-  cannot change a side, a price, a stop or a size, and cannot propose a trade.
+Run `make all` for Ruff lint and format, mypy, Bandit, pytest and the package build.
+Tests that start sibling workers require those checkouts and their environments.
+The [Makefile](Makefile) lists the equivalent uv commands for platforms without Make.
