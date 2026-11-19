@@ -89,7 +89,9 @@ class ExecutionSessions:
             ),
             encoding="utf-8",
         )
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP
         with result.open("wb") as stdout, log.open("wb") as stderr:
             # The operator supplies the interpreter. The module is fixed and paths are separate arguments.
             self._process = subprocess.Popen(  # nosec B603
