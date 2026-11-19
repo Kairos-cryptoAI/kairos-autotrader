@@ -254,6 +254,28 @@ def test_live_runner_hands_selected_targets_to_one_execution_owner(tmp_path, mon
     assert (partial is None) is qualified
 
 
+@pytest.mark.parametrize("reason", ["STOP", "TAKE"])
+def test_live_runner_accounts_for_bracket_completed_during_entry(tmp_path, monkeypatch, reason):
+    _real_review(monkeypatch)
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    broker_enter = trader.broker.enter
+
+    async def fast_bracket(*args, **kwargs):
+        fill = await broker_enter(*args, **kwargs)
+        venue.venue_exit("-0.15" if reason == "STOP" else ".27")
+        trader.broker.receipt["exit_origin"] = "system"
+        return {**fill, "closed_at_entry": reason, "exit_price": "82.1"}
+
+    monkeypatch.setattr(trader.broker, "enter", fast_bracket)
+    enter(trader)
+    assert only(trader) is None and not venue.close_bodies and len(venue.market_bodies) == 1
+    assert trader.store.state["round_trips"] == 1
+    (closed,) = [row for row in journal_of(trader) if row["event"] == "trade_closed"]
+    assert (closed["reason"], closed["exit_origin"], closed["exit_price"]) == (reason, "system", "82.1")
+
+
 def test_paper_trade_trails_its_stop_and_exits_above_entry(tmp_path, monkeypatch):
     _real_review(monkeypatch)
     venue = FakeVenue()

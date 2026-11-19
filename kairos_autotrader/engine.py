@@ -2280,12 +2280,18 @@ class Trader:
             "management": policy.as_dict() if policy else None,
             "native_partial_targets": bool(fill.get("native_partial_targets")),
         }
+        if fill.get("closed_at_entry") in {"STOP", "TAKE"}:
+            trade["closed_at_entry"] = fill["closed_at_entry"]
+            trade["exit_price"] = str(fill["exit_price"])
         for other in trades:
             other["solo"] = False
         trades.append(trade)
         self._day()["trades"] += 1
         self.store.save()
         self.store.journal("trade_opened", trade=trade)
+        if trade.get("closed_at_entry"):
+            await self._finish(trade, trade["closed_at_entry"], None, close=False)
+            return
         say(
             f"ВХОД {trade['symbol']} {trade['side']} {trade['quantity']} по {fill['price']}, "
             f"плечо {trade['leverage']}x; "
@@ -2299,6 +2305,9 @@ class Trader:
     # ---- managing open trades ----------------------------------------------
 
     async def manage(self, trade: dict[str, Any], now_ms: int) -> None:
+        if trade.get("closed_at_entry"):
+            await self._finish(trade, trade["closed_at_entry"], None, close=False)
+            return
         if now_ms < trade.get("retry_after_ms", 0):
             return
         is_open = await self.broker.position_open(trade)
@@ -2393,9 +2402,12 @@ class Trader:
             return dec(trade["pnl_usd"]), True
         if trade.get("solo", True):
             return equity - dec(trade["equity_before"]), False
-        if book is None:
-            book = await self.api.book(trade["symbol"])
-        exit_price = book.bid if trade["side"] == "LONG" else book.ask
+        if trade.get("closed_at_entry"):
+            exit_price = dec(trade["exit_price"])
+        else:
+            if book is None:
+                book = await self.api.book(trade["symbol"])
+            exit_price = book.bid if trade["side"] == "LONG" else book.ask
         trade["exit_price"] = str(exit_price)
         return estimate_pnl(trade, exit_price, self.fee) + dec(trade.get("partial_pnl_usd", "0")), False
 
