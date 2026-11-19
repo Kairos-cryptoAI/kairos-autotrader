@@ -154,6 +154,22 @@ def route(request: dict) -> dict:
 
 
 def main() -> int:
+    if "--serve" in sys.argv[2:]:
+        from worker_session import serve_requests
+
+        sys.path[0] = sys.argv[1]
+        # Load the same policy, validators and settings before announcing readiness.
+        route(
+            {
+                "symbols": ["BTCUSDT"],
+                "review_timeout_ms": 60_000,
+                "source": "kairos-autotrader",
+                "now_ms": 0,
+                "intents": [],
+                "signals": [],
+            }
+        )
+        return serve_requests(route)
     # argv[1] replaces this script's own directory on the import path, so nothing from the
     # runner package can shadow Router imports.
     sys.path[0] = sys.argv[1]

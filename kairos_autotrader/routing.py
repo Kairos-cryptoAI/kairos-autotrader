@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
 from .signals import Routed
+from .worker_session import WorkerSession
 
 WORKER = Path(__file__).with_name("router_worker.py")
 ROUTE_SOURCE = "kairos-autotrader"  # the process that ran the Router's policy
@@ -48,6 +49,10 @@ def router_revision(config: RouterConfig) -> str:
     return git_revision(config.source, "kairos_router")
 
 
+def router_session(config: RouterConfig) -> WorkerSession:
+    return WorkerSession(config.python, WORKER, [str(config.source)], timeout_s=config.timeout_s)
+
+
 def _run_worker(config: RouterConfig, request: dict[str, Any]) -> dict[str, Any]:
     try:
         return run_worker(config.python, WORKER, [str(config.source)], request, timeout_s=config.timeout_s)
@@ -73,6 +78,7 @@ async def route_intents(
     now_ms: int,
     review_timeout_ms: int,
     runner=None,
+    session: WorkerSession | None = None,
 ) -> Routing:
     """Route the intent of every instrument. Raises ``RouterError`` if the worker fails."""
     if not intents:
@@ -86,7 +92,13 @@ async def route_intents(
         "signals": signals,
         "intents": [intent.model_dump(mode="json") for intent in intents.values()],
     }
-    answer = await asyncio.to_thread(runner or _run_worker, config, request)
+    if session is None:
+        answer = await asyncio.to_thread(runner or _run_worker, config, request)
+    else:
+        try:
+            answer = await session.ask(request)
+        except SiblingError as exc:
+            raise RouterError(f"Router: {exc}") from exc
     rows = answer.get("routes")
     if not isinstance(rows, list) or {str(r.get("intent_id")) for r in rows} != set(by_id):
         raise RouterError("Router worker did not answer for exactly the intents it was given")

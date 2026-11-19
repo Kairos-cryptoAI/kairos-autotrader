@@ -193,3 +193,26 @@ def test_real_router_time_rules_reject_late_and_early_candidates():
     assert reasons(DECISION - 1_000) == {"candidate postdates routing evaluation time"}
     assert reasons(DECISION - 60_000) == {"future-dated candidate"}
     assert len(route(None, offered=offered, now_ms=DECISION + 59_999).routed) == 2
+
+
+def test_real_warm_router_preserves_identity_deadlines_and_isolates_batches():
+    from kairos_autotrader.routing import router_session
+
+    config = real_config()
+    offered = intents()
+    common = dict(now_ms=DECISION + 15_000, review_timeout_ms=60_000)
+    expected = asyncio.run(route_intents(config, offered, signals=[], **common))
+
+    async def exercise():
+        session = router_session(config)
+        try:
+            await session.warm()
+            bullish = news("n1", impact="bullish", sentiment=0.9, confidence=0.8, minutes_before=1)
+            first = await route_intents(config, offered, signals=[bullish], session=session, **common)
+            assert any(item.route.review_tier.value == "CONFLICT" for item in first.routed)
+            second = await route_intents(config, offered, signals=[], session=session, **common)
+            assert second == expected
+        finally:
+            await session.stop()
+
+    asyncio.run(exercise())

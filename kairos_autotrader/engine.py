@@ -71,7 +71,14 @@ from .risk import (
     evaluate_entry,
     risk_revisions,
 )
-from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
+from .routing import (
+    MAX_REVIEW_TIMEOUT_MS,
+    RouterConfig,
+    RouterError,
+    route_intents,
+    router_revision,
+    router_session,
+)
 from .signals import SIGNAL_VENUE, Features, Routed, held_outcome, outcome, signal_symbol
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
@@ -93,6 +100,7 @@ from .system_engine import (
 from .system_rules import MacroDesk, RulesConfig, RulesError, bias_of
 from .system_rules import revisions as rules_revisions
 from .text_scouts import NewsDesk, TextScoutsError
+from .worker_session import WorkerSession
 
 # Hard bounds of the configuration. Dollar limits are fractions of the capital basis, so the
 # same rules hold for a 100 USD canary and a 100 000 USD account.
@@ -751,6 +759,8 @@ class Trader:
         self._fetch_bars = fetch_bars or http_fetcher(session)
         self.engine: EngineConfig | None = EngineConfig()
         self.quant, self.router = QuantConfig(), RouterConfig()
+        self._router_session: WorkerSession | None = None
+        self._router_warm_task: asyncio.Task | None = None
         self._signal_revisions: dict[str, str] = {}
         # The Aggregator review's evidence: the market snapshots taken before a boundary and
         # the newest closed bars of the last scan, keyed by the Binance signal symbol.
@@ -1726,6 +1736,7 @@ class Trader:
                     signals=self.news.raw_signals() if self.news else [],
                     now_ms=int(time.time() * 1000),
                     review_timeout_ms=int(self.config.review_timeout_s * 1000),
+                    session=self._router_session,
                 )
             except RouterError as exc:
                 say(f"Router не дал ответа, сигналы этого скана пропущены: {str(exc)[:200]}")
@@ -2369,6 +2380,9 @@ class Trader:
     ) -> None:
         news_task = None
         try:
+            if self.engine is not None:
+                self._router_session = router_session(self.router)
+                self._router_warm_task = asyncio.create_task(self._warm_router(self._router_session))
             await self.start(new_session=new_session, resume_reconciled=resume_reconciled)
             if self.news is not None and max_steps is None:
                 news_task = asyncio.create_task(self._news_loop())
@@ -2379,6 +2393,17 @@ class Trader:
                 with contextlib.suppress(asyncio.CancelledError):
                     await news_task
             await self.stop_engine_workers()
+
+    async def _warm_router(self, session: WorkerSession) -> None:
+        from .sibling import SiblingError
+
+        started = time.monotonic()
+        try:
+            await session.warm()
+        except SiblingError as exc:
+            self.store.journal("router_warm_error", message=str(exc)[:200])
+        else:
+            self.store.journal("router_ready", warm_s=round(time.monotonic() - started, 3))
 
     async def stop_engine_workers(self) -> None:
         """End the background engine work and the persistent workers before the loop closes."""
@@ -2392,6 +2417,12 @@ class Trader:
                 await pool.stop()
         if self.risk_session is not None:
             await self.risk_session.stop()
+        if self._router_warm_task is not None:
+            self._router_warm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._router_warm_task
+        if self._router_session is not None:
+            await self._router_session.stop()
 
     def _heartbeat(self, started_at: str) -> None:
         """Replace ``heartbeat.json`` on every loop for the single-host alert monitor.
