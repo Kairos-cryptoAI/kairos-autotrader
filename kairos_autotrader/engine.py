@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from kairos_execution.one_canary_account import CanaryAccountError
 from kairos_execution.portfolio_broker import NeedsOperator
 from kairos_execution.portfolio_broker import PortfolioBroker as LiveBroker
 from kairos_execution.portfolio_journal import PortfolioJournalError
+from kairos_execution.portfolio_performance import read_pilot_status
 
 from . import brain
 from .aggregator_review import (
@@ -734,9 +736,12 @@ class Trader:
         openai_key: str | None,
         bars: ClosedBarStore | None = None,
         fetch_bars: FetchPage | None = None,
+        pilot_journal_path: Path | None = None,
     ) -> None:
         self.api, self.session, self.store, self.config = api, session, store, config
         self.broker, self.fee, self.instruments, self.openai_key = broker, fee, instruments, openai_key
+        self._pilot_journal_path = pilot_journal_path
+        self._next_flat_probe = 0.0
         self._extras: dict[str, dict[str, Any]] = {}
         self._status_at: dict[str, int] = {}  # when each position was last reported on screen
         # The signal chain of the Kairos design: closed Binance bars checked by Quant Scouts,
@@ -952,7 +957,7 @@ class Trader:
     @staticmethod
     def _lineage(trade: dict[str, Any] | None) -> dict[str, Any] | None:
         """What the Risk Manager needs to know about the trade behind a position, if it has it."""
-        if not trade or not trade.get("risk_decision_id"):
+        if not trade or not trade.get("risk_decision_id") or not trade.get("leverage"):
             return None  # opened before entries were decided by the Risk Manager
         return {
             key: trade[key]
@@ -966,6 +971,7 @@ class Trader:
                 "risk_decision_id",
                 "risk_trade_id",
                 "first_fill_ms",
+                "leverage",
             )
         } | {"entry_order_id": trade["id"]}
 
@@ -998,7 +1004,9 @@ class Trader:
                     "side": "LONG" if p.side == "BUY" else "SHORT",
                     "quantity": float(p.quantity),
                     "entry_price": float(p.avg_price),
-                    "mark_price": float((books[p.instrument].bid + books[p.instrument].ask) / 2),
+                    "mark_price": float(
+                        books[p.instrument].bid if p.side == "BUY" else books[p.instrument].ask
+                    ),
                     "stop_order_id": p.stop_id,
                     "trade": self._lineage(trades.get(p.instrument)),
                 }
@@ -1040,12 +1048,34 @@ class Trader:
         }
         return scope, limits
 
+    def _recent_outcomes(self, limit: int) -> list[dict]:
+        history = self.store.state.get("history", [])
+        if self.broker.mode == "live":
+            history = [
+                row
+                for row in history
+                if row.get("mode") == "live"
+                and row.get("pnl_basis") == "execution_fills"
+                and row.get("exit_origin") == "system"
+                and row.get("risk_trade_id")
+                and row.get("risk_decision_id")
+                and row.get("result_r") is not None
+            ]
+        return history[-limit:]
+
     async def macro_tick(self, features: list[Features], now_ms: int) -> None:
         """Ask the Macro Strategist if an allocation is due. Its failures never reach the trading loop."""
         if self.macro is None or not features:
             return
         try:
             account = await self._account_view()
+            if isinstance(self.broker, LiveBroker):
+                pilot = self.broker.pilot_status() or {}
+                performance = {"pilot_account_result_usd": pilot.get("account_result")}
+            else:
+                performance = {
+                    "session_realized_usd": self.store.state.get("session", {}).get("realized_usd")
+                }
             allocation = await self.macro.refresh(
                 self.session,
                 openai_key=self.openai_key,
@@ -1054,10 +1084,10 @@ class Trader:
                 market=self._market_view(features),
                 portfolio={k: account[k] for k in ("equity_usd", "available_usd", "positions")},
                 performance={
+                    **performance,
                     "daily_realized_pnl_usd": account["daily_realized_pnl_usd"],
-                    "session_realized_usd": self.store.state.get("session", {}).get("realized_usd"),
                     "trades_today": self._day()["trades"],
-                    "recent_closed_trades": self.store.state.get("history", [])[-20:],
+                    "recent_closed_trades": self._recent_outcomes(20),
                 },
                 now_ms=now_ms,
             )
@@ -1696,7 +1726,7 @@ class Trader:
                 ],
                 extras=self._extras,
                 fear_greed=fear_greed,
-                recent_trades=self.store.state.get("history", [])[-10:],
+                recent_trades=self._recent_outcomes(10),
                 text_signals=self.news.context(now_ms) if self.news else None,
                 macro=self.macro.summary() if self.macro else None,
             )
@@ -2083,7 +2113,7 @@ class Trader:
         self, trade: dict[str, Any], reason: str, book: Book | None, equity: Decimal
     ) -> tuple[Decimal, bool]:
         """This trade's result in USD and whether it is exact or estimated from prices."""
-        if "pnl_usd" in trade:  # the paper broker computes it itself
+        if self.broker.mode == "paper" and "pnl_usd" in trade:
             return dec(trade["pnl_usd"]), True
         if trade.get("solo", True):
             return equity - dec(trade["equity_before"]), False
@@ -2131,7 +2161,11 @@ class Trader:
             session["last_flat_equity"] = str(equity)
         if reason != "PROTECTION_FAILED":
             state["round_trips"] = int(state.get("round_trips", 0)) + 1
-        risk = Decimal(str(self.config.risk_per_trade_usd))
+        r_multiple = (
+            (pnl / dec(trade["one_r_usd"])).quantize(Decimal("0.0001"))
+            if trade.get("one_r_usd") and dec(trade["one_r_usd"]) > 0
+            else None
+        )
         history = state.setdefault("history", [])
         history.append(
             {
@@ -2141,17 +2175,15 @@ class Trader:
                 "exit": reason,
                 "pnl_basis": basis,
                 "exit_origin": origin,
-                "result_r": round(float(pnl / risk), 2),
+                "mode": self.broker.mode,
+                "risk_trade_id": trade.get("risk_trade_id"),
+                "risk_decision_id": trade.get("risk_decision_id"),
+                "result_r": float(r_multiple) if r_multiple is not None else None,
                 "held_minutes": (int(time.time() * 1000) - trade["opened_ms"]) // 60_000,
                 "closed_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%MZ"),
             }
         )
         del history[:-HISTORY_LENGTH]
-        r_multiple = (
-            (pnl / dec(trade["one_r_usd"])).quantize(Decimal("0.0001"))
-            if trade.get("one_r_usd") and dec(trade["one_r_usd"]) > 0
-            else None
-        )
         if reason == "REGIME_EXIT" and r_multiple is not None and trade.get("signal_symbol"):
             entry = dec(trade["entry_price"])
             self._queue_early_exit(
@@ -2328,6 +2360,36 @@ class Trader:
                 return
         self.store.journal("heartbeat_error", message="the heartbeat file stayed locked")
 
+    async def _can_stop_flat(self) -> bool:
+        if (
+            self.trades()
+            or self.store.state.get("execution_session")
+            or self.store.state.get("pending_entry")
+        ):
+            return False
+        stop = self.store.flag("STOP")
+        if not isinstance(self.broker, LiveBroker):
+            return stop
+        now = datetime.now(UTC)
+        expired = now >= self.broker.entry_deadline_utc
+        if not (stop or expired) or time.monotonic() < self._next_flat_probe:
+            return False
+        self._next_flat_probe = time.monotonic() + 60
+        if await self.broker.foreign_exposure(set()):
+            return False
+        if not expired:
+            return True
+        if self._pilot_journal_path is None:
+            return False
+        await self.broker.refresh_performance(force=True)
+        status = read_pilot_status(self._pilot_journal_path)
+        return bool(
+            status
+            and status["final_flat_observation"]
+            and datetime.fromisoformat(status["observed_at"]) >= now
+            and status["open_positions"] == status["unresolved_effects"] == 0
+        )
+
     async def _loop(self, max_steps: int | None) -> None:
         errors = steps = 0
         started_at = datetime.now(UTC).isoformat()
@@ -2335,12 +2397,17 @@ class Trader:
             steps += 1
             try:
                 await self.step()
+                if await self._can_stop_flat():
+                    self._heartbeat(started_at)
+                    say("Новые входы завершены. Открытых позиций и ожидающих операций нет.")
+                    return
                 errors = 0
             except (
                 TimeoutError,
                 EvedexError,
                 PortfolioJournalError,
                 CanaryAccountError,
+                sqlite3.Error,
                 aiohttp.ClientError,
             ) as exc:
                 errors += 1
@@ -2357,9 +2424,6 @@ class Trader:
                     self.halt("слишком много ошибок подряд")
                     errors = 0
             self._heartbeat(started_at)
-            if self.store.flag("STOP") and not self.trades():
-                say("Найден файл STOP, позиций нет. Останавливаюсь.")
-                return
             await asyncio.sleep(self.pause_s(time.time()) if max_steps is None else 0)
 
     def pause_s(self, now_s: float) -> float:

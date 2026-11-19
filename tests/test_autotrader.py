@@ -579,6 +579,34 @@ def test_entry_deadline_stops_new_risk_and_keeps_managing_open_positions(tmp_pat
     assert len(venue.close_bodies) == 1 and not trader.trades()
 
 
+@pytest.mark.parametrize("evidence", ["verified", "offline", "open", "unknown"])
+def test_expired_pilot_completes_only_with_a_fresh_flat_observation(tmp_path, monkeypatch, evidence):
+    trader = live_trader(tmp_path, FakeVenue())
+    asyncio.run(trader.start())
+    cutoff = datetime.now(UTC) - timedelta(minutes=2)
+    trader.broker.entry_deadline_utc = cutoff
+    trader._pilot_journal_path = tmp_path / "pilot.db"
+    refreshed = []
+
+    async def refresh(*, force=False):
+        refreshed.append(force)
+
+    def observation(path):
+        assert path == trader._pilot_journal_path
+        return {
+            "observed_at": (cutoff if evidence == "offline" else datetime.now(UTC)).isoformat(),
+            "final_flat_observation": {"observed_at": cutoff.isoformat()} if evidence != "open" else None,
+            "open_positions": int(evidence == "open"),
+            "unresolved_effects": int(evidence == "unknown"),
+        }
+
+    monkeypatch.setattr(trader.broker, "refresh_performance", refresh)
+    monkeypatch.setattr("kairos_autotrader.engine.read_pilot_status", observation)
+    assert asyncio.run(trader._can_stop_flat()) == (evidence == "verified")
+    assert refreshed == [True]
+    assert not trader.broker.venue.market_bodies and not trader.broker.venue.close_bodies
+
+
 def test_session_loss_limit_halts_entries(tmp_path):
     venue = FakeVenue()
     venue.close_pnl = Decimal("-5.10")
@@ -588,6 +616,27 @@ def test_session_loss_limit_halts_entries(tmp_path):
     trade = only(trader)
     asyncio.run(trader.manage(trade, trade["deadline_ms"] + 1))
     assert trader.entries_blocked() == "portfolio loss stop or unavailable performance baseline"
+
+
+def test_live_review_only_sees_verified_system_outcomes(tmp_path):
+    trader = live_trader(tmp_path, FakeVenue())
+    owned = {
+        "mode": "live",
+        "pnl_basis": "execution_fills",
+        "exit_origin": "system",
+        "risk_trade_id": "id",
+        "risk_decision_id": "decision",
+        "result_r": 0.3,
+    }
+    trader.store.state["history"] = [
+        {"result_r": 20},
+        {**owned, "mode": "paper"},
+        {**owned, "pnl_basis": "account_change"},
+        {**owned, "exit_origin": "operator"},
+        {**owned, "risk_trade_id": None},
+        owned,
+    ]
+    assert trader._recent_outcomes(20) == [owned]
 
 
 @pytest.mark.parametrize("unknown_effect", [False, True])

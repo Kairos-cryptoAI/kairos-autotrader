@@ -248,6 +248,7 @@ async def build_trader(args: argparse.Namespace, session: aiohttp.ClientSession,
             store=store,
             config=config,
             broker=broker,
+            pilot_journal_path=profile.journal_path if profile else None,
             fee=fee,
             instruments=instruments,
             openai_key=secrets["openai"] if config.use_llm else None,
@@ -329,6 +330,23 @@ def _read_journal(directory: Path) -> list[dict]:
     return records
 
 
+def _report_pilot_costs(directory: Path, status: dict) -> None:
+    from .pilot_costs import pilot_model_usage
+
+    sample = status["final_flat_observation"] or status["cutoff_observation"] or status
+    usage = pilot_model_usage(directory, started_at=status["started_at"], until=sample["observed_at"])
+    subtotal = usage["known_aggregator_usd"]
+    adjusted = Decimal(sample["account_result"]) - subtotal
+    say(
+        f"За период {status['started_at']} — {sample['observed_at']} учтено расходов Aggregator "
+        f"{subtotal:.6f} USD. Результат EVEDEX за вычетом этой суммы {adjusted:+.6f} USD "
+        f"при оценке 1 USDT = 1 USD."
+    )
+    if not usage["aggregator_complete"]:
+        say(f"Учёт Aggregator неполный. Незавершённых резервов {usage['pending_reservations']}.")
+    say("Полная стоимость отдельных вызовов Macro, Text Scouts и вероятностного обзора неизвестна.")
+
+
 def _report_execution(config_path: Path | None) -> None:
     """The Execution Engine's closed trades, when it is the executor: its database is the journal."""
     if config_path is None:
@@ -356,7 +374,20 @@ def _report_execution(config_path: Path | None) -> None:
                     f"неясных операций {status['unresolved_effects']}, "
                     f"входы до {status['entry_deadline_utc']}."
                 )
-                say("Расходы на модели оплачиваются отдельно от результата счёта EVEDEX.")
+                for key, label in (
+                    ("cutoff_observation", "Первое наблюдение после окончания приёма входов"),
+                    ("final_flat_observation", "Итог после закрытия позиций и сверки заявок"),
+                ):
+                    sample = status[key]
+                    if sample is None:
+                        say(f"{label} пока отсутствует.")
+                    else:
+                        say(
+                            f"{label} в {sample['observed_at']}. Результат счёта "
+                            f"{sample['account_result']} USDT, позиций {sample['open_positions']}, "
+                            f"через {sample['lag_seconds']:.1f} с после срока."
+                        )
+                _report_pilot_costs(profile.runner_runtime_dir, status)
             else:
                 say("Пилот EVEDEX: подтверждённого начального баланса пока нет.")
     if not (config.execution_python and config.execution_session_config):

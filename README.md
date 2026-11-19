@@ -79,6 +79,7 @@ uv run --locked kairos-autotrader report --config config.json --runtime-dir ../r
 A `STOP` file in the runtime directory stops new entries and lets the runner manage
 open positions to exit. A `CLOSE` file requests immediate closure of owned positions.
 The signed deadline stops new entries while open trades continue to settlement.
+The runner exits after a fresh observation confirms a flat account and a settled journal.
 `--new-session` starts a new reporting period and preserves live loss controls.
 The historical `runner` executor name selects the portfolio broker. Configuration
 for the retired `execution_engine` single-trade path is supported by the report.
@@ -89,6 +90,9 @@ The report groups closes by live or paper mode and by the source of their PnL. E
 row shows the recorded exit initiator. With the signed profile the report also reads
 the account-wide pilot balance, net transfers, conservative loss and counts of open
 positions, closed trades and attributed outcomes from the Execution journal.
+It records the first observation at or after the deadline, its delay and the first
+fully settled observation. The report deducts settled Aggregator fees over that interval
+and identifies the incomplete coverage of external model charges.
 A disappearing position has unknown origin.
 For earlier live trades the balance delta includes any manual trading, transfers and
 funding during the trade. Overlapping positions have price estimates. The learning

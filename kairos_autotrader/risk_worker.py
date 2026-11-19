@@ -41,6 +41,7 @@ import json
 import math
 import sys
 import time
+from decimal import Decimal
 from typing import Any
 
 MARKER = "@@KAIROS-WORKER@@"
@@ -118,6 +119,11 @@ def venue_quality(
     )
 
 
+def _position_pnl(raw: dict) -> Decimal:
+    change = Decimal(str(raw["mark_price"])) - Decimal(str(raw["entry_price"]))
+    return change * Decimal(str(raw["quantity"])) * {"LONG": 1, "SHORT": -1}[raw["side"]]
+
+
 class RunnerAccountVerifier:
     """Account evidence read by the runner, as ``VerifiedLiveAccountV1``."""
 
@@ -144,9 +150,10 @@ class RunnerAccountVerifier:
             raise ValueError("account evidence belongs to another account")
 
         positions, open_risk, notional, strategy_notional, unrealized = [], 0.0, 0.0, 0.0, 0.0
+        unrealized_loss = 0.0
         for raw in evidence["positions"]:
             trade = raw.get("trade")
-            if not trade:
+            if not trade or not trade.get("leverage"):
                 raise ValueError(f"position {raw['venue_symbol']} has no Kairos lineage")
             side = Side(raw["side"])
             quantity, entry, mark = (
@@ -161,7 +168,7 @@ class RunnerAccountVerifier:
                 max_holding_ms=int(trade["max_holding_ms"]),
             )
             stop_id = raw.get("stop_order_id")
-            pnl = sign * (mark - entry) * quantity
+            pnl = float(_position_pnl(raw))
             positions.append(
                 PositionSnapshotV2(
                     venue_symbol=raw["venue_symbol"],
@@ -169,7 +176,7 @@ class RunnerAccountVerifier:
                     signed_quantity=sign * quantity,
                     entry_price=entry,
                     mark_price=mark,
-                    leverage=1.0,
+                    leverage=trade["leverage"],
                     unrealized_pnl_usd=pnl,
                     strategy_id=trade["strategy_id"],
                     strategy_revision=trade["strategy_revision"],
@@ -187,11 +194,12 @@ class RunnerAccountVerifier:
             open_risk += quantity * abs(entry - exit_plan.stop_price)
             notional += quantity * mark
             unrealized += pnl
+            unrealized_loss += max(0.0, -pnl)
             if trade["strategy_id"] == expected_scope.strategy_id:
                 strategy_notional += quantity * mark
         realized = float(evidence["daily_realized_pnl_usd"])
         # Unrealized profit is never counted as equity; an unrealized loss always is.
-        equity = float(evidence["balance_usd"]) + min(0.0, unrealized)
+        equity = float(evidence["balance_usd"]) - unrealized_loss
         account = AccountSnapshotV2(
             source=self.source_id,
             trading_mode=TradingMode.LIVE,
@@ -224,7 +232,7 @@ class RunnerAccountVerifier:
             reserved_open_notional_usd=0.0,
             strategy_open_notional_usd=strategy_notional,
             strategy_reserved_notional_usd=0.0,
-            daily_adverse_loss_usd=max(0.0, -realized) + max(0.0, -unrealized),
+            daily_adverse_loss_usd=max(0.0, -realized) + unrealized_loss,
         )
 
 
@@ -373,6 +381,25 @@ def _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_rec
     )
 
 
+def _learning_ledger(outcomes):
+    from kairos_risk.learning import LearningLedger, TradeOutcome
+
+    return LearningLedger(
+        tuple(
+            TradeOutcome(
+                strategy_id=str(row["strategy_id"]),
+                symbol=str(row["symbol"]),
+                regime=str(row["regime"]),
+                r_multiple=Decimal(str(row["r_multiple"])),
+                decided_at_ms=int(row["decided_at_ms"]),
+                source=row["source"],
+            )
+            for row in outcomes
+            if row.get("source") in {"LIVE", "REPLAY"}
+        )
+    )
+
+
 def _adaptive_limits(
     adaptive: dict,
     limits,
@@ -394,25 +421,17 @@ def _adaptive_limits(
         adaptive_risk_fraction,
         minimum_lot_fraction,
     )
-    from kairos_risk.learning import UNKNOWN_REGIME, LearningLedger, TradeOutcome
+    from kairos_risk.learning import UNKNOWN_REGIME
     from kairos_risk.live import CHOP_RISK_MULTIPLIER
 
-    ledger = LearningLedger(
-        tuple(
-            TradeOutcome(
-                strategy_id=str(row["strategy_id"]),
-                symbol=str(row["symbol"]),
-                regime=str(row["regime"]),
-                r_multiple=Decimal(str(row["r_multiple"])),
-                decided_at_ms=int(row["decided_at_ms"]),
-                source=row.get("source", "LIVE"),
-            )
-            for row in adaptive.get("outcomes", [])
-        )
-    )
+    ledger = _learning_ledger(adaptive.get("outcomes", []))
     regime = allocation.regime.value if allocation is not None else UNKNOWN_REGIME
     edge = ledger.estimate(review.intent.strategy_id, review.intent.symbol, regime)
-    equity = Decimal(str(account["balance_usd"]))
+    equity = Decimal(str(account["balance_usd"])) + sum(
+        min(Decimal(0), _position_pnl(raw)) for raw in account.get("positions", [])
+    )
+    if equity <= 0:
+        return None, {"reasons": ["conservative account equity is not positive"]}
     peak = max(equity, Decimal(str(account.get("peak_equity_usd") or equity)))
     decision = adaptive_risk_fraction(
         AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
@@ -480,23 +499,7 @@ def _adaptive_limits(
 
 def ledger_table(request: dict) -> dict:
     """The Risk Manager's learning ledger, cell by cell, for the report."""
-    from decimal import Decimal
-
-    from kairos_risk.learning import LearningLedger, TradeOutcome
-
-    ledger = LearningLedger(
-        tuple(
-            TradeOutcome(
-                strategy_id=str(row["strategy_id"]),
-                symbol=str(row["symbol"]),
-                regime=str(row["regime"]),
-                r_multiple=Decimal(str(row["r_multiple"])),
-                decided_at_ms=int(row["decided_at_ms"]),
-                source=row.get("source", "LIVE"),
-            )
-            for row in request.get("outcomes", [])
-        )
-    )
+    ledger = _learning_ledger(request.get("outcomes", []))
     return {"table": ledger.table()}
 
 

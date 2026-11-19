@@ -143,6 +143,26 @@ def test_report_reads_the_execution_engines_closed_trades(tmp_path, monkeypatch,
     assert "сделок закрыто 1" in out and "+1.200 R" in out and "SOLUSD BUY TARGET" in out
 
 
+def test_report_deducts_model_costs_through_the_settled_cutoff(tmp_path, capsys):
+    from kairos_autotrader.__main__ import _report_pilot_costs
+
+    status = {
+        "started_at": "2026-11-19T00:00:00Z",
+        "observed_at": "2026-11-24T12:00:00Z",
+        "account_result": "99",
+        "cutoff_observation": {"observed_at": "2026-11-22T21:00:05Z", "account_result": "2"},
+        "final_flat_observation": {"observed_at": "2026-11-22T21:04:05Z", "account_result": "1.5"},
+    }
+    (tmp_path / "llm-budget.json").write_text(
+        json.dumps(
+            {"2026-11": {"openai": {"a": {"at_ms": 1795046400000, "reserved": 100_000, "actual": 30_000}}}}
+        )
+    )
+    _report_pilot_costs(tmp_path, status)
+    out = capsys.readouterr().out
+    assert "2026-11-22T21:04:05Z" in out and "+1.470000" in out and "неизвестна" in out
+
+
 def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tmp_path, monkeypatch):
     package = tmp_path / "fake-ledger" / "kairos_execution"
     package.mkdir(parents=True)

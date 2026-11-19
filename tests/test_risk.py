@@ -14,6 +14,7 @@ import subprocess  # nosec B404 - the test starts the real worker code with a fi
 import time
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from kairos_core.contracts import CandidateReviewV1, RiskTradeDecisionV1
@@ -140,10 +141,38 @@ def lineage(symbol="XRPUSD") -> dict:
             "intent_id": "a" * 64,
             "risk_decision_id": "b" * 64,
             "risk_trade_id": "c" * 64,
+            "leverage": 5,
             "first_fill_ms": int(time.time() * 1000) - 3_600_000,
             "entry_order_id": "00476:" + "f" * 26,
         },
     }
+
+
+def test_verifier_keeps_approved_leverage_and_counts_each_open_loss():
+    from kairos_autotrader.risk_worker import RunnerAccountVerifier
+
+    winner, loser = lineage(), lineage("SOLUSD")
+    loser["mark_price"] = 1.08
+    loser["trade"]["risk_trade_id"] = "d" * 64
+    loser["trade"]["leverage"] = 3
+    verified = RunnerAccountVerifier(LIVE_ACCOUNT_SOURCE).verify(
+        account(positions=[winner, loser], daily_realized_pnl_usd=-0.5),
+        source_id=LIVE_ACCOUNT_SOURCE,
+        expected_scope=SimpleNamespace(
+            account_id="evedex-prod-test",
+            scope_sha256="e" * 64,
+            strategy_id=winner["trade"]["strategy_id"],
+        ),
+    )
+    assert verified.account.unrealized_pnl_usd == pytest.approx(-0.8)
+    assert verified.account.equity_usd == pytest.approx(108.4)
+    assert verified.daily_adverse_loss_usd == pytest.approx(1.5)
+    assert {p.venue_symbol: p.leverage for p in verified.account.positions} == {"SOLUSD": 3, "XRPUSD": 5}
+
+
+def test_risk_ledger_does_not_promote_rows_of_unknown_origin():
+    answer = decide(adaptive_={"outcomes": [{"source": "paper"}, {}]})
+    assert answer["adaptive"]["edge_level"] == "none"
 
 
 def decide(
