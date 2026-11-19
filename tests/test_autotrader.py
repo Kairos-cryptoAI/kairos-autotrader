@@ -340,6 +340,9 @@ class FakePortfolio(LiveBroker):
     def native_protection_unavailable(self):
         return self.venue.native_protection_unavailable
 
+    def protection_unavailable_for(self, instrument):
+        return self.venue.native_protection_unavailable
+
     async def refresh_performance(self, *, force=False):
         pass
 
@@ -1449,6 +1452,41 @@ def test_unqualified_native_protection_blocks_live_entries_but_keeps_management(
     asyncio.run(trader.step())
     assert managed == [("existing", True)] and not venue.market_bodies
     assert paper_trader(tmp_path, venue, Config(use_llm=False)).entries_blocked() is None
+
+
+@pytest.mark.parametrize("link_qualified", [True, False])
+def test_scan_reviews_blocked_instruments_without_spending_qualified_slots(
+    tmp_path, monkeypatch, link_qualified
+):
+    venue = FakeVenue()
+    two_books(venue)
+    trader = live_trader(tmp_path, venue, max_open_positions=1)
+    reason = "position-reducing protection is unqualified"
+    venue.native_protection_unavailable = reason
+    monkeypatch.setattr(
+        trader.broker,
+        "protection_unavailable_for",
+        lambda symbol: None if link_qualified and symbol == "LINKUSD" else reason,
+    )
+    monkeypatch.setattr("kairos_autotrader.engine.SCAN_AFTER_CLOSE_MS", 0)
+    asyncio.run(trader.start())
+    offered = [candidate(score=0.95), link_candidate()]
+
+    async def scan(now):
+        return [], offered
+
+    trader.scan = scan
+    asyncio.run(trader.step())
+    (decision,) = [row for row in journal_of(trader) if row["event"] == "decision"]
+    assert decision["candidate_ids"] == [c.id for c in offered]
+    assert decision["decision"]["picks"] == [c.id for c in offered]
+    skipped = [
+        row["candidate"]
+        for row in journal_of(trader)
+        if row["event"] == "entry_skipped" and row["reason"] == reason
+    ]
+    assert skipped == [c.id for c in (offered[:1] if link_qualified else offered)]
+    assert [row["candidate"] for row in venue.market_bodies] == ([offered[1].id] if link_qualified else [])
 
 
 def test_scan_trades_only_the_selected_strategies_and_runs_the_daily_rule_at_one_utc(tmp_path, monkeypatch):

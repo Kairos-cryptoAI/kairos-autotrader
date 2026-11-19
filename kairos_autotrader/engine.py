@@ -827,7 +827,7 @@ class Trader:
         self._aggregator_warm_task: asyncio.Task | None = None
         self._aggregator_task: asyncio.Task[Reviews] | None = None
         self._position_faults: dict[str, tuple[str, str]] = {}
-        self._reported_protection_block: str | None = None
+        self._reported_unprotected: dict[str, str] = {}
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
             try:
@@ -1347,9 +1347,13 @@ class Trader:
         self.store.state["early_exit_pending"] = remaining
         self.store.save()
 
-    def _protection_block(self) -> str | None:
+    def _protection_block(self, instrument: str | None = None) -> str | None:
         if not isinstance(self.broker, LiveBroker):
             return None
+        if instrument is not None:
+            for_instrument = getattr(self.broker, "protection_unavailable_for", None)
+            if for_instrument is not None:
+                return for_instrument(instrument)
         # An older installed execution package cannot certify position-reducing protection.
         return getattr(
             self.broker,
@@ -1357,14 +1361,11 @@ class Trader:
             "Execution Engine does not report qualified position-reducing native protection",
         )
 
-    def entries_blocked(self) -> str | None:
+    def _account_entry_block(self) -> str | None:
         state = self.store.state
         if state.get("halted"):
             return str(state["halted"])
         if isinstance(self.broker, LiveBroker):
-            protection_block = self._protection_block()
-            if protection_block:
-                return protection_block
             if datetime.now(UTC) >= self.broker.entry_deadline_utc:
                 return "signed entry window ended"
             status = self.broker.pilot_status()
@@ -1376,6 +1377,14 @@ class Trader:
             return "daily trade limit reached"
         return None
 
+    def entries_blocked(self, instrument: str | None = None) -> str | None:
+        return self._account_entry_block() or self._protection_block(instrument)
+
+    def _ranking_limit(self, candidates: list[Routed], free_slots: int) -> int:
+        # An instrument with unqualified exits may be reviewed but cannot take a live slot.
+        blocked = {c.instrument for c in candidates if self._protection_block(c.instrument)}
+        return free_slots + len(blocked)
+
     def slot_limit(self) -> int:
         return min(HARD_MAX_OPEN_POSITIONS, int(self.config.max_open_positions))
 
@@ -1386,11 +1395,6 @@ class Trader:
         if resume_reconciled and not isinstance(self.broker, LiveBroker):
             raise ConfigError("--resume-reconciled requires a live portfolio")
         state["mode"] = self.broker.mode
-        protection_block = self._protection_block()
-        if protection_block and protection_block != self._reported_protection_block:
-            self.store.journal("native_protection_unavailable", reason=protection_block)
-            say(f"Новые входы закрыты: защита EVEDEX не подтверждена. {protection_block}")
-        self._reported_protection_block = protection_block
         self.store.publish_close(recovering=True)
         trades = self.trades()
         pilot_baseline = None
@@ -1406,6 +1410,17 @@ class Trader:
                 await self._resume_reconciled(self.broker, trades)
             else:
                 await self._reconcile_portfolio(trades)
+            blocked = {
+                symbol: reason for symbol in self.config.symbols if (reason := self._protection_block(symbol))
+            }
+            if blocked and blocked != self._reported_unprotected:
+                self.store.journal(
+                    "native_protection_unavailable",
+                    reason="; ".join(dict.fromkeys(blocked.values())),
+                    symbols=list(blocked),
+                )
+                say(f"Без подтверждённой защиты EVEDEX: {len(blocked)} из {len(self.config.symbols)}.")
+            self._reported_unprotected = blocked
             status = self.broker.pilot_status()
             pilot_baseline = status["baseline"] if status else None
         if new_session and self.broker.mode == "paper":
@@ -1847,7 +1862,7 @@ class Trader:
     async def decide(
         self, features: list[Features], candidates: list[Routed], free_slots: int = 1
     ) -> brain.Decision:
-        control = brain.control_decision(candidates, free_slots)
+        control = brain.control_decision(candidates, self._ranking_limit(candidates, free_slots))
         day = self._day()
         if not (self.config.use_llm and self.openai_key):
             decision = control
@@ -2049,7 +2064,7 @@ class Trader:
                 **result.timing,
             },
         )
-        picks = allowed_in_order(reviews, candidates, free_slots)
+        picks = allowed_in_order(reviews, candidates, self._ranking_limit(candidates, free_slots))
         counts = {name: sum(r["decision"] == name for r in reviews) for name in ("ALLOW", "VETO", "DEFER")}
         top = next((r for r in reviews if picks and r["id"] == picks[0]), None)
         return brain.Decision(
@@ -2076,7 +2091,7 @@ class Trader:
         return self._reviews.get(candidate.id)
 
     async def try_enter(self, candidate: Routed, decision: brain.Decision) -> None:
-        blocked = self.entries_blocked()
+        blocked = self.entries_blocked(candidate.instrument)
         if blocked:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=blocked)
             return
@@ -2477,7 +2492,8 @@ class Trader:
             self.store.state.get("last_bar") != slot
             and now_ms - slot >= SCAN_AFTER_CLOSE_MS
             and self.slot_limit() - len(trades) > 0
-            and not self.entries_blocked()
+            and not self._account_entry_block()
+            and not any(self._protection_block(t["symbol"]) for t in trades)
         )
         for trade in [] if scan_first else list(trades):
             symbol = trade["symbol"]
@@ -2520,7 +2536,7 @@ class Trader:
                 raise
         if failure is not None:
             raise failure
-        if self.entries_blocked():
+        if self._account_entry_block():
             return
         free = self.slot_limit() - len(trades)
         if free <= 0:
@@ -2553,8 +2569,8 @@ class Trader:
             f"Решение ({decision.source}): {decision.action} {', '.join(decision.picks)} "
             f"— {decision.reason[:200]}"
         )
-        for candidate_id in decision.picks[:free]:
-            if self.entries_blocked() or len(self.trades()) >= self.slot_limit():
+        for candidate_id in decision.picks:
+            if self._account_entry_block() or len(self.trades()) >= self.slot_limit():
                 break
             await self.try_enter(next(c for c in eligible if c.id == candidate_id), decision)
 
