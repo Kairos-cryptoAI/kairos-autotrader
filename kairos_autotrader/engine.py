@@ -1319,6 +1319,7 @@ class Trader:
         state["mode"] = self.broker.mode
         self.store.publish_close(recovering=True)
         trades = self.trades()
+        pilot_baseline = None
         if isinstance(self.broker, LiveBroker):
             if self.config.executor == "execution_engine":
                 raise ConfigError("single-trade sessions are retired; configure execution_portfolio")
@@ -1328,34 +1329,39 @@ class Trader:
                 state.pop("execution_session")
                 self.store.save()
             await self._reconcile_portfolio(trades)
+            status = self.broker.pilot_status()
+            pilot_baseline = status["baseline"] if status else None
         if new_session and self.broker.mode == "paper":
             state.pop("session", None)
             state.pop("halted", None)
-        if new_session and "session" in state:
-            state["session"]["reporting_started_at"] = datetime.now(UTC).isoformat()
+        if new_session or "session" not in state:
+            equity = await self.broker.equity()
+            if "session" in state:
+                state["session"]["reporting_started_at"] = datetime.now(UTC).isoformat()
+            else:
+                state["session"] = {
+                    "start_equity": str(equity),
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "realized_usd": "0",
+                }
             self.store.journal(
                 "session_start",
+                equity=str(equity),
                 mode=self.broker.mode,
-                equity=str(await self.broker.equity()),
-                risk_start_equity=state["session"]["start_equity"],
                 config=asdict(self.config),
-            )
-        if "session" not in state:
-            equity = await self.broker.equity()
-            state["session"] = {
-                "start_equity": str(equity),
-                "started_at": datetime.now(UTC).isoformat(),
-                "realized_usd": "0",
-            }
-            self.store.journal(
-                "session_start", equity=str(equity), mode=self.broker.mode, config=asdict(self.config)
+                **({"risk_start_equity": pilot_baseline} if isinstance(self.broker, LiveBroker) else {}),
             )
         self.store.save()
         await self.warm_history()
-        say(
-            f"Режим: {self.broker.mode}. Стартовый баланс сессии: {state['session']['start_equity']} USDT. "
-            f"Позиций одновременно: до {self.slot_limit()}."
-        )
+        if isinstance(self.broker, LiveBroker):
+            opening = (
+                f"Начальный баланс пилота {pilot_baseline} USDT"
+                if pilot_baseline is not None
+                else ("Начальный баланс пилота пока не подтверждён")
+            )
+        else:
+            opening = f"Стартовый баланс сессии: {state['session']['start_equity']} USDT"
+        say(f"Режим: {self.broker.mode}. {opening}. Позиций одновременно: до {self.slot_limit()}.")
         for trade in self.trades():
             say(
                 f"Веду открытую позицию: {trade['symbol']} {trade['side']} {trade['quantity']} "

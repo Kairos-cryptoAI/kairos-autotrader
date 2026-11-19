@@ -552,13 +552,24 @@ def test_two_flat_snapshots_archive_a_legacy_trade_without_guessing_its_pnl(tmp_
     assert not venue.market_bodies and not venue.close_bodies
 
 
-def test_new_live_session_preserves_the_budget_halt_and_open_records(tmp_path):
+def test_new_live_session_preserves_the_budget_halt_and_open_records(tmp_path, capsys):
     trader = live_trader(tmp_path, FakeVenue())
+    trader.broker.baseline = Decimal("104.20")
     asyncio.run(trader.start())
     before = dict(trader.store.state["session"])
+    assert before["start_equity"] != "104.20"
+    assert "Начальный баланс пилота 104.20 USDT" in capsys.readouterr().out
     trader.store.state["halted"] = "earlier loss"
     trader.store.state["round_trips"] = 2
+    asyncio.run(trader.start())
+    assert "Начальный баланс пилота 104.20 USDT" in capsys.readouterr().out
     asyncio.run(trader.start(new_session=True))
+    assert "Начальный баланс пилота 104.20 USDT" in capsys.readouterr().out
+    starts = [row for row in journal_of(trader) if row["event"] == "session_start"]
+    assert len(starts) == 2
+    assert all(
+        row["risk_start_equity"] == "104.20" and row["equity"] == before["start_equity"] for row in starts
+    )
     assert trader.store.state["session"]["start_equity"] == before["start_equity"]
     assert trader.store.state["session"]["started_at"] == before["started_at"]
     assert trader.store.state["round_trips"] == 2 and trader.store.state["halted"] == "earlier loss"
