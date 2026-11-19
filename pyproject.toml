@@ -32,7 +32,7 @@ required-version = "==0.12.3"
 
 [tool.uv.sources]
 kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
-kairos-execution-engine = { git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git", rev = "3c2d6dbcef66bae861c1c1f41466b3a44296792e" }
+kairos-execution-engine = { git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git", rev = "b2b8def43fd32832e89f87af336e77813f5baf16" }
 
 [project.scripts]
 kairos-autotrader = "kairos_autotrader.__main__:main"
