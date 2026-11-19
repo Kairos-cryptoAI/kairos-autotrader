@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from .sibling import SiblingError, git_revision, run_worker, sibling_checkout, sibling_python
 from .signals import Routed
+from .worker_session import WorkerSession
 
 WORKER = Path(__file__).with_name("aggregator_worker.py")
 # The ceiling kairos-llm registers for OpenAI; a runner budget may be lower, never higher.
@@ -77,6 +78,15 @@ def _run_worker(config: AggregatorConfig, request: dict[str, Any]) -> dict[str, 
         raise AggregatorError(f"Aggregator: {exc}") from exc
 
 
+class AggregatorSession(WorkerSession):
+    """Reuse the interpreter. Every request still owns its context, model gateway and budget."""
+
+    def __init__(self, config: AggregatorConfig) -> None:
+        super().__init__(
+            config.python, WORKER, [str(config.source), str(config.llm_source)], timeout_s=config.timeout_s
+        )
+
+
 def _record(candidate: Routed, review: CandidateReviewV1, context: dict[str, Any] | None) -> dict[str, Any]:
     """The compact journal form of one review; the contract itself is several megabytes."""
     provenance = review.model_provenance
@@ -113,6 +123,7 @@ class Reviews:
     ingest_problems: list[str]
     # The validated CandidateReviewV1 per intent id; the Risk Manager decides on it.
     contracts: dict[str, CandidateReviewV1] = field(default_factory=dict)
+    timing: dict[str, Any] = field(default_factory=dict)
 
 
 async def review_candidates(
@@ -127,6 +138,7 @@ async def review_candidates(
     ledger: Path,
     monthly_budget_usd: float,
     runner=None,
+    session: AggregatorSession | None = None,
 ) -> Reviews:
     """One Aggregator review per candidate. Raises ``AggregatorError`` only if the worker fails.
 
@@ -152,7 +164,14 @@ async def review_candidates(
             "monthly_budget_microusd": int(round(monthly_budget_usd * 1_000_000)),
         },
     }
-    answer = await asyncio.to_thread(runner or _run_worker, config, request)
+    try:
+        answer = (
+            await session.ask(request)
+            if session
+            else await asyncio.to_thread(runner or _run_worker, config, request)
+        )
+    except SiblingError as exc:
+        raise AggregatorError(f"Aggregator: {exc}") from exc
     rows = answer.get("reviews")
     by_id = {candidate.id: candidate for candidate in candidates}
     if not isinstance(rows, list) or sorted(str(r.get("intent_id")) for r in rows) != sorted(by_id):
@@ -161,14 +180,27 @@ async def review_candidates(
     for row in rows:
         candidate = by_id[str(row["intent_id"])]
         try:
-            review = CandidateReviewV1.model_validate(row["review"])
+            raw = row["review"]
+            if session is not None:
+                if row.get("route_id") != candidate.route.route_id or "route" in raw or "intent" in raw:
+                    raise AggregatorError("Aggregator reply references a different route")
+                # The worker verified both identities before returning this compact reply.
+                raw = {**raw, "route": candidate.route, "intent": candidate.intent}
+            review = CandidateReviewV1.model_validate(raw)
         except (ValidationError, KeyError, TypeError) as exc:
             raise AggregatorError(f"bad review for {candidate.instrument}: {type(exc).__name__}") from exc
         if review.route.route_id != candidate.route.route_id or review.intent.intent_id != candidate.id:
             raise AggregatorError("a review belongs to another route than the one that was sent")
-        records.append(_record(candidate, review, row.get("context")))
+        record = _record(candidate, review, row.get("context"))
+        record["context_capture_at_ms"] = row.get("context_capture_at_ms")
+        records.append(record)
         contracts[candidate.id] = review
-    return Reviews(records, [str(problem) for problem in answer.get("ingest_problems", [])], contracts)
+    return Reviews(
+        records,
+        [str(problem) for problem in answer.get("ingest_problems", [])],
+        contracts,
+        answer.get("timing", {}),
+    )
 
 
 def allowed_in_order(reviews: list[dict[str, Any]], candidates: list[Routed], max_picks: int) -> list[str]:

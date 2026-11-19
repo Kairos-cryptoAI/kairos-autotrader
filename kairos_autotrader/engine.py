@@ -33,6 +33,7 @@ from .aggregator_review import (
     OPENAI_MONTHLY_CEILING_USD,
     AggregatorConfig,
     AggregatorError,
+    AggregatorSession,
     allowed_in_order,
     review_candidates,
     revisions,
@@ -72,6 +73,7 @@ from .risk import (
     risk_revisions,
 )
 from .routing import MAX_REVIEW_TIMEOUT_MS, RouterConfig, RouterError, route_intents, router_revision
+from .sibling import SiblingError
 from .signals import SIGNAL_VENUE, Features, Routed, held_outcome, outcome, signal_symbol
 from .system_engine import (
     HOURLY_TREND_HISTORY_MS,
@@ -783,6 +785,8 @@ class Trader:
         self._warm_task: asyncio.Task | None = None
         self._adaptive_task: asyncio.Task | None = None
         self.aggregator: AggregatorConfig | None = None
+        self._aggregator_session: AggregatorSession | None = None
+        self._aggregator_warm_task: asyncio.Task | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
             try:
@@ -1859,6 +1863,7 @@ class Trader:
                 openai_key=self.openai_key,
                 ledger=self.store.directory / "llm-budget.json",
                 monthly_budget_usd=self.config.review_budget_usd,
+                session=self._aggregator_session,
             )
         except (TimeoutError, AggregatorError, OSError) as exc:
             self.store.journal("aggregator_error", kind=type(exc).__name__, message=str(exc)[:300])
@@ -1881,6 +1886,7 @@ class Trader:
             timing={
                 "start_after_close_s": started_after_close_s,
                 "done_after_close_s": round((time.time() * 1000 - boundary) / 1000, 2),
+                **result.timing,
             },
         )
         picks = allowed_in_order(reviews, candidates, free_slots)
@@ -2369,6 +2375,11 @@ class Trader:
     ) -> None:
         news_task = None
         try:
+            if self.aggregator is not None and self.openai_key:
+                self._aggregator_session = AggregatorSession(self.aggregator)
+                self._aggregator_warm_task = asyncio.create_task(
+                    self._warm_aggregator(self._aggregator_session)
+                )
             await self.start(new_session=new_session, resume_reconciled=resume_reconciled)
             if self.news is not None and max_steps is None:
                 news_task = asyncio.create_task(self._news_loop())
@@ -2380,9 +2391,24 @@ class Trader:
                     await news_task
             await self.stop_engine_workers()
 
+    async def _warm_aggregator(self, session: AggregatorSession) -> None:
+        started = time.monotonic()
+        try:
+            await session.warm()
+        except SiblingError as exc:
+            self.store.journal("aggregator_warm_error", message=str(exc)[:300])
+            return
+        self.store.journal("aggregator_warm", seconds=round(time.monotonic() - started, 3))
+
     async def stop_engine_workers(self) -> None:
         """End the background engine work and the persistent workers before the loop closes."""
-        for task in (self._warm_task, self._adaptive_task, self._market_task, self._macro_task):
+        for task in (
+            self._warm_task,
+            self._adaptive_task,
+            self._market_task,
+            self._macro_task,
+            self._aggregator_warm_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, EngineError):
@@ -2392,6 +2418,8 @@ class Trader:
                 await pool.stop()
         if self.risk_session is not None:
             await self.risk_session.stop()
+        if self._aggregator_session is not None:
+            await self._aggregator_session.stop()
 
     def _heartbeat(self, started_at: str) -> None:
         """Replace ``heartbeat.json`` on every loop for the single-host alert monitor.

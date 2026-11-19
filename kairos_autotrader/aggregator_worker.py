@@ -196,17 +196,20 @@ def _summary(context) -> dict:
     }
 
 
-async def review(request: dict) -> dict:
+async def review(request: dict, *, compact: bool = False) -> dict:
     from kairos_aggregator.candidate_review import CandidateReviewBrain, deterministic_defer
     from kairos_aggregator.config import AggregatorSettings
     from kairos_aggregator.decision_context import CandidateContextStore
     from kairos_core.contracts import CandidateRouteV1
     from kairos_llm import BudgetedLLMGateway, LLMGateway, LLMSettings, Provider
 
+    started = time.monotonic()
     routes = [CandidateRouteV1.model_validate(raw) for raw in request["routes"]]
+    validated = time.monotonic()
     settings = AggregatorSettings(_env_file=None, bus_backend="memory", trading_symbols=request["symbols"])
     store = CandidateContextStore(settings)
     problems = _ingest(store, request)
+    ingested = time.monotonic()
 
     llm = request["llm"]
     deadline = min(route.review_deadline_ms for route in routes)
@@ -229,6 +232,7 @@ async def review(request: dict) -> dict:
         },
     )
     brain = CandidateReviewBrain(gateway, source=settings.service_name, clock_ms=_now_ms)
+    ready = time.monotonic()
 
     async def one(route):
         cut = _now_ms()
@@ -242,44 +246,67 @@ async def review(request: dict) -> dict:
                 reason_code="DECISION_CONTEXT_INVALID",
                 source=settings.service_name,
             )
-            return result, None
-        return await brain.review_with_context(route, context), _summary(context)
+            return result, None, cut
+        return await brain.review_with_context(route, context), _summary(context), cut
 
     try:
         results = await asyncio.gather(*(one(route) for route in routes))
     finally:
         await gateway.close()
     reviews = []
-    for route, (result, context) in zip(routes, results, strict=True):
-        if result.intent.intent_id != route.intent.intent_id:
-            raise ValueError("a review carries another intent than its route")
+    for route, (result, context, cut) in zip(routes, results, strict=True):
+        if result.intent != route.intent or result.route != route:
+            raise ValueError("a review carries another route than the one that was sent")
         reviews.append(
             {
                 "intent_id": route.intent.intent_id,
-                "review": result.model_dump(mode="json"),
+                "route_id": route.route_id,
+                # The caller holds the exact route and intent verified above.
+                "review": result.model_dump(mode="json", exclude={"route", "intent"} if compact else None),
                 "context": context,
+                "context_capture_at_ms": cut,
             }
         )
-    return {"reviews": reviews, "ingest_problems": problems}
+    return {
+        "reviews": reviews,
+        "ingest_problems": problems,
+        "timing": {
+            "validate_ms": round((validated - started) * 1000),
+            "ingest_ms": round((ingested - validated) * 1000),
+            "gateway_init_ms": round((ready - ingested) * 1000),
+            "review_ms": round((time.monotonic() - ready) * 1000),
+        },
+    }
 
 
 def main() -> int:
+    from worker_session import serve_requests
+
     # argv[1] replaces this script's own directory on the import path, so nothing from the
     # runner package can shadow Aggregator imports.
     sys.path[0] = sys.argv[1]
     if len(sys.argv) > 2:
         sys.path.insert(1, sys.argv[2])  # the kairos-llm checkout, ahead of the installed copy
-    request = json.load(sys.stdin)
+    if "--serve" in sys.argv[3:]:
+        # Load libraries before advertising readiness. No key or provider call is needed.
+        import kairos_llm  # noqa: F401
+        from kairos_aggregator import candidate_review, config, decision_context  # noqa: F401
+
+        return serve_requests(lambda request: _handle(request, compact=True))
+    result = _handle(json.load(sys.stdin), compact=False)
+    sys.stdout.write("\n" + MARKER + json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _handle(request: dict, *, compact: bool) -> dict:
     secret = str((request.get("llm") or {}).get("openai_api_key") or "")
     try:
         if request.get("op") != "review":
             raise ValueError(f"unknown operation {request.get('op')!r}")
-        result = asyncio.run(review(request))
+        return asyncio.run(review(request, compact=compact))
     except Exception as exc:  # noqa: BLE001 - reported to the caller as data
         message = f"{type(exc).__name__}: {str(exc)[:400]}"
-        result = {"error": message.replace(secret, "[key]") if secret else message}
-    sys.stdout.write("\n" + MARKER + json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
-    return 0
+        return {"error": message.replace(secret, "[key]") if secret else message}
 
 
 if __name__ == "__main__":
