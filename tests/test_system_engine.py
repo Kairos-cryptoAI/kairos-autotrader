@@ -212,7 +212,8 @@ def test_shadow_records_each_new_intent_once_and_refuses_a_trading_directory(tmp
     args = shadow_args(tmp_path)
     assert asyncio.run(system_cli.cmd_shadow(args)) == 0
     assert asyncio.run(system_cli.cmd_shadow(args)) == 0
-    records = [json.loads(line) for line in (args.runtime_dir / "journal.jsonl").read_text().splitlines()]
+    journal = (args.runtime_dir / "journal.jsonl").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in journal.splitlines()]
     scans = [r for r in records if r["event"] == "scan"]
     assert (
         len(scans) == 1
@@ -220,7 +221,7 @@ def test_shadow_records_each_new_intent_once_and_refuses_a_trading_directory(tmp
         and scans[0]["engine_revision"] == "rev-test"
     )
     assert scans[0]["candidates"] == offered, "the report reads the record as it was written"
-    state = json.loads((args.runtime_dir / "state.json").read_text())
+    state = json.loads((args.runtime_dir / "state.json").read_text(encoding="utf-8"))
     assert state["mode"] == "engine-shadow" and list(state["seen"]) == [offered[0]["id"]]
 
     live = tmp_path / "live"

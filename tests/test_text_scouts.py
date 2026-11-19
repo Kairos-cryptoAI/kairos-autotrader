@@ -249,7 +249,8 @@ def test_news_failure_never_reaches_the_trading_loop(tmp_path):
     trader.news = NewsDesk(store, TextScoutsConfig(), runner=failing)
     asyncio.run(trader.news_tick())
     events = [
-        json.loads(line)["event"] for line in (store.directory / "journal.jsonl").read_text().splitlines()
+        json.loads(line)["event"]
+        for line in (store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert events == ["news_error"]
     off = Trader(

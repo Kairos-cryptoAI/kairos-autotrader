@@ -495,7 +495,7 @@ def test_venue_exit_is_accounted_from_balance_and_leftovers_cancelled(tmp_path):
     assert sorted(venue.cancelled) == ["SOLUSD-t0", "SOLUSD-t1"] and not venue.close_bodies
     closed = [
         json.loads(line)
-        for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()
+        for line in (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
         if '"trade_closed"' in line
     ][0]
     assert closed["reason"] == "VENUE_EXIT" and Decimal(closed["pnl_usd"]) == Decimal("0.31")
@@ -771,7 +771,7 @@ def test_overlapping_live_trades_are_accounted_from_prices(tmp_path):
     asyncio.run(trader.manage(sol, now_ms()))
     closed = [
         json.loads(line)
-        for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()
+        for line in (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
         if '"trade_closed"' in line
     ][0]
     assert closed["pnl_exact"] is False and closed["exit_price"] == sol["take"]
@@ -1064,7 +1064,10 @@ def scanning_trader(tmp_path, feed: BarFeed, **config) -> Trader:
 
 
 def journal_of(trader) -> list[dict]:
-    return [json.loads(line) for line in (trader.store.directory / "journal.jsonl").read_text().splitlines()]
+    return [
+        json.loads(line)
+        for line in (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def test_scan_runs_binance_bars_through_the_engine_and_the_router(tmp_path, monkeypatch):

@@ -317,7 +317,9 @@ def test_an_entry_needs_a_review_and_the_risk_manager(tmp_path, monkeypatch):
     assert only(trader) is None and not venue.market_bodies
     assert (
         "the Aggregator has not reviewed"
-        in json.loads((trader.store.directory / "journal.jsonl").read_text().splitlines()[-1])["reason"]
+        in json.loads(
+            (trader.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+        )["reason"]
     )
 
     approve_entries(monkeypatch)

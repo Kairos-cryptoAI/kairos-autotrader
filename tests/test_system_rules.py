@@ -207,7 +207,7 @@ def test_macro_runs_once_a_day_and_again_after_a_shock_with_a_cooldown(tmp_path)
     assert refresh(desk, now + 25 * 3_600_000 + 2 * 3_600_000) is not None and len(calls) == 3, "next day"
     journal = [
         json.loads(line)["event"]
-        for line in (desk.store.directory / "journal.jsonl").read_text().splitlines()
+        for line in (desk.store.directory / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert journal.count("macro_allocation") == 3
 
