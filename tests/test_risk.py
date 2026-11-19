@@ -715,10 +715,14 @@ def test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_bey
     assert fraction < Decimal(raised["adaptive"]["per_trade_risk_fraction"]) <= Decimal("0.0025")
     assert "minimum lot" in raised["adaptive"]["reasons"][-1]
     assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
-    # A lot that would need more than the ceiling keeps the small size; the runner skips it.
+    # A subminimum approval cannot authorize an executable entry.
     huge = decide(adaptive_={"outcomes": []}, min_quantity=Decimal(repr(small["quantity"])) * 10)
-    assert huge["evaluation"]["decision"]["quantity"] == small["quantity"]
-    assert "ceiling" in huge["adaptive"]["minimum_lot"]
+    assert "evaluation" not in huge
+    assert huge["refused"] == huge["adaptive"]["minimum_lot"]
+    assert "ceiling" in huge["refused"]
+    fixed_size = decide(min_quantity=Decimal("100000"))
+    assert "evaluation" not in fixed_size
+    assert "below the venue's minimum lot" in fixed_size["refused"]
 
 
 def test_adaptive_risk_in_chop_sizes_and_levers_for_half_the_budget():
