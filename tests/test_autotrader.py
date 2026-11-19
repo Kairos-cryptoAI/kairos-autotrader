@@ -632,6 +632,7 @@ def test_explicit_resume_refuses_unverified_or_stopped_account(tmp_path, monkeyp
         monkeypatch.setattr(trader.broker, "foreign_exposure", unresolved)
     elif block == "stale":
         status = trader.broker.pilot_status()
+        status["observed_at"] = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
         monkeypatch.setattr(trader.broker, "pilot_status", lambda: status)
     with pytest.raises((ConfigError, NeedsOperator)):
         asyncio.run(trader.start(resume_reconciled=True))
