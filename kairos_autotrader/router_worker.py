@@ -8,8 +8,8 @@ repository's unchanged code:
 * ``CandidateRouterPolicy.build``: the ``CandidateRouteV1`` of one immutable intent, NORMAL
   or CONFLICT, with its review deadline and the exact evidence ids used.
 
-Text evidence is bucketed as ``RouterService`` does it: a topic that is one of the traded
-symbols is symbol-specific, everything else is market-wide, and symbol evidence wins when
+Text evidence is bucketed as ``RouterService`` does it: explicit pairs are symbol-specific,
+news topics are market-wide, and symbol evidence wins when
 there is any. The time checks of ``RouterService._candidate_rejection`` are restated below,
 because that method belongs to the bus service, whose pinned release refuses LIVE routing
 by configuration. Nothing here can change an intent.
@@ -110,7 +110,7 @@ def route(request: dict) -> dict:
     for signal in _sentiments(request.get("signals", [])):
         if window.has_message(signal.message_id):
             continue
-        bucket = signal.topic.strip().upper() if settings.symbol_allowed(signal.topic) else "*"
+        bucket = settings.sentiment_bucket(signal.topic)
         window.add_sentiment(
             bucket,
             message_id=signal.message_id,
