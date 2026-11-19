@@ -60,7 +60,7 @@ from .evedex import (
     floor_step,
 )
 from .execution_session import legacy_session_result
-from .management import Management, load_policy, managed_stop, partial_level, scale_in_status, tighter
+from .management import Management, load_policy, managed_stop, scale_in_status, tighter
 from .outcomes import recorded_closes
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
@@ -442,19 +442,35 @@ def management_step(
     best = max(best, float(touch)) if side == "LONG" else min(best, float(touch))
     trade["best_price"] = repr(best)
     part: Decimal | None = None
-    level = partial_level(policy, side, entry, initial)
-    if level is not None and not trade.get("partial_done") and instrument is not None:
-        reached = float(touch) >= level if side == "LONG" else float(touch) <= level
-        if reached:
-            quantity = dec(trade["quantity"])
+    targets = policy.targets()
+    if instrument is not None and targets and not trade.get("partial_done"):
+        initial_quantity = dec(trade.setdefault("initial_quantity", trade["quantity"]))
+        quantity = dec(trade["quantity"])
+        if quantity > initial_quantity:
+            raise NeedsOperator("managed position exceeds its original fill")
+        sign = 1 if side == "LONG" else -1
+        gain = sign * (touch - dec(trade["entry_price"]))
+        risk = abs(dec(trade["entry_price"]) - dec(trade.get("initial_stop", trade["stop"])))
+        fraction = sum(
+            (Decimal(str(t.fraction)) for t in targets if risk > 0 and gain >= Decimal(str(t.at_r)) * risk),
+            Decimal(0),
+        )
+        if fraction > 0:
+            # The reconciled remainder also covers a restart just after a confirmed fill.
             step = instrument.quantity_step
-            wanted = quantity * Decimal(repr(policy.partial_fraction))
-            part = (wanted / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if part < instrument.min_quantity or quantity - part < instrument.min_quantity:
+            cumulative = (initial_quantity * fraction / step).to_integral_value(rounding=ROUND_DOWN) * step
+            wanted = min(cumulative - (initial_quantity - quantity), quantity - instrument.min_quantity)
+            rounded = (wanted / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if rounded > 0 and rounded >= instrument.min_quantity:
+                part = rounded
+            elif len(targets) == 1 and initial_quantity == quantity:
                 trade["partial_done"] = "skipped: the position is not divisible into minimum lots"
-                part = None
     desired = managed_stop(policy, side, entry, initial, best)
-    if trade.get("partial_done") == "done" and policy.breakeven_at_r is not None:
+    if (
+        policy.partial_at_r is not None
+        and trade.get("partial_done") == "done"
+        and policy.breakeven_at_r is not None
+    ):
         desired = tighter(side, desired, entry)
     if instrument is None:
         return None, part
@@ -593,11 +609,16 @@ class PaperBroker:
         self._store.state["paper_equity"] = str(await self.equity() + pnl)
 
     async def move_stop(self, trade: dict[str, Any], stop: Decimal) -> bool:
+        current = dec(trade["stop"])
+        if stop <= current if trade["side"] == "LONG" else stop >= current:
+            raise ValueError("a stop may only move toward less risk")
         trade["stop"] = str(stop)
         return True
 
     async def partial_close(self, trade: dict[str, Any], book: Book, quantity: Decimal) -> Decimal | None:
         """Close part of the position at the book; returns the price."""
+        if not 0 < quantity < dec(trade["quantity"]):
+            return None
         entry = dec(trade["entry_price"])
         sign = 1 if trade["side"] == "LONG" else -1
         touch = book.bid if sign > 0 else book.ask
@@ -2115,7 +2136,7 @@ class Trader:
                     self.risk,
                     review=review,
                     allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
-                    # Read after the venue is measured, just before the decision.
+                    # Capture independent account and book observations concurrently.
                     account=self._account_evidence,
                     session=self.risk_session,
                     scope=scope,
@@ -2286,11 +2307,13 @@ class Trader:
         if part is not None:
             price = await self.broker.partial_close(trade, book, part)
             if price is not None:
-                trade["partial_done"] = "done"
+                if len(trade["management"].get("partial_targets", ())) <= 1:
+                    trade["partial_done"] = "done"
                 if self.broker.mode == "live":
                     # Partial fills remain price estimates until venue accounting is available.
                     partial = estimate_pnl({**trade, "quantity": str(part)}, price, self.fee)
                     trade["partial_pnl_usd"] = str(dec(trade.get("partial_pnl_usd", "0")) + partial)
+                self.store.save()
                 self.store.journal(
                     "partial_exit",
                     id=trade["id"],
