@@ -541,20 +541,24 @@ def _listen() -> dict:
 
 
 async def _serve_one(request: dict) -> dict:
-    """Measure the venue first, then ask for the account, so it is read just before deciding."""
+    """Read books and account concurrently after confirming the instrument is in scope."""
     signal_symbol = request["review"]["intent"]["symbol"]
     venue_symbol = venue_symbol_for(signal_symbol)
     if venue_symbol is None or venue_symbol not in set(request["scope"]["instruments"]):
         return {"refused": f"{signal_symbol} is outside Quant Scouts' approved PROD symbol map"}
-    venue = await _measure(
-        signal_symbol,
-        venue_symbol,
-        taker_fee_bps=float(request["venue"]["taker_fee_bps"]),
-        assessed=float(request["venue"]["assessed_notional_usd"]),
-    )
     _say({"need_account": True})
-    request = {**request, "account": _listen()["account"]}
-    return decide(request, venue)
+    try:
+        venue = await _measure(
+            signal_symbol,
+            venue_symbol,
+            taker_fee_bps=float(request["venue"]["taker_fee_bps"]),
+            assessed=float(request["venue"]["assessed_notional_usd"]),
+        )
+    finally:
+        # Consume the matching reply even when the public book request fails. Otherwise it
+        # would be mistaken for the next candidate on this persistent connection.
+        account = _listen()["account"]
+    return decide({**request, "account": account}, venue)
 
 
 def serve() -> int:

@@ -94,9 +94,9 @@ def _run_worker(config: RiskConfig, request: dict[str, Any]) -> dict[str, Any]:
 class RiskSession:
     """One persistent Risk worker (``risk_worker.py --serve``) shared by every entry.
 
-    The worker keeps Quant Scouts and the Risk Manager loaded. For each entry it measures
-    the venue and only then asks for the account, which the runner reads at that moment:
-    the account evidence reaches the decision well inside its five-second freshness.
+    The worker keeps Quant Scouts and the Risk Manager loaded. For each eligible candidate
+    it asks for the account while it measures the venue. Both sources retain their own
+    capture times and the evaluator checks their age when deciding.
     Any failure kills the worker; the next entry starts a fresh one.
     """
 
@@ -170,6 +170,10 @@ class RiskSession:
                 if isinstance(exc, RiskError):
                     raise
                 raise RiskError(f"Risk Manager: {type(exc).__name__}: {str(exc)[:200]}") from exc
+            except (Exception, asyncio.CancelledError):
+                # A failed/cancelled account callback leaves the worker waiting for its reply.
+                await self.stop()
+                raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,8 +252,8 @@ async def evaluate_entry(
 ) -> RiskOutcome:
     """The Risk Manager's decision on one reviewed candidate. Raises ``RiskError`` if it cannot answer.
 
-    With a ``session`` and an ``account`` reader, the account is read after the venue is
-    measured, just before the decision.
+    With a ``session`` and an ``account`` reader, the account is read alongside the venue
+    measurements for this candidate.
     """
     request: dict[str, Any] = {
         "review": review.model_dump(mode="json"),

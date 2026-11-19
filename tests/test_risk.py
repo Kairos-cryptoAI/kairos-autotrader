@@ -222,6 +222,7 @@ def decide(
         input=json.dumps(
             {
                 "request": request,
+                "sampled_at_ms": int(time.time() * 1000),
                 "books": books_ or books(),
                 "refusal_only": refusal_only,
                 "exchange_clock_lead_ms": exchange_clock_lead_ms,
@@ -613,7 +614,60 @@ def _fake_session(tmp_path, monkeypatch, timeout_s=10.0):
     return risk_module.RiskSession(config)
 
 
-def test_risk_session_reads_the_account_after_the_venue_and_reuses_one_process(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_book", [False, True])
+async def test_worker_requests_account_before_book_io_and_consumes_its_reply(monkeypatch, failed_book):
+    from kairos_autotrader import risk_worker
+
+    events = []
+    monkeypatch.setattr(risk_worker, "venue_symbol_for", lambda _: "SOLUSD")
+    monkeypatch.setattr(risk_worker, "_say", lambda message: events.append(message))
+
+    async def measure(*args, **kwargs):
+        assert events == [{"need_account": True}]
+        events.append("books")
+        if failed_book:
+            raise TimeoutError("public book")
+        return "fresh books"
+
+    def read_account():
+        events.append("account reply")
+        return {"account": {"captured_at_ms": 123}}
+
+    monkeypatch.setattr(risk_worker, "_measure", measure)
+    monkeypatch.setattr(risk_worker, "_listen", read_account)
+    monkeypatch.setattr(risk_worker, "decide", lambda req, venue: (req["account"], venue))
+    request = {
+        "review": {"intent": {"symbol": "SOLUSDT"}},
+        "scope": {"instruments": ["SOLUSD"]},
+        "venue": {"taker_fee_bps": 4.5, "assessed_notional_usd": 25.0},
+    }
+    if failed_book:
+        with pytest.raises(TimeoutError, match="public book"):
+            await risk_worker._serve_one(request)
+    else:
+        assert await risk_worker._serve_one(request) == ({"captured_at_ms": 123}, "fresh books")
+    assert events == [{"need_account": True}, "books", "account reply"]
+
+
+async def test_failed_account_reader_discards_the_worker_and_its_unanswered_request(tmp_path, monkeypatch):
+    session = _fake_session(tmp_path, monkeypatch)
+
+    async def broken_account():
+        raise RuntimeError("account unavailable")
+
+    async def recovered_account():
+        return {"captured_at_ms": 123}
+
+    try:
+        with pytest.raises(RuntimeError, match="account unavailable"):
+            await session.ask({"review": 1}, broken_account)
+        assert session._process is None
+        assert (await session.ask({"review": 2}, recovered_account))["echo"] == {"captured_at_ms": 123}
+    finally:
+        await session.stop()
+
+
+def test_risk_session_reads_the_account_on_request_and_reuses_one_process(tmp_path, monkeypatch):
     import asyncio
 
     session = _fake_session(tmp_path, monkeypatch)
@@ -633,7 +687,7 @@ def test_risk_session_reads_the_account_after_the_venue_and_reuses_one_process(t
 
     first, second = asyncio.run(scenario())
     assert first["echo"] == {"captured_at_ms": 1} and second["echo"] == {"captured_at_ms": 2}
-    assert "account" not in first["request_keys"], "the account is never sent before the venue is measured"
+    assert "account" not in first["request_keys"], "the account is read only for eligible candidates"
     assert first["pid"] == second["pid"], "one worker serves every entry"
 
 
