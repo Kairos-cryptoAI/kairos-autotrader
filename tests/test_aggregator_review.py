@@ -24,6 +24,7 @@ from kairos_autotrader import brain, engine, signals
 from kairos_autotrader.aggregator_review import (
     AggregatorConfig,
     AggregatorError,
+    AggregatorSession,
     Reviews,
     allowed_in_order,
     review_candidates,
@@ -286,6 +287,41 @@ def test_real_review_runs_the_aggregator_brain_through_the_budgeted_gateway(tmp_
     spent = json.loads(ledger.read_text())
     entries = [entry for month in spent.values() for entry in month["openai"].values()]
     assert len(entries) == 2 and all(0 < e["actual"] <= e["reserved"] for e in entries)
+
+
+async def test_real_preloaded_worker_keeps_exact_contracts_and_isolates_requests(tmp_path):
+    with Provider() as provider:
+        config = real_config(provider)
+        worker = AggregatorSession(config)
+        try:
+            await worker.warm()
+            decision = recent_decision()
+            picked, bars = review_case("SOLUSD", decision, declared=30_240)
+            inputs = dict(
+                candidates=[picked],
+                closed_bars={"SOLUSDT": bars},
+                signals=[],
+                macro=None,
+                openai_key=TEST_KEY,
+                ledger=tmp_path / "budget.json",
+                monthly_budget_usd=12.0,
+                session=worker,
+            )
+            allowed, missing = await asyncio.gather(
+                review_candidates(
+                    config, market={"SOLUSDT": snapshot("SOLUSDT", decision - 20_000)}, **inputs
+                ),
+                review_candidates(config, market={}, **inputs),
+            )
+            contract = allowed.contracts[picked.id]
+            assert contract.decision.value == "ALLOW"
+            assert contract.route == picked.route and contract.intent == picked.intent
+            assert allowed.records[0]["context_capture_at_ms"] <= picked.route.review_deadline_ms
+            assert missing.records[0]["decision"] == "DEFER"
+            assert len(provider.requests) == 1
+            assert "openai" in next(iter(json.loads(inputs["ledger"].read_text()).values()))
+        finally:
+            await worker.stop()
 
 
 def test_real_review_defers_without_market_evidence_or_budget_and_never_calls_the_model(tmp_path):
