@@ -85,6 +85,9 @@ A `STOP` file in the runtime directory stops new entries and lets the runner man
 open positions to exit. A `CLOSE` file requests immediate closure of owned positions.
 The signed deadline stops new entries while open trades continue to settlement.
 The runner exits after a fresh observation confirms a flat account and a settled journal.
+With the runner stopped and its `STOP` file present, `reconcile-stopped` can clear
+a resolved ownership mismatch after verifying the account, orders and pilot journal.
+It takes the same runtime, configuration and credential arguments as the live runner.
 `--new-session` starts a new reporting period and preserves live loss controls.
 The historical `runner` executor name selects the portfolio broker. Configuration
 for the retired `execution_engine` single-trade path is supported by the report.

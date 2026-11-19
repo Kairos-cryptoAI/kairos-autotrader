@@ -1430,6 +1430,22 @@ def test_exact_old_position_latch_requires_explicit_proven_flat_resume(tmp_path)
     assert trader.entries_blocked() is None
 
 
+def test_verify_legacy_halt_while_stopped_never_enters_the_trading_loop(tmp_path):
+    from kairos_autotrader.engine import MANUAL_CHECK_PREFIX, POSITION_MISMATCH
+
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    trader.halt(MANUAL_CHECK_PREFIX + POSITION_MISMATCH)
+    with pytest.raises(NeedsOperator):
+        asyncio.run(trader.reconcile_while_stopped())
+    (trader.store.directory / "STOP").touch()
+    asyncio.run(trader.reconcile_while_stopped())
+    assert trader.entries_blocked() == "stop file present"
+    assert "halted" not in trader.store.state
+    assert not venue.market_bodies and not venue.close_bodies
+
+
 def test_unqualified_native_protection_blocks_live_entries_but_keeps_management(tmp_path, monkeypatch):
     reason = "native triggers can increase an existing position"
     venue = FakeVenue()

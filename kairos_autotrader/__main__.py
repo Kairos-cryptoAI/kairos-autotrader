@@ -287,6 +287,20 @@ async def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_reconcile_stopped(args: argparse.Namespace) -> int:
+    if not (args.runtime_dir / "STOP").is_file():
+        raise ConfigError("stopped reconciliation requires the operator STOP file")
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        trader = await build_trader(args, session, "live")
+        try:
+            await trader.reconcile_while_stopped()
+        finally:
+            if isinstance(trader.broker, LiveBroker):
+                trader.broker.release()
+    say("Биржевой счёт и журнал сверены. Торговля остановлена.")
+    return 0
+
+
 async def cmd_scan(args: argparse.Namespace) -> int:
     async with aiohttp.ClientSession(trust_env=True) as session:
         args.runtime_dir = args.runtime_dir or Path(tempfile.mkdtemp(prefix="kairos-scan-"))
@@ -658,6 +672,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--max-steps", type=int, help=argparse.SUPPRESS)
     add_secret_args(run)
 
+    reconcile = sub.add_parser("reconcile-stopped", help="reconcile a flat live account while STOP is held")
+    reconcile.add_argument("--runtime-dir", type=Path, required=True)
+    reconcile.add_argument("--config", type=Path, required=True)
+    add_secret_args(reconcile)
+
     report = sub.add_parser("report", help="summary of the journal")
     report.add_argument("--runtime-dir", type=Path, required=True)
     report.add_argument("--outcomes", action="store_true", help="also evaluate every signal on later candles")
@@ -669,9 +688,14 @@ def main(argv: list[str] | None = None) -> int:
     extra = system_cli.add_parsers(sub)
 
     args = parser.parse_args(argv)
-    command = {"check": cmd_check, "scan": cmd_scan, "run": cmd_run, "report": cmd_report, **extra}[
-        args.command
-    ]
+    command = {
+        "check": cmd_check,
+        "scan": cmd_scan,
+        "run": cmd_run,
+        "report": cmd_report,
+        "reconcile-stopped": cmd_reconcile_stopped,
+        **extra,
+    }[args.command]
     try:
         return asyncio.run(command(args))
     except KeyboardInterrupt:

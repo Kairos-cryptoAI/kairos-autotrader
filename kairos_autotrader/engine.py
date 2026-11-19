@@ -1467,7 +1467,14 @@ class Trader:
                 "Состояние печатается раз в 10 минут."
             )
 
-    async def _resume_reconciled(self, broker: LiveBroker, trades: list[dict[str, Any]]) -> None:
+    async def reconcile_while_stopped(self) -> None:
+        if not isinstance(self.broker, LiveBroker) or self.store.state.get("mode") != "live":
+            raise ConfigError("stopped reconciliation requires an existing live portfolio")
+        await self._resume_reconciled(self.broker, self.trades(), while_stopped=True)
+
+    async def _resume_reconciled(
+        self, broker: LiveBroker, trades: list[dict[str, Any]], *, while_stopped: bool = False
+    ) -> None:
         state = self.store.state
         halt = state.get("halted")
         eligible = state.get("entry_reconciliation_halt")
@@ -1483,8 +1490,8 @@ class Trader:
             raise ConfigError("no execution-reconciliation halt to resume")
         if trades or state.get("pending_entry") or state.get("execution_session"):
             raise NeedsOperator("runner still has an open or pending trade")
-        if self.store.flag("STOP") or self.store.flag("CLOSE"):
-            raise NeedsOperator("operator stop is active")
+        if self.store.flag("STOP") != while_stopped or self.store.flag("CLOSE"):
+            raise NeedsOperator("operator stop state does not match the requested reconciliation")
         if any(await asyncio.gather(self.api.positions(), self.api.open_orders(), self.api.active_tpsl())):
             raise NeedsOperator("venue still has a position or an open order or protection")
 
@@ -1502,11 +1509,16 @@ class Trader:
             <= datetime.fromisoformat(status["observed_at"])
             <= now
             or now >= broker.entry_deadline_utc
-            or self.store.flag("STOP")
+            or self.store.flag("STOP") != while_stopped
             or self.store.flag("CLOSE")
         ):
             raise NeedsOperator("a fresh flat account with an active pilot mandate is required")
-        self.store.journal("entry_halt_reconciled", reason=halt, observed_at=status["observed_at"])
+        self.store.journal(
+            "entry_halt_reconciled",
+            reason=halt,
+            observed_at=status["observed_at"],
+            while_stopped=while_stopped,
+        )
         state.pop("halted")
         state.pop("entry_reconciliation_halt", None)
         self.store.save()
