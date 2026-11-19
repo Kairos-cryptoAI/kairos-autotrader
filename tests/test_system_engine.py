@@ -660,12 +660,13 @@ for line in sys.stdin:
 
 def test_engine_pool_keeps_each_worker_and_restarts_a_failed_one(tmp_path, monkeypatch):
     import sys
+    from dataclasses import replace
 
     script = tmp_path / "worker.py"
     script.write_text(FAKE_SERVE_WORKER, encoding="utf-8")
     monkeypatch.setattr(system_engine, "WORKER", script)
     pool = system_engine.EnginePool(
-        EngineConfig(python=Path(sys.executable), source=tmp_path, timeout_s=5), 2
+        EngineConfig(python=Path(sys.executable), source=tmp_path, timeout_s=30), 2
     )
 
     async def run():
@@ -677,8 +678,11 @@ def test_engine_pool_keeps_each_worker_and_restarts_a_failed_one(tmp_path, monke
             with pytest.raises(EngineError, match="exited"):
                 await pool.ask(0, {"op": "die"})
             assert await pool.ask(0, {"op": "e"}) == {"count": 1, "op": "e"}  # a fresh one
-            with pytest.raises(EngineError, match="TimeoutError"):
-                await pool.ask(1, {"op": "hang"})
+            # Apply the short deadline to the deliberate hang on the already running worker.
+            with monkeypatch.context() as fault:
+                fault.setattr(pool, "config", replace(pool.config, timeout_s=0.5))
+                with pytest.raises(EngineError, match="TimeoutError"):
+                    await pool.ask(1, {"op": "hang"})
             assert await pool.ask(1, {"op": "f"}) == {"count": 1, "op": "f"}
         finally:
             await pool.stop()
