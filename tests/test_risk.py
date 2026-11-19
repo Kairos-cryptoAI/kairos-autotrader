@@ -148,15 +148,17 @@ def lineage(symbol="XRPUSD") -> dict:
     }
 
 
-def test_verifier_keeps_approved_leverage_and_counts_each_open_loss():
-    from kairos_autotrader.risk_worker import RunnerAccountVerifier
+def test_verifier_keeps_approved_leverage_and_counts_each_open_loss(monkeypatch):
+    from kairos_autotrader import risk_worker
 
     winner, loser = lineage(), lineage("SOLUSD")
     loser["mark_price"] = 1.08
     loser["trade"]["risk_trade_id"] = "d" * 64
     loser["trade"]["leverage"] = 3
-    verified = RunnerAccountVerifier(LIVE_ACCOUNT_SOURCE).verify(
-        account(positions=[winner, loser], daily_realized_pnl_usd=-0.5),
+    snapshot = account(positions=[winner, loser], daily_realized_pnl_usd=-0.5)
+    monkeypatch.setattr(risk_worker, "_now_ms", lambda: snapshot["captured_at_ms"])
+    verified = risk_worker.RunnerAccountVerifier(LIVE_ACCOUNT_SOURCE).verify(
+        snapshot,
         source_id=LIVE_ACCOUNT_SOURCE,
         expected_scope=SimpleNamespace(
             account_id="evedex-prod-test",
