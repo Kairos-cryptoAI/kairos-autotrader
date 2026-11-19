@@ -443,7 +443,12 @@ def management_step(
     trade["best_price"] = repr(best)
     part: Decimal | None = None
     targets = policy.targets()
-    if instrument is not None and targets and not trade.get("partial_done"):
+    if (
+        instrument is not None
+        and targets
+        and not trade.get("partial_done")
+        and not trade.get("native_partial_targets")
+    ):
         initial_quantity = dec(trade.setdefault("initial_quantity", trade["quantity"]))
         quantity = dec(trade["quantity"])
         if quantity > initial_quantity:
@@ -2206,9 +2211,25 @@ class Trader:
         if equity_before is None:
             equity_before = await self.broker.equity()
         leverage = max(1, int(risk_decision.leverage))
+        policy = self.management_policy(now_ms, candidate.intent.strategy_id)
+        target_args: dict[str, Any] = {}
+        if policy and policy.targets() and isinstance(self.broker, LiveBroker):
+            qualifies = getattr(self.broker, "native_ladder_qualified_for", None)
+            if qualifies and qualifies(candidate.instrument):
+                target_args["partial_targets"] = [
+                    {"at_r": target.at_r, "fraction": target.fraction} for target in policy.targets()
+                ]
         try:
             fill = await self.broker.enter(
-                candidate, quantity, book, instrument, stop, take, leverage=leverage, decision=risk_decision
+                candidate,
+                quantity,
+                book,
+                instrument,
+                stop,
+                take,
+                leverage=leverage,
+                decision=risk_decision,
+                **target_args,
             )
         except CanaryAccountError as exc:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=str(exc)[:200])
@@ -2256,9 +2277,8 @@ class Trader:
             # Position management fixed for this trade's life (None: the plan as it is).
             "initial_stop": str(stop),
             "initial_quantity": str(fill["quantity"]),
-            "management": (lambda p: p.as_dict() if p else None)(
-                self.management_policy(now_ms, candidate.intent.strategy_id)
-            ),
+            "management": policy.as_dict() if policy else None,
+            "native_partial_targets": bool(fill.get("native_partial_targets")),
         }
         for other in trades:
             other["solo"] = False
@@ -2281,7 +2301,15 @@ class Trader:
     async def manage(self, trade: dict[str, Any], now_ms: int) -> None:
         if now_ms < trade.get("retry_after_ms", 0):
             return
-        if not await self.broker.position_open(trade):
+        is_open = await self.broker.position_open(trade)
+        if trade.get("native_target_fills"):
+            trade["partial_pnl_usd"] = str(
+                sum(
+                    estimate_pnl({**trade, "quantity": qty}, dec(price), self.fee)
+                    for _, qty, price in trade["native_target_fills"]
+                )
+            )
+        if not is_open:
             # One empty answer is not proof that the position is gone: the venue has had short
             # outages. Its protective orders are cancelled only after several polls agree.
             trade["missing_polls"] = trade.get("missing_polls", 0) + 1

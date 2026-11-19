@@ -27,7 +27,16 @@ from kairos_autotrader.management import (
     write_policy,
 )
 from kairos_autotrader.signals import Candle, outcome
-from tests.test_autotrader import SOL, FakeVenue, candidate, enter, journal_of, only, paper_trader
+from tests.test_autotrader import (
+    SOL,
+    FakeVenue,
+    candidate,
+    enter,
+    journal_of,
+    live_trader,
+    only,
+    paper_trader,
+)
 from tests.test_execution_session import _real_review
 
 TRAIL = Management("trail", trail_start_r=1.0, trail_distance_r=0.5)
@@ -212,6 +221,37 @@ def _write_policy(trader, policy: Management) -> None:
         now_ms=int(time.time() * 1000),
         reward_risk=trader.config.reward_risk,
     )
+
+
+@pytest.mark.parametrize("qualified", [True, False])
+def test_live_runner_hands_selected_targets_to_one_execution_owner(tmp_path, monkeypatch, qualified):
+    _real_review(monkeypatch)
+    trader = live_trader(tmp_path, FakeVenue())
+    instrument = dataclasses.replace(SOL, min_quantity=Decimal(".01"), quantity_step=Decimal(".01"))
+    trader.instruments["SOLUSD"] = instrument
+    asyncio.run(trader.start())
+    _write_policy(trader, LADDER)
+    monkeypatch.setattr(trader.broker, "native_ladder_qualified_for", lambda symbol: qualified, raising=False)
+    broker_enter = trader.broker.enter
+    selected = []
+
+    async def submit(*args, partial_targets=None, **kwargs):
+        selected.extend(partial_targets or [])
+        fill = await broker_enter(*args, **kwargs)
+        return {**fill, "native_partial_targets": bool(partial_targets)}
+
+    monkeypatch.setattr(trader.broker, "enter", submit)
+    enter(trader)
+    trade = only(trader)
+    assert trade["native_partial_targets"] is qualified
+    assert selected == (
+        [{"at_r": 0.5, "fraction": 0.25}, {"at_r": 1.0, "fraction": 0.25}] if qualified else []
+    )
+    entry, stop = Decimal(trade["entry_price"]), Decimal(trade["initial_stop"])
+    bid = entry + (entry - stop) * Decimal(".6")
+    moved, partial = management_step(trade, Book(0, bid, bid + SOL.price_step), instrument)
+    assert moved is not None and moved >= entry - SOL.price_step
+    assert (partial is None) is qualified
 
 
 def test_paper_trade_trails_its_stop_and_exits_above_entry(tmp_path, monkeypatch):
