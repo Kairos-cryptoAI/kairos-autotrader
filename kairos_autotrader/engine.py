@@ -756,6 +756,9 @@ class Trader:
         # the newest closed bars of the last scan, keyed by the Binance signal symbol.
         self._market: dict[str, Any] = {"boundary": None, "items": {}, "problems": {}}
         self._market_task: asyncio.Task | None = None
+        self._metrics_task: asyncio.Task[dict[str, dict[str, Any]]] | None = None
+        self._metrics_boundary: int | None = None
+        self._probability_shadow: asyncio.Task[None] | None = None
         self._review_bars: dict[str, list[Any]] = {}
         try:
             self.engine.check_hourly_trend()
@@ -881,10 +884,12 @@ class Trader:
 
     # ---- Kairos Macro Strategist and Risk Manager -------------------------------
 
-    def _market_view(self, features: list[Features]) -> dict[str, dict[str, Any]]:
+    def _market_view(
+        self, features: list[Features], metrics: dict[str, dict[str, Any]] | None = None
+    ) -> dict[str, dict[str, Any]]:
         view: dict[str, dict[str, Any]] = {}
         for f in features:
-            extras = self._extras.get(f.symbol, {})
+            extras = {**self._extras.get(f.symbol, {}), **(metrics or {}).get(f.symbol, {})}
             view[f.symbol] = {
                 "price": round(f.price, 8),
                 "quant_bias": bias_of(f.trend),
@@ -1081,7 +1086,7 @@ class Trader:
                 openai_key=self.openai_key,
                 model=self.config.llm_model,
                 effort=self.config.macro_effort,
-                market=self._market_view(features),
+                market=self._market_view(features, await self._metrics_at(self.scan_slot(now_ms))),
                 portfolio={k: account[k] for k in ("equity_usd", "available_usd", "positions")},
                 performance={
                     **performance,
@@ -1602,6 +1607,18 @@ class Trader:
             problems=self._market["problems"],
         )
 
+    async def _optional_metrics(self) -> dict[str, dict[str, Any]]:
+        try:
+            return await self.api.metrics()
+        except Exception as exc:  # noqa: BLE001 - supplementary public data cannot fail the review
+            self.store.journal("venue_metrics_unavailable", kind=type(exc).__name__)
+            return {}
+
+    async def _metrics_at(self, boundary: int) -> dict[str, dict[str, Any]]:
+        if self._metrics_boundary == boundary and self._metrics_task is not None:
+            return await asyncio.shield(self._metrics_task)
+        return {}
+
     async def scan(self, now_ms: int) -> tuple[list[Features], list[Routed]]:
         """Ask the Kairos signal chain about the hourly bar that has just closed.
 
@@ -1615,11 +1632,18 @@ class Trader:
         slot = self.scan_slot(now_ms)
         last_closed = slot - BAR_MS
         self._review_bars = {}
+        self._extras = {}
         if self.engine is None:
             self.store.journal("scan_error", bar=last_closed, message="the signal chain is not available")
             return [], []
         started = time.monotonic()
         timing: dict[str, float] = {"start_after_close_s": round((time.time() * 1000 - slot) / 1000, 2)}
+        # These public metrics enrich the scan report, Macro and the probability review.
+        # The Router and Aggregator use their own evidence at this bar's boundary.
+        metrics_task = None
+        if self._metrics_task is None or self._metrics_task.done():
+            self._metrics_boundary = slot
+            metrics_task = self._metrics_task = asyncio.create_task(self._optional_metrics())
         series, problems = await self._update_bars(now_ms)
         timing["bars_s"] = round(time.monotonic() - started, 2)
         skipped = [f"{symbol}: {reason}" for symbol, reason in problems.items()]
@@ -1672,15 +1696,8 @@ class Trader:
                 # Only observed, never traded: it must not take time from the review window.
                 self._adaptive_task = asyncio.create_task(self._observe_adaptive(series, slot))
             self._measure_early_exits(series)
-        try:
-            metrics = await self.api.metrics()
-        except EvedexError:
-            metrics = {}
         features = [found.features[s] for s in self.config.symbols if found and s in found.features]
-        self._extras = {
-            f.symbol: {**(found.context[f.symbol] if found else {}), **metrics.get(f.symbol, {})}
-            for f in features
-        }
+        self._extras = {f.symbol: dict(found.context[f.symbol]) for f in features} if found else {}
         candidates: list[Routed] = []
         rejected: list[dict[str, Any]] = []
         router: dict[str, Any] = {}
@@ -1719,6 +1736,7 @@ class Trader:
                     intents[instrument] = intent
                 timing["right_tail_s"] = round(time.monotonic() - started, 2)
         if intents:
+            routing_started = time.monotonic()
             try:
                 routing = await route_intents(
                     self.router,
@@ -1732,10 +1750,16 @@ class Trader:
                 self.store.journal("scan_error", bar=last_closed, message=str(exc)[:300])
                 return features, []
             candidates, rejected, router = routing.routed, routing.rejected, routing.settings
+            timing["router_s"] = round(time.monotonic() - routing_started, 2)
+        metrics_ready = metrics_task is not None and metrics_task.done() and not metrics_task.cancelled()
+        metrics = metrics_task.result() if metrics_task is not None and metrics_ready else {}
+        for symbol, extras in self._extras.items():
+            extras.update(metrics.get(symbol, {}))
         timing["done_after_close_s"] = round((time.time() * 1000 - slot) / 1000, 2)
         self.store.journal(
             "scan",
             timing=timing,
+            venue_metrics_ready=metrics_ready,
             bar=last_closed,
             source="strategy_engine",
             signal_venue=SIGNAL_VENUE,
@@ -1759,75 +1783,53 @@ class Trader:
         elif day["llm_calls"] >= self.config.max_llm_calls_per_day:
             decision = brain.Decision("WAIT", None, 0.0, "daily model call limit reached", "FALLBACK")
         else:
-            fear_greed = await brain.fetch_fear_greed(self.session)
-            now_ms = int(time.time() * 1000)
-            payload = brain.build_payload(
-                features,
-                candidates,
-                trades_today=day["trades"],
-                free_slots=free_slots,
-                open_positions=[
-                    {
-                        "symbol": t["symbol"],
-                        "side": t["side"],
-                        "entry_price": t["entry_price"],
-                        "stop": t["stop"],
-                        "take": t["take"],
-                        "age_minutes": (now_ms - t["opened_ms"]) // 60_000,
-                    }
-                    for t in self.trades()
-                ],
-                extras=self._extras,
-                fear_greed=fear_greed,
-                recent_trades=self._recent_outcomes(10),
-                text_signals=self.news.context(now_ms) if self.news else None,
-                macro=self.macro.summary() if self.macro else None,
-            )
             by_aggregator = self.config.review_mode == "aggregator" and self.aggregator is not None
-            api_key = self.openai_key or ""  # this branch runs only with a key
             left = self.config.max_llm_calls_per_day - day["llm_calls"]
-            ask_probability = not by_aggregator or (self.config.review_shadow and left > len(candidates))
+            shadow_slot = self._probability_shadow is None or self._probability_shadow.done()
+            ask_probability = not by_aggregator or (
+                self.config.review_shadow and left > len(candidates) and shadow_slot
+            )
             ask_aggregator = self.aggregator is not None and (
                 by_aggregator or (self.config.review_shadow and left > len(candidates))
             )
             day["llm_calls"] += int(ask_probability) + (len(candidates) if ask_aggregator else 0)
             self.store.save()
-
-            async def probability() -> brain.Decision | None:
-                if not ask_probability:
-                    return None
-                return await brain.ask_llm(
-                    self.session,
-                    api_key=api_key,
-                    model=self.config.llm_model,
-                    effort=self.config.llm_effort,
-                    payload=payload,
-                    candidates=candidates,
-                    min_confidence=self.config.min_confidence,
-                    timeout_s=self.config.llm_timeout_s,
-                    max_picks=free_slots,
-                )
-
-            async def aggregator() -> brain.Decision | None:
-                if not ask_aggregator:
-                    return None
-                return await self._aggregator_decision(candidates, free_slots)
-
-            by_probability, by_review = await asyncio.gather(probability(), aggregator())
-            chosen = by_review if by_aggregator else by_probability
-            other = by_probability if by_aggregator else by_review
-            decision = chosen or brain.Decision(
-                "WAIT", None, 0.0, "the selected reviewer did not answer", "FALLBACK"
+            # Snapshot portfolio and signal context before an entry can change them. Only the
+            # probability reviewer consumes this payload or fetches the external sentiment index.
+            payload = (
+                self._probability_payload(features, candidates, free_slots, day["trades"])
+                if ask_probability
+                else {}
             )
-            if other is not None:
+            if by_aggregator:
+                if ask_probability:
+                    self._probability_shadow = asyncio.create_task(
+                        self._record_probability_shadow(payload, candidates, free_slots)
+                    )
+                chosen = await self._aggregator_decision(candidates, free_slots)
+                if not ask_probability:
+                    self.store.journal(
+                        "review_context",
+                        candidate_ids=[c.id for c in candidates],
+                        fear_greed=None,
+                        text_signals=self.news.context(int(time.time() * 1000))
+                        if self.news
+                        else "news layer is off",
+                        macro=(self.macro.summary() if self.macro else None) or "UNAVAILABLE",
+                    )
+            elif ask_aggregator:
+                # The probability choice still needs the Aggregator contract for the Risk Manager.
+                chosen, other = await asyncio.gather(
+                    self._probability_decision(payload, candidates, free_slots),
+                    self._aggregator_decision(candidates, free_slots),
+                )
                 self.store.journal(
                     "shadow_decision", decision=other.as_dict(), candidate_ids=[c.id for c in candidates]
                 )
-            self.store.journal(
-                "review_context",
-                fear_greed=fear_greed,
-                text_signals=payload["text_scouts_signals"],
-                macro=payload["macro_allocation"],
+            else:
+                chosen = await self._probability_decision(payload, candidates, free_slots)
+            decision = chosen or brain.Decision(
+                "WAIT", None, 0.0, "the selected reviewer did not answer", "FALLBACK"
             )
         self.store.journal(
             "decision",
@@ -1837,6 +1839,72 @@ class Trader:
             candidate_ids=[c.id for c in candidates],
         )
         return decision
+
+    def _probability_payload(
+        self, features: list[Features], candidates: list[Routed], free_slots: int, trades_today: int
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        return brain.build_payload(
+            features,
+            candidates,
+            trades_today=trades_today,
+            free_slots=free_slots,
+            open_positions=[
+                {
+                    "symbol": t["symbol"],
+                    "side": t["side"],
+                    "entry_price": t["entry_price"],
+                    "stop": t["stop"],
+                    "take": t["take"],
+                    "age_minutes": (now_ms - t["opened_ms"]) // 60_000,
+                }
+                for t in self.trades()
+            ],
+            extras=self._extras,
+            recent_trades=self._recent_outcomes(10),
+            text_signals=self.news.context(now_ms) if self.news else None,
+            macro=self.macro.summary() if self.macro else None,
+        )
+
+    async def _probability_decision(
+        self, payload: dict[str, Any], candidates: list[Routed], free_slots: int
+    ) -> brain.Decision:
+        fear_greed, metrics = await asyncio.gather(
+            brain.fetch_fear_greed(self.session),
+            self._metrics_at(max((c.signal_time for c in candidates), default=0)),
+        )
+        for feature in payload["market_features"]:
+            feature.update(metrics.get(feature["symbol"], {}))
+        payload["crypto_fear_greed_index"] = fear_greed or "unavailable"
+        self.store.journal(
+            "review_context",
+            candidate_ids=[c.id for c in candidates],
+            fear_greed=fear_greed,
+            text_signals=payload["text_scouts_signals"],
+            macro=payload["macro_allocation"],
+        )
+        return await brain.ask_llm(
+            self.session,
+            api_key=self.openai_key or "",
+            model=self.config.llm_model,
+            effort=self.config.llm_effort,
+            payload=payload,
+            candidates=candidates,
+            min_confidence=self.config.min_confidence,
+            timeout_s=self.config.llm_timeout_s,
+            max_picks=free_slots,
+        )
+
+    async def _record_probability_shadow(
+        self, payload: dict[str, Any], candidates: list[Routed], free_slots: int
+    ) -> None:
+        candidate_ids = [c.id for c in candidates]
+        try:
+            decision = await self._probability_decision(payload, candidates, free_slots)
+        except Exception as exc:  # noqa: BLE001 - an optional observation must not fail a primary review
+            self.store.journal("shadow_review_error", error=type(exc).__name__, candidate_ids=candidate_ids)
+        else:
+            self.store.journal("shadow_decision", decision=decision.as_dict(), candidate_ids=candidate_ids)
 
     async def _aggregator_decision(self, candidates: list[Routed], free_slots: int) -> brain.Decision:
         """The Kairos Aggregator review of every routed candidate, as one decision."""
@@ -2382,7 +2450,14 @@ class Trader:
 
     async def stop_engine_workers(self) -> None:
         """End the background engine work and the persistent workers before the loop closes."""
-        for task in (self._warm_task, self._adaptive_task, self._market_task, self._macro_task):
+        for task in (
+            self._probability_shadow,
+            self._metrics_task,
+            self._warm_task,
+            self._adaptive_task,
+            self._market_task,
+            self._macro_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, EngineError):

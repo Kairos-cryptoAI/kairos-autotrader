@@ -1183,6 +1183,35 @@ def test_scan_runs_binance_bars_through_the_engine_and_the_router(tmp_path, monk
     assert feed.asked == [("SOLUSDT", SLOT - 3 * MINUTE, SLOT + QUARTER)]
 
 
+def test_delayed_venue_metrics_do_not_hold_the_route(tmp_path, monkeypatch):
+    fake_parser(monkeypatch)
+    fake_engine(monkeypatch)
+    fake_router(monkeypatch)
+    trader = scanning_trader(tmp_path, BarFeed(last_open_ms=SLOT - MINUTE))
+
+    async def scenario():
+        requested, release = asyncio.Event(), asyncio.Event()
+
+        async def held_metrics():
+            requested.set()
+            await release.wait()
+            return {"SOLUSD": {"funding_rate_pct": 0.117}}
+
+        monkeypatch.setattr(trader.api, "metrics", held_metrics)
+        features, routed = await asyncio.wait_for(trader.scan(SLOT + 12_000), timeout=5)
+        assert routed and requested.is_set()
+        record = next(row for row in journal_of(trader) if row["event"] == "scan")
+        assert not record["venue_metrics_ready"] and "router_s" in record["timing"]
+        assert await trader._metrics_at(SLOT + QUARTER) == {}
+        release.set()
+        metrics = await trader._metrics_at(SLOT)
+        assert trader._market_view(features, metrics)["SOLUSD"]["funding_rate_pct"] == 0.117
+        await trader.stop_engine_workers()
+        assert trader._metrics_task.done()
+
+    asyncio.run(scenario())
+
+
 def test_scan_skips_an_instrument_without_complete_fresh_bars(tmp_path, monkeypatch):
     fake_parser(monkeypatch)
     fake_engine(monkeypatch)

@@ -508,7 +508,13 @@ def test_aggregator_mode_trades_allowed_candidates_by_priority(tmp_path, monkeyp
             review_row(xrp.id, "DEFER", 0),
         ],
     )
-    decision = asyncio.run(trader.decide([], [sol, link, xrp], 2))
+
+    async def compare():
+        primary = await trader.decide([], [sol, link, xrp], 2)
+        await trader._probability_shadow
+        return primary
+
+    decision = asyncio.run(compare())
     assert (
         decision.source == "AGGREGATOR" and decision.action == "TRADE" and decision.picks == [link.id, sol.id]
     )
@@ -522,6 +528,60 @@ def test_aggregator_mode_trades_allowed_candidates_by_priority(tmp_path, monkeyp
     )
     waited = asyncio.run(alone.decide([], [sol], 1))
     assert waited.action == "WAIT" and calls == {"probability": 0, "aggregator": 1}
+
+
+def test_slow_probability_context_cannot_delay_or_replace_the_primary_result(tmp_path, monkeypatch):
+    sol = candidate()
+    trader, calls = trader_with_reviews(
+        tmp_path, monkeypatch, mode="aggregator", reviews=[review_row(sol.id, "ALLOW", 80)]
+    )
+
+    async def scenario():
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_index(session):
+            waiting.set()
+            await release.wait()
+            return {"value": 50}
+
+        monkeypatch.setattr(brain, "fetch_fear_greed", slow_index)
+        first = await asyncio.wait_for(trader.decide([], [sol]), timeout=1)
+        assert first.picks == [sol.id] and first.source == "AGGREGATOR"
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        task = trader._probability_shadow
+        second = await asyncio.wait_for(trader.decide([], [sol]), timeout=1)
+        assert second.picks == [sol.id] and trader._probability_shadow is task
+        assert calls == {"probability": 0, "aggregator": 2}
+        assert trader._day()["llm_calls"] == 3
+        release.set()
+        await task
+        assert calls["probability"] == 1
+        assert [e["event"] for e in events(trader)].count("shadow_decision") == 1
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_cancels_outstanding_probability_review(tmp_path, monkeypatch):
+    sol = candidate()
+    trader, _ = trader_with_reviews(
+        tmp_path, monkeypatch, mode="aggregator", reviews=[review_row(sol.id, "VETO", 0)]
+    )
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def slow_model(session, **options):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(brain, "ask_llm", slow_model)
+        assert (await trader.decide([], [sol])).action == "WAIT"
+        await started.wait()
+        await trader.stop_engine_workers()
+        assert trader._probability_shadow.cancelled()
+        assert all(e["event"] != "shadow_decision" for e in events(trader))
+
+    asyncio.run(scenario())
 
 
 def test_aggregator_failure_never_trades_in_its_own_mode_and_is_harmless_as_shadow(tmp_path, monkeypatch):
