@@ -15,7 +15,7 @@ import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 from typing import Any
@@ -1112,9 +1112,10 @@ class Trader:
                 + (" (защитное решение: модель не ответила)" if allocation.get("origin") != "model" else "")
             )
 
-    def halt(self, reason: str) -> None:
+    def halt(self, reason: str, *, reconcile_entry: bool = False) -> None:
         if self.store.state.get("halted") != reason:
             self.store.state["halted"] = reason
+            self.store.state["entry_reconciliation_halt"] = reconcile_entry
             self.store.save()
             self.store.journal("halt", reason=reason)
             say(f"НОВЫЕ ВХОДЫ ОСТАНОВЛЕНЫ: {reason}")
@@ -1312,10 +1313,12 @@ class Trader:
     def slot_limit(self) -> int:
         return min(HARD_MAX_OPEN_POSITIONS, int(self.config.max_open_positions))
 
-    async def start(self, *, new_session: bool = False) -> None:
+    async def start(self, *, new_session: bool = False, resume_reconciled: bool = False) -> None:
         state = self.store.state
         if state.get("mode") not in (None, self.broker.mode):
             raise ConfigError("this runtime directory belongs to another mode; use a separate directory")
+        if resume_reconciled and not isinstance(self.broker, LiveBroker):
+            raise ConfigError("--resume-reconciled requires a live portfolio")
         state["mode"] = self.broker.mode
         self.store.publish_close(recovering=True)
         trades = self.trades()
@@ -1328,12 +1331,16 @@ class Trader:
                 self.store.journal("execution_session_finished", **legacy)
                 state.pop("execution_session")
                 self.store.save()
-            await self._reconcile_portfolio(trades)
+            if resume_reconciled:
+                await self._resume_reconciled(self.broker, trades)
+            else:
+                await self._reconcile_portfolio(trades)
             status = self.broker.pilot_status()
             pilot_baseline = status["baseline"] if status else None
         if new_session and self.broker.mode == "paper":
             state.pop("session", None)
             state.pop("halted", None)
+            state.pop("entry_reconciliation_halt", None)
         if new_session or "session" not in state:
             equity = await self.broker.equity()
             if "session" in state:
@@ -1373,6 +1380,46 @@ class Trader:
                 "Все места заняты: новые входы начнутся после закрытия позиции. "
                 "Состояние печатается раз в 10 минут."
             )
+
+    async def _resume_reconciled(self, broker: LiveBroker, trades: list[dict[str, Any]]) -> None:
+        state = self.store.state
+        halt = state.get("halted")
+        eligible = state.get("entry_reconciliation_halt")
+        if eligible is None and isinstance(halt, str):
+            # Older live runners recorded only the reason, including the affected instrument.
+            prefixes = tuple(f"вход {symbol} требует сверки: " for symbol in self.config.symbols)
+            eligible = halt.startswith(("портфель требует сверки: ", *prefixes))
+        if not halt or eligible is not True:
+            raise ConfigError("no execution-reconciliation halt to resume")
+        if trades or state.get("pending_entry") or state.get("execution_session"):
+            raise NeedsOperator("runner still has an open or pending trade")
+        if self.store.flag("STOP") or self.store.flag("CLOSE"):
+            raise NeedsOperator("operator stop is active")
+        if any(await asyncio.gather(self.api.positions(), self.api.open_orders(), self.api.active_tpsl())):
+            raise NeedsOperator("venue still has a position or an open order or protection")
+
+        started = datetime.now(UTC)
+        await broker.reconcile_start([], None)
+        if await broker.foreign_exposure(set()):
+            raise NeedsOperator("portfolio ownership or a venue request remains unresolved")
+        status = broker.pilot_status()
+        now = datetime.now(UTC)
+        if (
+            not status
+            or status["stopped"]
+            or status["open_positions"] != 0
+            or not max(started, now - timedelta(seconds=60))
+            <= datetime.fromisoformat(status["observed_at"])
+            <= now
+            or now >= broker.entry_deadline_utc
+            or self.store.flag("STOP")
+            or self.store.flag("CLOSE")
+        ):
+            raise NeedsOperator("a fresh flat account with an active pilot mandate is required")
+        self.store.journal("entry_halt_reconciled", reason=halt, observed_at=status["observed_at"])
+        state.pop("halted")
+        state.pop("entry_reconciliation_halt", None)
+        self.store.save()
 
     async def _reconcile_portfolio(self, trades: list[dict[str, Any]]) -> None:
         broker = self.broker
@@ -1935,7 +1982,7 @@ class Trader:
                     adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
             except (NeedsOperator, PortfolioJournalError) as exc:
-                self.halt(f"портфель требует сверки: {str(exc)[:160]}")
+                self.halt(f"портфель требует сверки: {str(exc)[:160]}", reconcile_entry=True)
                 return
             except (RiskError, EvedexError, TimeoutError, aiohttp.ClientError, OSError) as exc:
                 reason = f"the Risk Manager could not decide ({type(exc).__name__}: {str(exc)[:120]})"
@@ -1974,7 +2021,7 @@ class Trader:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=str(exc)[:200])
             return
         except (Unknown, NeedsOperator, PortfolioJournalError) as exc:
-            self.halt(f"вход {candidate.instrument} требует сверки: {str(exc)[:160]}")
+            self.halt(f"вход {candidate.instrument} требует сверки: {str(exc)[:160]}", reconcile_entry=True)
             return
         if fill is None:
             self.store.journal("entry_skipped", candidate=candidate.id, reason="execution refused the entry")
@@ -2317,10 +2364,12 @@ class Trader:
                 break
             await self.try_enter(next(c for c in eligible if c.id == candidate_id), decision)
 
-    async def run(self, *, max_steps: int | None = None, new_session: bool = False) -> None:
+    async def run(
+        self, *, max_steps: int | None = None, new_session: bool = False, resume_reconciled: bool = False
+    ) -> None:
         news_task = None
         try:
-            await self.start(new_session=new_session)
+            await self.start(new_session=new_session, resume_reconciled=resume_reconciled)
             if self.news is not None and max_steps is None:
                 news_task = asyncio.create_task(self._news_loop())
             await self._loop(max_steps)

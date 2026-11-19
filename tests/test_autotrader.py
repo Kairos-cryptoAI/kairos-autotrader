@@ -345,6 +345,8 @@ class FakePortfolio(LiveBroker):
     def pilot_status(self):
         return {
             "started_at": datetime.now(UTC).date().isoformat(),
+            "observed_at": datetime.now(UTC).isoformat(),
+            "open_positions": len(self.venue.position_list),
             "funding_balance": str(self.venue.funding),
             "baseline": str(self.baseline),
             "external_flow": str(self.flow),
@@ -574,6 +576,68 @@ def test_new_live_session_preserves_the_budget_halt_and_open_records(tmp_path, c
     assert trader.store.state["session"]["started_at"] == before["started_at"]
     assert trader.store.state["round_trips"] == 2 and trader.store.state["halted"] == "earlier loss"
     assert trader.store.state["session"]["reporting_started_at"]
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_explicit_resume_reconciles_entry_halt_and_keeps_pilot_baseline(tmp_path, legacy):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    session = trader.store.state["session"].copy()
+    reason = f"вход {trader.config.symbols[0]} требует сверки: protection verification failed"
+    if legacy:
+        trader.store.state["halted"] = reason
+    else:
+        trader.halt(reason, reconcile_entry=True)
+    asyncio.run(trader.start())
+    assert trader.entries_blocked() == reason
+    asyncio.run(trader.start(resume_reconciled=True))
+    assert trader.entries_blocked() is None and trader.store.state["session"] == session
+    assert [r["reason"] for r in journal_of(trader) if r["event"] == "entry_halt_reconciled"] == [reason]
+    assert not venue.market_bodies and not venue.close_bodies
+
+
+@pytest.mark.parametrize(
+    "block",
+    ["loss", "stop", "expired", "order", "position", "tpsl", "pending", "unsettled", "stale", "other"],
+)
+def test_explicit_resume_refuses_unverified_or_stopped_account(tmp_path, monkeypatch, block):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    reason = f"вход {trader.config.symbols[0]} требует сверки: protection verification failed"
+    if block == "other":
+        trader.halt("an operator or risk halt")
+    else:
+        trader.halt(reason, reconcile_entry=True)
+    if block == "stop":
+        (trader.store.directory / "STOP").touch()
+    elif block == "expired":
+        trader.broker.entry_deadline_utc = datetime.now(UTC)
+    elif block == "loss":
+        venue.funding -= Decimal("5")
+    elif block == "order":
+        venue.orders_open = [{"example": True}]
+    elif block == "position":
+        venue.position_list = [Position("SOLUSD", "BUY", Decimal("0.2"), Decimal("82.35"))]
+    elif block == "tpsl":
+        venue.tpsl = [{"instrument": "SOLUSD", "status": "active"}]
+    elif block == "pending":
+        trader.store.state["pending_entry"] = {"instrument": "SOLUSD"}
+    elif block == "unsettled":
+
+        async def unresolved(_own):
+            return ["unresolved venue request"]
+
+        monkeypatch.setattr(trader.broker, "foreign_exposure", unresolved)
+    elif block == "stale":
+        status = trader.broker.pilot_status()
+        monkeypatch.setattr(trader.broker, "pilot_status", lambda: status)
+    with pytest.raises((ConfigError, NeedsOperator)):
+        asyncio.run(trader.start(resume_reconciled=True))
+    assert trader.store.state["halted"]
+    assert not any(r["event"] == "entry_halt_reconciled" for r in journal_of(trader))
+    assert not venue.market_bodies and not venue.close_bodies
 
 
 def test_entry_deadline_stops_new_risk_and_keeps_managing_open_positions(tmp_path):

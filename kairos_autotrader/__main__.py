@@ -267,7 +267,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
         trader = await build_trader(args, session, args.mode)
         say("Остановить входы: создайте файл STOP в папке запуска. Закрыть позицию сейчас: файл CLOSE.")
         try:
-            await trader.run(max_steps=args.max_steps, new_session=args.new_session)
+            await trader.run(
+                max_steps=args.max_steps,
+                new_session=args.new_session,
+                resume_reconciled=args.resume_reconciled,
+            )
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
@@ -641,6 +645,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--config", type=Path)
     run.add_argument("--no-llm", action="store_true", help="algorithm only, for comparison")
     run.add_argument("--confirm-real-orders", action="store_true")
+    run.add_argument(
+        "--resume-reconciled",
+        action="store_true",
+        help="resume an entry-reconciliation halt after verifying a flat live account and its order journal",
+    )
     run.add_argument(
         "--new-session",
         action="store_true",
