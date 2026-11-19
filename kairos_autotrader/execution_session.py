@@ -15,7 +15,7 @@ the production path holds one position at a time.
 from __future__ import annotations
 
 import json
-import subprocess
+import subprocess  # nosec B404
 import sys
 import time
 from dataclasses import dataclass
@@ -35,7 +35,8 @@ class ExecutionSettings:
 def closed_trades(python: Path, session_config: Path) -> list[dict[str, Any]]:
     """The Execution Engine's closed trades from its own database (``production_report``)."""
     manifest = json.loads(Path(session_config).read_text(encoding="utf-8"))["manifest"]
-    completed = subprocess.run(  # noqa: S603 - fixed module of the owner's configured environment
+    # The operator selects the interpreter. The report module is fixed and the manifest is one argument.
+    completed = subprocess.run(  # nosec B603
         [str(python), "-m", "kairos_execution.production_report", "--manifest", str(manifest)],
         capture_output=True,
         timeout=60,
@@ -90,7 +91,8 @@ class ExecutionSessions:
         )
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         with result.open("wb") as stdout, log.open("wb") as stderr:
-            self._process = subprocess.Popen(  # noqa: S603 - fixed module of the owner's configured environment
+            # The operator supplies the interpreter. The module is fixed and paths are separate arguments.
+            self._process = subprocess.Popen(  # nosec B603
                 [
                     str(self.settings.python),
                     "-m",
@@ -127,7 +129,8 @@ class ExecutionSessions:
         session refuses to start on stale ones, so a failure here stops the entry.
         """
         root = Path(self.settings.session_config).parent
-        completed = subprocess.run(  # noqa: S603 - fixed module of the owner's configured environment
+        # This invokes the fixed setup module's refresh command, with the directory as a separate argument.
+        completed = subprocess.run(  # nosec B603
             [
                 str(self.settings.python),
                 "-m",

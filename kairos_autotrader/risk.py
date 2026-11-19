@@ -111,7 +111,8 @@ class RiskSession:
         self._lock = asyncio.Lock()
 
     async def _read(self) -> dict[str, Any]:
-        assert self._process is not None and self._process.stdout is not None
+        if self._process is None or self._process.stdout is None:
+            raise RiskError("Risk Manager: worker output is unavailable")
         while True:
             line = await self._process.stdout.readline()
             if not line:
@@ -124,7 +125,8 @@ class RiskSession:
                 return value
 
     async def _write(self, value: dict[str, Any]) -> None:
-        assert self._process is not None and self._process.stdin is not None
+        if self._process is None or self._process.stdin is None:
+            raise RiskError("Risk Manager: worker input is unavailable")
         self._process.stdin.write((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
         await self._process.stdin.drain()
 

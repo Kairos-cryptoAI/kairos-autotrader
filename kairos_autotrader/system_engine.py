@@ -618,7 +618,8 @@ class EnginePool:
         return len(self._processes)
 
     async def _read(self, process: asyncio.subprocess.Process) -> dict[str, Any]:
-        assert process.stdout is not None
+        if process.stdout is None:
+            raise EngineError("Strategy Engine: worker output is unavailable")
         while True:
             line = await process.stdout.readline()
             if not line:
@@ -684,7 +685,8 @@ class EnginePool:
         process = self._processes[index]
         if process is None or process.returncode is not None:
             process = await self._start(index)
-        assert process.stdin is not None
+        if process.stdin is None:
+            raise EngineError("Strategy Engine: worker input is unavailable")
         process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         await process.stdin.drain()
         return await self._read(process)

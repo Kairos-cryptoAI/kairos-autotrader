@@ -1939,8 +1939,9 @@ class Trader:
         The answers are discarded: they decide nothing. The first real scan after a start
         then checks only the bars that closed since, instead of the whole window.
         """
-        assert self.engine is not None
         engine = self.engine
+        if engine is None:
+            return
         now_ms = int(time.time() * 1000)
         ticks = {name: item.price_step for name, item in self.instruments.items()}
         parts: dict[str, tuple[int, Any]] = {}
