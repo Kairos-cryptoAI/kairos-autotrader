@@ -781,6 +781,20 @@ def test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_bey
     assert "below the venue's minimum lot" in fixed_size["refused"]
 
 
+def test_minimum_lot_can_use_the_last_two_percent_of_the_approved_budget():
+    minimum = Decimal("0.227929")
+    result = decide(
+        adaptive_={"outcomes": []},
+        account_=lambda: account(
+            balance_usd=100, available_usd=100, day_start_equity_usd=100, peak_equity_usd=100
+        ),
+        min_quantity=minimum,
+    )
+    decision = result["evaluation"]["decision"]
+    assert decision["approved"] and Decimal(repr(decision["quantity"])) >= minimum
+    assert 0.245 < decision["worst_case_loss_usd"] <= decision["loss_budget_usd"] <= 0.25
+
+
 def test_adaptive_risk_in_chop_sizes_and_levers_for_half_the_budget():
     leveraged = {
         **LIMITS,

@@ -320,12 +320,10 @@ def decide(request: dict, venue) -> dict:
         # The adaptive share sized a position below the venue's minimum lot: the share is
         # raised just enough for that lot, only within the constitution's ceiling, and the
         # Risk Manager decides again with it.
-        needed = (
-            Decimal(adaptive_record["per_trade_risk_fraction"])
-            * minimum
-            / Decimal(repr(decision.quantity))
-            * Decimal("1.02")
-        )
+        # The first decision already includes fees, slippage and downward quantity rounding.
+        # minimum_lot_fraction rounds this share up. The second decision verifies the lot.
+        current_fraction = Decimal(adaptive_record["per_trade_risk_fraction"])
+        needed = current_fraction * minimum / Decimal(repr(decision.quantity))
         raised_limits, raised_record = _adaptive_limits(
             request["adaptive"],
             base_limits,
