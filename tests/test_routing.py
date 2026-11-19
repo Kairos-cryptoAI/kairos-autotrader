@@ -195,6 +195,22 @@ def test_real_router_time_rules_reject_late_and_early_candidates():
     assert len(route(None, offered=offered, now_ms=DECISION + 59_999).routed) == 2
 
 
+def test_real_router_ignores_pair_evidence_outside_the_candidate_batch():
+    config = real_config()
+    offered = {"SOLUSD": intents()["SOLUSD"]}
+    foreign = news(
+        "link", topic="LINKUSDT", impact="bullish", sentiment=0.9, confidence=0.9, minutes_before=1
+    )
+    market = news("market", topic="ETF", impact="bearish", sentiment=-0.9, confidence=0.8, minutes_before=2)
+    (item,) = asyncio.run(
+        route_intents(
+            config, offered, signals=[foreign, market], now_ms=DECISION + 15_000, review_timeout_ms=60_000
+        )
+    ).routed
+    assert item.route.evidence_ids == ("market",)
+    assert item.route.review_tier.value == "NORMAL"
+
+
 def test_real_warm_router_preserves_identity_deadlines_and_isolates_batches():
     from kairos_autotrader.routing import router_session
 
