@@ -288,6 +288,9 @@ def test_control_decision_takes_best_score():
 
 
 class FakeVenue:
+    # This fixture implements position-reducing protection, unlike the unqualified production venue.
+    native_protection_unavailable: str | None = None
+
     def __init__(self) -> None:
         self.funding = Decimal("109.42")
         self.bid, self.ask = Decimal("82.33"), Decimal("82.35")
@@ -332,6 +335,10 @@ class FakePortfolio(LiveBroker):
 
     account_id = "evedex-prod-test"
     entry_deadline_utc = datetime.max.replace(tzinfo=UTC)
+
+    @property
+    def native_protection_unavailable(self):
+        return self.venue.native_protection_unavailable
 
     async def refresh_performance(self, *, force=False):
         pass
@@ -1205,7 +1212,7 @@ def test_delayed_venue_metrics_do_not_hold_the_route(tmp_path, monkeypatch):
         assert await trader._metrics_at(SLOT + QUARTER) == {}
         release.set()
         metrics = await trader._metrics_at(SLOT)
-        assert trader._market_view(features, metrics)["SOLUSD"]["funding_rate_pct"] == 0.117
+        assert trader._market_view(features, trader._extras, metrics)["SOLUSD"]["funding_rate_pct"] == 0.117
         await trader.stop_engine_workers()
         assert trader._metrics_task.done()
 
@@ -1420,6 +1427,30 @@ def test_exact_old_position_latch_requires_explicit_proven_flat_resume(tmp_path)
     assert trader.entries_blocked() is None
 
 
+def test_unqualified_native_protection_blocks_live_entries_but_keeps_management(tmp_path, monkeypatch):
+    reason = "native triggers can increase an existing position"
+    venue = FakeVenue()
+    venue.native_protection_unavailable = reason
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    asyncio.run(trader.start())
+    assert trader.entries_blocked() == reason and trader.store.state.get("halted") is None
+    assert [
+        row["reason"] for row in journal_of(trader) if row["event"] == "native_protection_unavailable"
+    ] == [reason]
+    trader.store.state["open_trades"] = [{"id": "existing", "symbol": "OPUSD"}]
+    (trader.store.directory / "CLOSE").touch()
+    managed = []
+
+    async def manage(trade, now):
+        managed.append((trade["id"], trader.store.flag("CLOSE")))
+
+    monkeypatch.setattr(trader, "manage", manage)
+    asyncio.run(trader.step())
+    assert managed == [("existing", True)] and not venue.market_bodies
+    assert paper_trader(tmp_path, venue, Config(use_llm=False)).entries_blocked() is None
+
+
 def test_scan_trades_only_the_selected_strategies_and_runs_the_daily_rule_at_one_utc(tmp_path, monkeypatch):
     from support import strict_intent
 
@@ -1517,6 +1548,38 @@ def test_a_due_scan_runs_before_positions_are_managed(tmp_path, monkeypatch):
     trader.config.max_open_positions = 1
     asyncio.run(trader.step())
     assert calls == ["manage"]
+
+
+async def test_macro_preserves_original_scan_data_when_the_account_read_crosses_a_boundary(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    trader = paper_trader(tmp_path, FakeVenue(), Config(use_llm=False, symbols=["SOLUSD"]))
+    trader.macro = SimpleNamespace(refresh=AsyncMock(return_value=None))
+    trader._extras = {"SOLUSD": {"change_7d_pct": 2}}
+    trader._metrics_boundary = SLOT
+    trader._metrics_task = asyncio.create_task(asyncio.sleep(0, result={"SOLUSD": {"funding_rate_pct": 0.1}}))
+    arrived = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def account():
+        arrived.set()
+        await proceed.wait()
+        return {"equity_usd": 100, "available_usd": 100, "positions": [], "daily_realized_pnl_usd": 0}
+
+    monkeypatch.setattr(trader, "_account_view", account)
+    feature = SimpleNamespace(symbol="SOLUSD", price=10, trend="UP", rsi=50, atr_pct=1, change_24h_pct=0)
+    request = asyncio.create_task(trader.macro_tick([feature], SLOT))
+    await arrived.wait()
+    trader._extras = {"SOLUSD": {"change_7d_pct": 40}}
+    trader._metrics_boundary = SLOT + QUARTER
+    trader._metrics_task = None
+    proceed.set()
+    await request
+    market = trader.macro.refresh.await_args.kwargs["market"]["SOLUSD"]
+    assert market["change_7d_pct"] == 2 and market["funding_rate_pct"] == 0.1
 
 
 def engine_module_time():

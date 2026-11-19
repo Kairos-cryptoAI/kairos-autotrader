@@ -806,6 +806,7 @@ class Trader:
         self._aggregator_warm_task: asyncio.Task | None = None
         self._aggregator_task: asyncio.Task[Reviews] | None = None
         self._position_faults: dict[str, tuple[str, str]] = {}
+        self._reported_protection_block: str | None = None
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
             try:
@@ -904,12 +905,13 @@ class Trader:
 
     # ---- Kairos Macro Strategist and Risk Manager -------------------------------
 
+    @staticmethod
     def _market_view(
-        self, features: list[Features], metrics: dict[str, dict[str, Any]] | None = None
+        features: list[Features], scan_extras: dict[str, dict[str, Any]], metrics: dict[str, dict[str, Any]]
     ) -> dict[str, dict[str, Any]]:
         view: dict[str, dict[str, Any]] = {}
         for f in features:
-            extras = {**self._extras.get(f.symbol, {}), **(metrics or {}).get(f.symbol, {})}
+            extras = {**scan_extras.get(f.symbol, {}), **metrics.get(f.symbol, {})}
             view[f.symbol] = {
                 "price": round(f.price, 8),
                 "quant_bias": bias_of(f.trend),
@@ -1093,7 +1095,12 @@ class Trader:
         if self.macro is None or not features:
             return
         try:
-            account = await self._account_view()
+            # A slow account read may cross a scan boundary. Capture this scan's features and
+            # optional metrics together before another scan can replace their source.
+            scan_extras = {symbol: fields.copy() for symbol, fields in self._extras.items()}
+            account, metrics = await asyncio.gather(
+                self._account_view(), self._metrics_at(self.scan_slot(now_ms))
+            )
             if isinstance(self.broker, LiveBroker):
                 pilot = self.broker.pilot_status() or {}
                 performance = {"pilot_account_result_usd": pilot.get("account_result")}
@@ -1106,7 +1113,7 @@ class Trader:
                 openai_key=self.openai_key,
                 model=self.config.llm_model,
                 effort=self.config.macro_effort,
-                market=self._market_view(features, await self._metrics_at(self.scan_slot(now_ms))),
+                market=self._market_view(features, scan_extras, metrics),
                 portfolio={k: account[k] for k in ("equity_usd", "available_usd", "positions")},
                 performance={
                     **performance,
@@ -1319,11 +1326,24 @@ class Trader:
         self.store.state["early_exit_pending"] = remaining
         self.store.save()
 
+    def _protection_block(self) -> str | None:
+        if not isinstance(self.broker, LiveBroker):
+            return None
+        # An older installed execution package cannot certify position-reducing protection.
+        return getattr(
+            self.broker,
+            "native_protection_unavailable",
+            "Execution Engine does not report qualified position-reducing native protection",
+        )
+
     def entries_blocked(self) -> str | None:
         state = self.store.state
         if state.get("halted"):
             return str(state["halted"])
         if isinstance(self.broker, LiveBroker):
+            protection_block = self._protection_block()
+            if protection_block:
+                return protection_block
             if datetime.now(UTC) >= self.broker.entry_deadline_utc:
                 return "signed entry window ended"
             status = self.broker.pilot_status()
@@ -1345,6 +1365,11 @@ class Trader:
         if resume_reconciled and not isinstance(self.broker, LiveBroker):
             raise ConfigError("--resume-reconciled requires a live portfolio")
         state["mode"] = self.broker.mode
+        protection_block = self._protection_block()
+        if protection_block and protection_block != self._reported_protection_block:
+            self.store.journal("native_protection_unavailable", reason=protection_block)
+            say(f"Новые входы закрыты: защита EVEDEX не подтверждена. {protection_block}")
+        self._reported_protection_block = protection_block
         self.store.publish_close(recovering=True)
         trades = self.trades()
         pilot_baseline = None
@@ -1810,6 +1835,10 @@ class Trader:
         else:
             by_aggregator = self.config.review_mode == "aggregator" and self.aggregator is not None
             left = self.config.max_llm_calls_per_day - day["llm_calls"]
+            if by_aggregator and len(candidates) > left:
+                ranked = sorted(candidates, key=lambda c: (-c.strength, c.id))
+                self.store.journal("review_budget_limited", skipped=[c.id for c in ranked[left:]])
+                candidates = ranked[:left]
             shadow_slot = self._probability_shadow is None or self._probability_shadow.done()
             ask_probability = not by_aggregator or (
                 self.config.review_shadow and left > len(candidates) and shadow_slot

@@ -625,6 +625,24 @@ def test_aggregator_mode_trades_allowed_candidates_by_priority(tmp_path, monkeyp
     assert waited.action == "WAIT" and calls == {"probability": 0, "aggregator": 1}
 
 
+async def test_last_daily_model_call_can_review_only_one_candidate(tmp_path, monkeypatch):
+    trader, _ = trader_with_reviews(tmp_path, monkeypatch, mode="aggregator")
+    trader._day()["llm_calls"] = trader.config.max_llm_calls_per_day - 1
+    strong = candidate(symbol="APTUSD", score=0.9)
+    weak = candidate(symbol="ENAUSD", score=0.2)
+    requested = []
+
+    async def reviews(config, **kwargs):
+        requested.extend(c.id for c in kwargs["candidates"])
+        return Reviews([], [])
+
+    monkeypatch.setattr(engine, "review_candidates", reviews)
+    await trader.decide([], [weak, strong], 2)
+    assert requested == [strong.id] and trader._probability_shadow is None
+    assert trader._day()["llm_calls"] == trader.config.max_llm_calls_per_day
+    assert next(e for e in events(trader) if e["event"] == "review_budget_limited")["skipped"] == [weak.id]
+
+
 def test_slow_probability_context_cannot_delay_or_replace_the_primary_result(tmp_path, monkeypatch):
     sol = candidate()
     trader, calls = trader_with_reviews(
