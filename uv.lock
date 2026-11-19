@@ -1056,7 +1056,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.4,<4" },
     { name = "eth-account", specifier = ">=0.11,<1" },
     { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07" },
-    { name = "kairos-execution-engine", git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git?rev=1c1db747592471ee160bd2d51afbf0235666dbe8" },
+    { name = "kairos-execution-engine", git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git?rev=8161586cfc1a348a9409da4209fdae56d1523d2f" },
 ]
 
 [package.metadata.requires-dev]
@@ -1087,7 +1087,7 @@ dependencies = [
 [[package]]
 name = "kairos-execution-engine"
 version = "0.1.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git?rev=1c1db747592471ee160bd2d51afbf0235666dbe8#1c1db747592471ee160bd2d51afbf0235666dbe8" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-execution-engine.git?rev=8161586cfc1a348a9409da4209fdae56d1523d2f#8161586cfc1a348a9409da4209fdae56d1523d2f" }
 dependencies = [
     { name = "aiohttp" },
     { name = "kairos-core" },
