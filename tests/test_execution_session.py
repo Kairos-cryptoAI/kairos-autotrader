@@ -157,6 +157,10 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
     (package / "production_setup.py").write_text("print('{\"ok\": true}')\n", encoding="utf-8")
     row = {
         "version": "kairos.execution-closed-trade.v1",
+        "trade_id": "engine-trade",
+        "exit_origin": "system",
+        "exit_reason": "TARGET",
+        "settled_at": "2027-01-16T12:00:00+00:00",
         "strategy_id": "hourly_trend_candidates_v1",
         "symbol": "SOLUSDT",
         "decided_at_ms": 1_800_000_000_000,
@@ -176,6 +180,12 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
         execution_session_config=str(session),
     )
     for record in (
+        {
+            "event": "execution_session_finished",
+            "outcome": "CLOSED_AND_ACCOUNTED",
+            "trade_id": "engine-trade",
+            "candidate": "engine-candidate",
+        },
         {"event": "macro_allocation", "regime": "BEAR", "produced_at": "2027-01-01T00:00:00+00:00"},
         {"event": "macro_allocation", "regime": "BULL", "produced_at": "2027-01-15T00:00:00+00:00"},
         {
@@ -185,6 +195,12 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
             "regime": "CHOP",
             "decided_at_ms": 5,
             "r_multiple": "1.5",
+            "mode": "live",
+            "trade_id": "portfolio-trade",
+            "candidate_id": "portfolio-candidate",
+            "exit_origin": "system",
+            "pnl_basis": "execution_fills",
+            "pnl_exact": True,
         },
         {"event": "trade_closed", "pnl_usd": "0.1"},
     ):
@@ -194,6 +210,54 @@ def test_learning_outcomes_join_runner_and_execution_trades_with_their_regime(tm
         ("XRPUSDT", "CHOP", "1.5"),
         ("SOLUSDT", "BULL", "-1.0200"),
     }
+
+
+def test_only_attributed_automatic_live_closes_can_change_live_risk(tmp_path):
+    from kairos_autotrader.engine import collect_learning_outcomes
+    from kairos_autotrader.outcomes import recorded_closes
+
+    old = {
+        "event": "trade_closed",
+        "strategy_id": "s",
+        "signal_symbol": "SOLUSDT",
+        "decided_at_ms": 5,
+        "r_multiple": "3",
+        "pnl_exact": True,
+    }
+    exact = {
+        **old,
+        "mode": "live",
+        "trade_id": "verified",
+        "candidate_id": "c",
+        "exit_origin": "system",
+        "pnl_basis": "execution_fills",
+    }
+    events = [
+        old,
+        {"event": "session_start", "mode": "paper"},
+        old,
+        {**exact, "mode": "paper"},
+        {"event": "session_start", "mode": "live"},
+        {**old, "reason": "VENUE_EXIT"},
+        {**old, "pnl_exact": False},
+        {**exact, "exit_origin": "operator", "trade_id": "manual"},
+        {**exact, "exit_origin": "unknown", "trade_id": "unknown"},
+        {**exact, "candidate_id": None, "trade_id": "orphan"},
+        exact,
+        exact,
+    ]
+    (tmp_path / "journal.jsonl").write_text("\n".join(json.dumps(row) for row in events), encoding="utf-8")
+    outcomes = collect_learning_outcomes(tmp_path, Config())
+    assert len(outcomes) == 1 and outcomes[0]["source"] == "LIVE"
+    closes = recorded_closes(events)
+    assert [c.pnl_basis for c in closes[:5]] == [
+        "unknown",
+        "paper_fills",
+        "execution_fills",
+        "account_change",
+        "price_estimate",
+    ]
+    assert closes[3].exit_origin == "unknown"
 
 
 def test_replayed_signals_join_the_ledger_as_half_weight_evidence(tmp_path):

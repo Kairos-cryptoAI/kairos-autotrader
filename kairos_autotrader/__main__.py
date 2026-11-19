@@ -337,6 +337,8 @@ async def _report_ledger(config_path: Path | None, runtime_dir: Path) -> None:
 
 
 async def cmd_report(args: argparse.Namespace) -> int:
+    from .outcomes import recorded_closes
+
     _report_execution(getattr(args, "config", None))
     if getattr(args, "ledger", False):
         await _report_ledger(getattr(args, "config", None), args.runtime_dir)
@@ -344,22 +346,36 @@ async def cmd_report(args: argparse.Namespace) -> int:
     if not records:
         say("Журнал пуст.")
         return 0
-    closed = [r for r in records if r["event"] == "trade_closed"]
+    closed = recorded_closes(records)
     decisions = [r for r in records if r["event"] == "decision"]
-    total = sum(Decimal(r["pnl_usd"]) for r in closed)
-    wins = sum(Decimal(r["pnl_usd"]) > 0 for r in closed)
-    say(f"Сделок закрыто: {len(closed)}, из них в плюс: {wins}. Итог: {total:+.4f} USDT.")
-    for r in closed:
+    say(f"Закрытия в журнале runner: {len(closed)}.")
+    totals: dict[tuple[str, str], Decimal] = {}
+    counts: Counter = Counter()
+    for close in closed:
+        r = close.row
+        group = (close.mode, close.pnl_basis)
+        counts[group] += 1
+        totals[group] = totals.get(group, Decimal(0)) + Decimal(r["pnl_usd"])
         say(
             f"  {r['ts'][:19]} {r['symbol']} {r['side']} {r['reason']}: {Decimal(r['pnl_usd']):+.4f} USDT "
-            f"(решение: {r.get('source')}{'' if r.get('pnl_exact', True) else ', оценка по ценам'})"
+            f"({close.mode}, {close.pnl_basis}, инициатор закрытия: {close.exit_origin})"
         )
-    equities = [r for r in records if r["event"] in ("session_start", "trade_closed") and r.get("equity")]
-    if len(equities) > 1:
-        say(
-            f"Баланс по бирже: {Decimal(equities[0]['equity']):.4f} "
-            f"-> {Decimal(equities[-1]['equity']):.4f} USDT."
-        )
+    for group, total in sorted(totals.items()):
+        say(f"  {group[0]}, {group[1]}: {counts[group]} закрытий, сумма {total:+.4f} USDT.")
+    # Print observed account equity for each session. It also includes manual
+    # trades, transfers and open risk; grouping avoids mixing paper with real money.
+    observed_session: dict | None = None
+    latest = None
+    for r in [*records, {"event": "session_start"}]:
+        if r.get("event") == "session_start":
+            if observed_session and observed_session.get("equity") is not None and latest is not None:
+                say(
+                    f"Баланс сессии {observed_session.get('mode', 'unknown')} ({observed_session['ts'][:19]}): "
+                    f"{Decimal(observed_session['equity']):.4f} -> {Decimal(latest):.4f} USDT."
+                )
+            observed_session, latest = r, None
+        elif r.get("event") == "trade_closed" and r.get("equity") is not None:
+            latest = r["equity"]
     actions = Counter((d["decision"]["source"], d["decision"]["action"]) for d in decisions)
     say(
         "Решения: " + ", ".join(f"{src} {act}: {n}" for (src, act), n in sorted(actions.items()))
@@ -483,7 +499,7 @@ async def cmd_report(args: argparse.Namespace) -> int:
     if len(setups) > 1:
         for setup in setups:
             line(f"правило {setup}", {cid for cid, c in candidates.items() if c["setup"] == setup})
-    traded = {r.get("candidate_id") for r in closed}
+    traded = {close.row.get("candidate_id") for close in closed if close.mode == "live"}
     line("реально сторгованные", {cid for cid in traded if cid})
     return 0
 

@@ -58,6 +58,7 @@ from .evedex import (
 )
 from .execution_session import FINAL_OK, ExecutionSessions, ExecutionSettings
 from .management import Management, load_policy, managed_stop, partial_level, scale_in_status, tighter
+from .outcomes import recorded_closes
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
     LIVE_ACCOUNT_SOURCE,
@@ -1107,6 +1108,22 @@ def collect_learning_outcomes(directory: Path, config: Config, journal=None) -> 
                 records.append(json.loads(line))
             except ValueError:
                 continue
+    # Balance changes and estimated exits include effects from other positions,
+    # funding, account transfers or manual actions. They cannot establish strategy edge.
+    eligible = {}
+    for close in recorded_closes(records):
+        row = close.row
+        trade_id = row.get("trade_id")
+        if (
+            close.mode == "live"
+            and close.pnl_basis == "execution_fills"
+            and close.exit_origin == "system"
+            and row.get("pnl_exact") is True
+            and isinstance(trade_id, str)
+            and trade_id
+            and row.get("candidate_id")
+        ):
+            eligible[trade_id] = row
     outcomes = [
         {
             "strategy_id": r["strategy_id"],
@@ -1116,9 +1133,8 @@ def collect_learning_outcomes(directory: Path, config: Config, journal=None) -> 
             "decided_at_ms": r["decided_at_ms"],
             "source": "LIVE",
         }
-        for r in records
-        if r.get("event") == "trade_closed"
-        and r.get("r_multiple") is not None
+        for r in eligible.values()
+        if r.get("r_multiple") is not None
         and r.get("strategy_id")
         and r.get("signal_symbol")
         and isinstance(r.get("decided_at_ms"), int)
@@ -1169,6 +1185,18 @@ def collect_learning_outcomes(directory: Path, config: Config, journal=None) -> 
         except (OSError, RuntimeError, ValueError, KeyError) as exc:
             (journal or (lambda *a, **k: None))("learning_error", message=str(exc)[:200])
             rows = []
+        # The accepted accounting report is scoped to the Execution database. Bind
+        # it to completed live handoffs in this journal before using it in Risk.
+        finished = {
+            r["trade_id"]
+            for r in records
+            if r.get("event") == "execution_session_finished"
+            and r.get("outcome") == "CLOSED_AND_ACCOUNTED"
+            and r.get("candidate")
+            and not r.get("exit_requested")
+            and r.get("trade_id")
+            and r["trade_id"] not in eligible
+        }
         outcomes.extend(
             {
                 "strategy_id": row["strategy_id"],
@@ -1179,7 +1207,13 @@ def collect_learning_outcomes(directory: Path, config: Config, journal=None) -> 
                 "source": "LIVE",
             }
             for row in rows
-            if row.get("r_multiple") is not None
+            if row.get("trade_id") in finished
+            and row.get("version") == "kairos.execution-closed-trade.v1"
+            and row.get("settled_at")
+            and row.get("exit_reason") in {"STOP", "TARGET", "TIMEOUT"}
+            and not row.get("early_exit")
+            and row.get("exit_origin") == "system"
+            and row.get("r_multiple") is not None
         )
     return outcomes
 
@@ -2624,7 +2658,7 @@ class Trader:
         if "pnl_usd" in trade:  # the paper broker computes it itself
             return dec(trade["pnl_usd"]), True
         if trade.get("solo", True):
-            return equity - dec(trade["equity_before"]), True
+            return equity - dec(trade["equity_before"]), False
         if book is None:
             book = await self.api.book(trade["symbol"])
         touch = book.bid if trade["side"] == "LONG" else book.ask
@@ -2700,6 +2734,21 @@ class Trader:
             reason=reason,
             pnl_usd=str(pnl),
             pnl_exact=exact,
+            mode=self.broker.mode,
+            pnl_basis=(
+                "paper_fills"
+                if self.broker.mode == "paper"
+                else "account_change"
+                if trade.get("solo", True)
+                else "price_estimate"
+            ),
+            exit_origin=(
+                "operator"
+                if reason == "OPERATOR_CLOSE"
+                else "unknown"
+                if reason == "VENUE_EXIT"
+                else "system"
+            ),
             equity=str(equity),
             exit_price=trade.get("exit_price"),
             source=trade["decision"].get("source"),
@@ -2713,7 +2762,7 @@ class Trader:
         )
         say(
             f"ВЫХОД {trade['symbol']} ({reason}). Результат сделки: {pnl:+.4f} USDT"
-            f"{'' if exact else ' (оценка по ценам)'}. Баланс: {equity:.4f} USDT. "
+            f"{'' if exact else ' (оценка)'}. Баланс: {equity:.4f} USDT. "
             f"Открыто позиций: {len(trades)}."
         )
         limit = Decimal(str(self.config.session_loss_stop_usd))

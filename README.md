@@ -77,6 +77,16 @@ A `STOP` file in the runtime directory stops new entries and lets the runner man
 open positions to exit. A `CLOSE` file requests immediate closure. Execution Engine
 sessions also require the [production session setup](https://github.com/Kairos-cryptoAI/kairos-execution-engine/blob/main/docs/PRODUCTION-SESSION.md).
 
+## Reading trade results
+
+The report groups closes by live or paper mode and by the source of their PnL. Each
+row shows the recorded exit initiator. A disappearing position has unknown origin.
+For earlier live trades the balance delta includes any manual trading, transfers and
+funding during the trade. Overlapping positions have price estimates. The learning
+ledger admits a live result only with attributed execution accounting, a system exit
+and an identifiable trade and candidate. Simulated replay evidence retains its own
+source. Compare observed account balances separately from strategy PnL.
+
 ## Development checks
 
 Run `make all` for Ruff lint and format, mypy, Bandit, pytest and the package build.
