@@ -8,6 +8,11 @@ management and the historical studies in Russian. The
 [Kairos project](https://github.com/Kairos-cryptoAI/kairos) maintains the service-stack
 manifest, release evidence and readiness statements.
 
+This revision blocks new EVEDEX production entries. A native full-position
+take-profit increased an existing short when it triggered. The runner records
+the reason at startup. Paper trading, account reconciliation, cancellation and
+the dedicated position-close endpoint remain available.
+
 ## From a closed bar to a position
 
 | Stage | What the runner uses |
