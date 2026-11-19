@@ -1377,6 +1377,49 @@ def test_every_loop_replaces_the_heartbeat_for_the_alert_monitor(tmp_path):
     assert datetime.fromisoformat(beat["at"]) >= datetime.fromisoformat(beat["started_at"])
 
 
+def test_position_fault_keeps_observing_the_portfolio_without_repeating_the_halt(tmp_path, monkeypatch):
+    from kairos_autotrader.engine import MANUAL_CHECK_PREFIX, POSITION_MISMATCH
+
+    trader = live_trader(tmp_path, FakeVenue())
+    trader.store.state["open_trades"] = [
+        {"id": "problem", "symbol": "OPUSD"},
+        {"id": "other", "symbol": "ARBUSD"},
+    ]
+    trader.store.state["last_bar"] = trader.scan_slot(now_ms())
+    managed, observations = [], []
+
+    async def manage(trade, now):
+        managed.append(trade["symbol"])
+        if trade["symbol"] == "OPUSD":
+            raise NeedsOperator(POSITION_MISMATCH)
+
+    async def observe():
+        observations.append(True)
+
+    monkeypatch.setattr(trader, "manage", manage)
+    monkeypatch.setattr(trader.broker, "refresh_performance", observe)
+    asyncio.run(trader._loop(max_steps=32))
+    assert managed == ["OPUSD", "ARBUSD"] * 32 and len(observations) == 32
+    assert trader.store.state["halted"] == MANUAL_CHECK_PREFIX + POSITION_MISMATCH
+    assert trader.store.state["entry_reconciliation_halt"]
+    rows = journal_of(trader)
+    assert [r["symbol"] for r in rows if r["event"] == "position_management_error"] == ["OPUSD"]
+    assert sum(r["event"] == "error" for r in rows) == sum(r["event"] == "halt" for r in rows) == 1
+
+
+def test_exact_old_position_latch_requires_explicit_proven_flat_resume(tmp_path):
+    from kairos_autotrader.engine import MANUAL_CHECK_PREFIX, POSITION_MISMATCH
+
+    trader = live_trader(tmp_path, FakeVenue())
+    asyncio.run(trader.start())
+    trader.halt(MANUAL_CHECK_PREFIX + POSITION_MISMATCH)
+    with pytest.raises(NeedsOperator, match="open or pending"):
+        asyncio.run(trader._resume_reconciled(trader.broker, [{"symbol": "OPUSD"}]))
+    assert trader.entries_blocked()
+    asyncio.run(trader.start(resume_reconciled=True))
+    assert trader.entries_blocked() is None
+
+
 def test_scan_trades_only_the_selected_strategies_and_runs_the_daily_rule_at_one_utc(tmp_path, monkeypatch):
     from support import strict_intent
 

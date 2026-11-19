@@ -324,6 +324,63 @@ async def test_real_preloaded_worker_keeps_exact_contracts_and_isolates_requests
             await worker.stop()
 
 
+async def test_real_multi_candidate_batch_freezes_all_contexts_at_one_cut(tmp_path):
+    with Provider() as provider:
+        config = real_config(provider)
+        worker = AggregatorSession(config)
+        try:
+            await worker.warm()
+            decision = recent_decision()
+            candidates, bars, market = [], {}, {}
+            for symbol in ("ENAUSD", "APTUSD", "ARBUSD"):
+                item, rows = review_case(symbol, decision)
+                candidates.append(item)
+                bars[item.intent.symbol] = rows
+                market[item.intent.symbol] = snapshot(item.intent.symbol, decision - 20_000)
+            reviews = await review_candidates(
+                config,
+                candidates=candidates,
+                closed_bars=bars,
+                market=market,
+                signals=[],
+                macro=None,
+                openai_key=TEST_KEY,
+                ledger=tmp_path / "budget.json",
+                monthly_budget_usd=12.0,
+                session=worker,
+            )
+            assert len(provider.requests) == len(reviews.contracts) == 3
+            assert all(row["decision"] == "ALLOW" for row in reviews.records)
+            cuts = {row["context_capture_at_ms"] for row in reviews.records}
+            assert len(cuts) == 1 and cuts.pop() < min(c.route.review_deadline_ms for c in candidates)
+        finally:
+            await worker.stop()
+
+
+async def test_overdue_batch_returns_wait_while_its_single_request_settles(tmp_path, monkeypatch):
+    offered = [candidate(symbol=s) for s in ("ENAUSD", "APTUSD", "ARBUSD")]
+    trader, calls = trader_with_reviews(tmp_path, monkeypatch, mode="aggregator", shadow=False)
+    deadline = offered[0].route.review_deadline_ms
+    monkeypatch.setattr(engine.time, "time", lambda: (deadline - 550) / 1000)
+    release = asyncio.Event()
+    sent = []
+
+    async def slow_review(config, **kwargs):
+        sent.append(len(kwargs["candidates"]))
+        await release.wait()
+        return Reviews([], [], {offered[0].id: object()})
+
+    monkeypatch.setattr(engine, "review_candidates", slow_review)
+    trader._reviews = {"prior": object()}
+    result = await asyncio.wait_for(trader._aggregator_decision(offered, 1), timeout=0.4)
+    assert result.action == "WAIT" and trader._reviews == {}
+    assert (await trader._aggregator_decision(offered, 1)).action == "WAIT"
+    assert sent == [3] and not trader._aggregator_task.done()
+    release.set()
+    await trader._aggregator_task
+    assert trader._reviews == {} and calls["probability"] == 0
+
+
 def test_real_review_defers_without_market_evidence_or_budget_and_never_calls_the_model(tmp_path):
     decision = recent_decision()
     with Provider() as provider:
@@ -454,6 +511,8 @@ def test_allowed_candidates_are_ranked_by_priority_one_per_instrument():
 
 
 def trader_with_reviews(tmp_path, monkeypatch, *, mode: str, shadow: bool = True, reviews=None, fail=False):
+    boundary = candidate().signal_time
+    monkeypatch.setattr(engine.time, "time", lambda: (boundary + 1_000) / 1_000)
     cfg = Config(review_mode=mode, review_shadow=shadow, use_text_scouts=False)
     cfg.validate()
     store = Store(tmp_path / "rt")
@@ -672,6 +731,7 @@ def test_market_snapshots_are_taken_before_the_boundary_and_used_only_for_its_de
     assert record["event"] == "market_snapshots" and record["symbols"] == ["SOLUSDT"]
 
     given = {}
+    monkeypatch.setattr(engine.time, "time", lambda: boundary / 1000)
 
     async def reviews(config, **kwargs):
         given["market"] = kwargs["market"]

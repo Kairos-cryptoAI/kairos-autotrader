@@ -34,6 +34,7 @@ from .aggregator_review import (
     AggregatorConfig,
     AggregatorError,
     AggregatorSession,
+    Reviews,
     allowed_in_order,
     review_candidates,
     revisions,
@@ -143,6 +144,9 @@ SNAPSHOT_LEAD_MS = (10_000, 75_000)
 # window), so the scan starts soon after the close and runs its parts wide: the last
 # minute bar is on Binance within a second or two of the close.
 SCAN_AFTER_CLOSE_MS = 5_000
+POSITION_MISMATCH = "position quantity, side or price differs from the owned entry"
+MANUAL_CHECK_PREFIX = "нужна ручная проверка счёта: "
+REPEATED_ERRORS_HALT = "слишком много ошибок подряд"
 BAR_CONCURRENCY = 8
 ENGINE_PROCESSES = 8
 # The right-tail rule reads 35 days of minute bars per instrument; it runs beside the hourly
@@ -800,6 +804,8 @@ class Trader:
         self.aggregator: AggregatorConfig | None = None
         self._aggregator_session: AggregatorSession | None = None
         self._aggregator_warm_task: asyncio.Task | None = None
+        self._aggregator_task: asyncio.Task[Reviews] | None = None
+        self._position_faults: dict[str, tuple[str, str]] = {}
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
             try:
@@ -1404,6 +1410,10 @@ class Trader:
         state = self.store.state
         halt = state.get("halted")
         eligible = state.get("entry_reconciliation_halt")
+        # Old runners wrote this specific ownership fault with a false flag. The same
+        # flat-account and venue/journal checks below are required for an explicit resume.
+        if halt == MANUAL_CHECK_PREFIX + POSITION_MISMATCH:
+            eligible = True
         if eligible is None and isinstance(halt, str):
             # Older live runners recorded only the reason, including the affected instrument.
             prefixes = tuple(f"вход {symbol} требует сверки: " for symbol in self.config.symbols)
@@ -1931,21 +1941,42 @@ class Trader:
             self._market_task.cancel()
         market = self._market["items"] if self._market["boundary"] == boundary else {}
         started_after_close_s = round((time.time() * 1000 - boundary) / 1000, 2)
+        deadline = min(c.route.review_deadline_ms for c in candidates)
+        # Reserve the final half second for publishing the selected decision.
+        remaining = (deadline - 500) / 1000 - time.time()
         try:
-            result = await review_candidates(
-                self.aggregator,
-                candidates=candidates,
-                market=market,
-                closed_bars=self._review_bars,
-                signals=self.news.raw_signals() if self.news else [],
-                macro=self.macro.allocation_message() if self.macro else None,
-                openai_key=self.openai_key,
-                ledger=self.store.directory / "llm-budget.json",
-                monthly_budget_usd=self.config.review_budget_usd,
-                session=self._aggregator_session,
+            if remaining <= 0:
+                raise TimeoutError("review window has elapsed")
+            if self._aggregator_task is not None and not self._aggregator_task.done():
+                raise AggregatorError("previous review is still settling")
+            self._aggregator_task = asyncio.create_task(
+                review_candidates(
+                    self.aggregator,
+                    candidates=candidates,
+                    market=market,
+                    closed_bars=self._review_bars,
+                    signals=self.news.raw_signals() if self.news else [],
+                    macro=self.macro.allocation_message() if self.macro else None,
+                    openai_key=self.openai_key,
+                    ledger=self.store.directory / "llm-budget.json",
+                    monthly_budget_usd=self.config.review_budget_usd,
+                    session=self._aggregator_session,
+                )
             )
+            # Leave any dispatched usage reservation to settle. A late result cannot authorize an entry.
+            self._aggregator_task.add_done_callback(self._observe_review_completion)
+            async with asyncio.timeout(remaining):
+                result = await asyncio.shield(self._aggregator_task)
+            if time.time() * 1000 >= deadline:
+                raise TimeoutError("review returned after the route deadline")
         except (TimeoutError, AggregatorError, OSError) as exc:
-            self.store.journal("aggregator_error", kind=type(exc).__name__, message=str(exc)[:300])
+            self._reviews = {}
+            self.store.journal(
+                "aggregator_error",
+                kind=type(exc).__name__,
+                message=str(exc)[:300] or "review window elapsed while waiting for worker",
+                done_after_close_s=round((time.time() * 1000 - boundary) / 1000, 3),
+            )
             return brain.Decision(
                 "WAIT",
                 None,
@@ -2397,6 +2428,7 @@ class Trader:
             and not self.entries_blocked()
         )
         for trade in [] if scan_first else list(trades):
+            symbol = trade["symbol"]
             try:
                 await self.manage(trade, now_ms)
             except (
@@ -2406,11 +2438,36 @@ class Trader:
                 CanaryAccountError,
                 aiohttp.ClientError,
             ) as exc:
-                failure = failure or exc  # keep managing the other positions first
+                fault = type(exc).__name__, str(exc)[:300]
+                if self._position_faults.get(symbol) != fault:
+                    self.store.journal(
+                        "position_management_error", symbol=symbol, kind=fault[0], message=fault[1]
+                    )
+                    self._position_faults[symbol] = fault
+                if failure is None or (
+                    isinstance(exc, (NeedsOperator, PortfolioJournalError))
+                    and not isinstance(failure, (NeedsOperator, PortfolioJournalError))
+                ):
+                    failure = exc  # a transient fault on another instrument cannot mask an ownership fault
+            else:
+                if self._position_faults.pop(symbol, None) is not None:
+                    self.store.journal("position_management_recovered", symbol=symbol)
+        if isinstance(self.broker, LiveBroker):
+            try:
+                await self.broker.refresh_performance()
+            except (
+                TimeoutError,
+                EvedexError,
+                PortfolioJournalError,
+                CanaryAccountError,
+                sqlite3.Error,
+                aiohttp.ClientError,
+            ) as refresh_error:
+                if failure is not None:
+                    raise failure from refresh_error
+                raise
         if failure is not None:
             raise failure
-        if isinstance(self.broker, LiveBroker):
-            await self.broker.refresh_performance()
         if self.entries_blocked():
             return
         free = self.slot_limit() - len(trades)
@@ -2475,6 +2532,11 @@ class Trader:
                     await news_task
             await self.stop_engine_workers()
 
+    @staticmethod
+    def _observe_review_completion(task: asyncio.Task[Reviews]) -> None:
+        if not task.cancelled():
+            task.exception()
+
     async def _warm_review_worker(self, name: str, session: WorkerSession) -> None:
         started = time.monotonic()
         try:
@@ -2487,6 +2549,7 @@ class Trader:
     async def stop_engine_workers(self) -> None:
         """End the background engine work and the persistent workers before the loop closes."""
         for task in (
+            self._aggregator_task,
             self._probability_shadow,
             self._metrics_task,
             self._warm_task,
@@ -2563,6 +2626,7 @@ class Trader:
 
     async def _loop(self, max_steps: int | None) -> None:
         errors = steps = 0
+        last_fault: tuple[str, str] | None = None
         started_at = datetime.now(UTC).isoformat()
         while max_steps is None or steps < max_steps:
             steps += 1
@@ -2573,6 +2637,7 @@ class Trader:
                     say("Новые входы завершены. Открытых позиций и ожидающих операций нет.")
                     return
                 errors = 0
+                last_fault = None
             except (
                 TimeoutError,
                 EvedexError,
@@ -2582,18 +2647,22 @@ class Trader:
                 aiohttp.ClientError,
             ) as exc:
                 errors += 1
-                self.store.journal(
-                    "error",
-                    kind=type(exc).__name__,
-                    message=str(exc)[:300],
-                    body=getattr(exc, "body", "")[:300],
-                )
-                say(f"Ошибка связи с биржей ({type(exc).__name__}): {str(exc)[:160]}")
+                fault = type(exc).__name__, str(exc)[:300]
+                if last_fault != fault:
+                    self.store.journal(
+                        "error", kind=fault[0], message=fault[1], body=getattr(exc, "body", "")[:300]
+                    )
+                    say(f"Ошибка торгового цикла ({fault[0]}): {fault[1][:160]}")
+                    last_fault = fault
+                active_halt = self.store.state.get("halted")
                 if isinstance(exc, (NeedsOperator, PortfolioJournalError)):
-                    self.halt("нужна ручная проверка счёта: " + str(exc)[:200])
-                if errors >= 30:
-                    self.halt("слишком много ошибок подряд")
-                    errors = 0
+                    if not active_halt or active_halt == REPEATED_ERRORS_HALT:
+                        self.halt(
+                            MANUAL_CHECK_PREFIX + str(exc)[:200],
+                            reconcile_entry=isinstance(exc, NeedsOperator) and str(exc) == POSITION_MISMATCH,
+                        )
+                elif errors >= 30 and not active_halt:
+                    self.halt(REPEATED_ERRORS_HALT)
             self._heartbeat(started_at)
             await asyncio.sleep(self.pause_s(time.time()) if max_steps is None else 0)
 
