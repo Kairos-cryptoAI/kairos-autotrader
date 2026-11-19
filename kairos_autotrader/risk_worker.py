@@ -41,7 +41,7 @@ import json
 import math
 import sys
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 MARKER = "@@KAIROS-WORKER@@"
@@ -305,21 +305,24 @@ def decide(request: dict, venue) -> dict:
             }
     result = _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_record)
     decision = result.decision
-    minimum = venue_in.get("min_quantity")
+    try:
+        minimum = Decimal(str(venue_in.get("min_quantity") or 0))
+    except InvalidOperation:
+        return {"refused": "venue minimum lot is invalid"}
+    if not minimum.is_finite() or minimum < 0:
+        return {"refused": "venue minimum lot is invalid"}
     if (
         adaptive_record is not None
         and minimum
         and decision.approved
-        and 0 < decision.quantity < float(minimum)
+        and 0 < Decimal(str(decision.quantity)) < minimum
     ):
         # The adaptive share sized a position below the venue's minimum lot: the share is
         # raised just enough for that lot, only within the constitution's ceiling, and the
         # Risk Manager decides again with it.
-        from decimal import Decimal
-
         needed = (
             Decimal(adaptive_record["per_trade_risk_fraction"])
-            * Decimal(str(minimum))
+            * minimum
             / Decimal(repr(decision.quantity))
             * Decimal("1.02")
         )
@@ -334,10 +337,15 @@ def decide(request: dict, venue) -> dict:
             needed_fraction=needed,
         )
         if raised_limits is None:
-            adaptive_record = {**adaptive_record, "minimum_lot": raised_record["reasons"][-1]}
-        else:
-            result = _evaluate(scope_in, account, review, allocation, venue, raised_limits, raised_record)
-            adaptive_record = raised_record
+            reason = raised_record["reasons"][-1]
+            return {"refused": reason, "adaptive": {**adaptive_record, "minimum_lot": reason}}
+        result = _evaluate(scope_in, account, review, allocation, venue, raised_limits, raised_record)
+        adaptive_record = raised_record
+    if result.decision.approved and Decimal(str(result.decision.quantity)) < minimum:
+        refusal: dict[str, Any] = {"refused": "approved risk size is below the venue's minimum lot"}
+        if adaptive_record is not None:
+            refusal["adaptive"] = adaptive_record
+        return refusal
     answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
     if adaptive_record is not None:
         answer["adaptive"] = adaptive_record
