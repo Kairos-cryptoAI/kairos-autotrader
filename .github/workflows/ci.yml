@@ -73,7 +73,7 @@ jobs:
           kairos-aggregator 34963c2787e0afcbe587cadde7d612737d996eca
           kairos-llm 3a4781965f4d6d4d05d233fe525986409f1a5f12
           kairos-quant-scouts 7f994a3cb7c48fbbe9a4c590a1e4733e6e11a633
-          kairos-risk-manager f27da1ecf70d2de09a111b63fa4e979ed9343126
+          kairos-risk-manager f7eeeb6de2ceb4e093eddc55bce30348cc7864de
           kairos-router 06b1a9044af77cdac59c83f9fe8264acd0b1f729
           PINS
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -103,7 +103,8 @@ jobs:
             tests/test_aggregator_review.py::test_real_multi_candidate_batch_freezes_all_contexts_at_one_cut \
             tests/test_aggregator_review.py::test_overdue_batch_returns_wait_while_its_single_request_settles \
             tests/test_routing.py::test_real_router_ignores_pair_evidence_outside_the_candidate_batch \
-            tests/test_risk.py::test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_beyond
+            tests/test_risk.py::test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_beyond \
+            tests/test_risk_margin.py::test_registered_risk_worker_fits_margin_after_full_sizing
           .venv/bin/python - "$RUNNER_TEMP/trading-contracts.xml" <<'PY'
           import sys
           import xml.etree.ElementTree as ET

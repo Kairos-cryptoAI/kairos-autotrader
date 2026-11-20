@@ -97,7 +97,7 @@ class RiskSession:
     The worker keeps Quant Scouts and the Risk Manager loaded. For each eligible candidate
     it asks for the account while it measures the venue. Both sources retain their own
     capture times and the evaluator checks their age when deciding.
-    Any failure kills the worker; the next entry starts a fresh one.
+    A transport failure discards the worker. A complete error reply is scoped to its entry.
     """
 
     def __init__(self, config: RiskConfig) -> None:
@@ -161,9 +161,14 @@ class RiskSession:
                 async with asyncio.timeout(self.config.timeout_s):
                     await self._write(request)
                     answer = await self._read()
-                    if answer.get("need_account"):
+                    # Each public-book attempt requests its own authenticated snapshot.
+                    for _ in range(2):
+                        if not answer.get("need_account"):
+                            break
                         await self._write({"account": await account()})
                         answer = await self._read()
+                    if answer.get("need_account"):
+                        raise RiskError("Risk Manager: worker exceeded the account-read limit")
                 return answer
             except (TimeoutError, OSError, ValueError, RiskError) as exc:
                 await self.stop()
@@ -277,6 +282,10 @@ async def evaluate_entry(
     else:
         request["account"] = await account() if callable(account) else account
         answer = await asyncio.to_thread(runner or _run_worker, config, request)
+    if "error" in answer:
+        # A complete worker error is a terminal response to this candidate. The persistent
+        # session has already consumed it, so the next candidate can use the same worker.
+        raise RiskError(f"Risk Manager: {str(answer['error'])[:200]}")
     if "refused" in answer:
         reason = str(answer["refused"])[:200]
         record = {"approved": False, "refused": reason}
