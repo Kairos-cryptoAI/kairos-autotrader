@@ -22,6 +22,7 @@ from typing import Any
 
 import aiohttp
 from kairos_core.contracts import StrategyIntentV1
+from kairos_execution import portfolio_broker
 from kairos_execution.one_canary_account import CanaryAccountError
 from kairos_execution.portfolio_broker import NeedsOperator
 from kairos_execution.portfolio_broker import PortfolioBroker as LiveBroker
@@ -34,6 +35,7 @@ from .aggregator_review import (
     AggregatorConfig,
     AggregatorError,
     AggregatorSession,
+    Reviews,
     allowed_in_order,
     review_candidates,
     revisions,
@@ -59,7 +61,7 @@ from .evedex import (
     floor_step,
 )
 from .execution_session import legacy_session_result
-from .management import Management, load_policy, managed_stop, partial_level, scale_in_status, tighter
+from .management import Management, load_policy, managed_stop, scale_in_status, tighter
 from .outcomes import recorded_closes
 from .risk import (
     AGGREGATE_OPEN_RISK_FRACTION,
@@ -143,6 +145,12 @@ SNAPSHOT_LEAD_MS = (10_000, 75_000)
 # window), so the scan starts soon after the close and runs its parts wide: the last
 # minute bar is on Binance within a second or two of the close.
 SCAN_AFTER_CLOSE_MS = 5_000
+POSITION_MISMATCH = "position quantity, side or price differs from the owned entry"
+MANUAL_CHECK_PREFIX = "нужна ручная проверка счёта: "
+REPEATED_ERRORS_HALT = "слишком много ошибок подряд"
+# An older Execution wheel never reports a proved, temporarily unindexed close.
+_SETTLEMENT_PENDING = getattr(portfolio_broker, "SettlementPending", ())
+
 BAR_CONCURRENCY = 8
 ENGINE_PROCESSES = 8
 # The right-tail rule reads 35 days of minute bars per instrument; it runs beside the hourly
@@ -424,7 +432,8 @@ def management_step(
 ) -> tuple[Decimal | None, Decimal | None]:
     """What the trade's management policy asks for now: a tighter stop and/or a partial exit.
 
-    The best price since entry is updated from the book. A new stop is on the price tick,
+    The best price since entry includes book observations and confirmed native target fills.
+    A new stop is on the price tick,
     strictly less risky than the stop in force and away from the market by one tick; a
     partial exit is a multiple of the quantity step and leaves at least the minimum lot.
     """
@@ -434,29 +443,61 @@ def management_step(
     side, entry = trade["side"], float(trade["entry_price"])
     initial = float(trade.get("initial_stop", trade["stop"]))
     touch = book.bid if side == "LONG" else book.ask
-    best = float(trade.get("best_price", trade["entry_price"]))
-    best = max(best, float(touch)) if side == "LONG" else min(best, float(touch))
+    # A resting target can fill between polls, even while the runner is restarting.
+    # Execution reconciles these fills to this position before management runs.
+    favorable = max if side == "LONG" else min
+    best = favorable(float(trade.get("best_price", trade["entry_price"])), float(touch))
+    for _, _, price in trade.get("native_target_fills", ()):
+        best = favorable(best, float(price))
     trade["best_price"] = repr(best)
     part: Decimal | None = None
-    level = partial_level(policy, side, entry, initial)
-    if level is not None and not trade.get("partial_done") and instrument is not None:
-        reached = float(touch) >= level if side == "LONG" else float(touch) <= level
-        if reached:
-            quantity = dec(trade["quantity"])
+    targets = policy.targets()
+    if (
+        instrument is not None
+        and targets
+        and not trade.get("partial_done")
+        and not trade.get("native_partial_targets")
+    ):
+        initial_quantity = dec(trade.setdefault("initial_quantity", trade["quantity"]))
+        quantity = dec(trade["quantity"])
+        if quantity > initial_quantity:
+            raise NeedsOperator("managed position exceeds its original fill")
+        sign = 1 if side == "LONG" else -1
+        gain = sign * (touch - dec(trade["entry_price"]))
+        risk = abs(dec(trade["entry_price"]) - dec(trade.get("initial_stop", trade["stop"])))
+        fraction = sum(
+            (Decimal(str(t.fraction)) for t in targets if risk > 0 and gain >= Decimal(str(t.at_r)) * risk),
+            Decimal(0),
+        )
+        if fraction > 0:
+            # The reconciled remainder also covers a restart just after a confirmed fill.
             step = instrument.quantity_step
-            wanted = quantity * Decimal(repr(policy.partial_fraction))
-            part = (wanted / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if part < instrument.min_quantity or quantity - part < instrument.min_quantity:
+            cumulative = (initial_quantity * fraction / step).to_integral_value(rounding=ROUND_DOWN) * step
+            wanted = min(cumulative - (initial_quantity - quantity), quantity - instrument.min_quantity)
+            rounded = (wanted / step).to_integral_value(rounding=ROUND_DOWN) * step
+            if rounded > 0 and rounded >= instrument.min_quantity:
+                part = rounded
+            elif len(targets) == 1 and initial_quantity == quantity:
                 trade["partial_done"] = "skipped: the position is not divisible into minimum lots"
-                part = None
     desired = managed_stop(policy, side, entry, initial, best)
-    if trade.get("partial_done") == "done" and policy.breakeven_at_r is not None:
+    # Even a slipped partial fill proves its trigger was reached. All native
+    # levels are at least the first configured target, including rounded levels.
+    if (
+        (trade.get("native_target_fills") or trade.get("partial_done") == "done")
+        and targets
+        and policy.breakeven_at_r is not None
+        and policy.breakeven_at_r <= targets[0].at_r
+    ):
         desired = tighter(side, desired, entry)
     if instrument is None:
         return None, part
     tick = instrument.price_step
     rounding = ROUND_DOWN if side == "LONG" else ROUND_UP
     stop = (Decimal(repr(desired)) / tick).to_integral_value(rounding=rounding) * tick
+    if policy.breakeven_at_r is not None and desired == entry:
+        # An average fill can lie between ticks. Use the profitable side of entry.
+        rounding = ROUND_UP if side == "LONG" else ROUND_DOWN
+        stop = (dec(trade["entry_price"]) / tick).to_integral_value(rounding=rounding) * tick
     current = dec(trade["stop"])
     safe = stop <= touch - tick if side == "LONG" else stop >= touch + tick
     better = stop > current if side == "LONG" else stop < current
@@ -589,11 +630,16 @@ class PaperBroker:
         self._store.state["paper_equity"] = str(await self.equity() + pnl)
 
     async def move_stop(self, trade: dict[str, Any], stop: Decimal) -> bool:
+        current = dec(trade["stop"])
+        if stop <= current if trade["side"] == "LONG" else stop >= current:
+            raise ValueError("a stop may only move toward less risk")
         trade["stop"] = str(stop)
         return True
 
     async def partial_close(self, trade: dict[str, Any], book: Book, quantity: Decimal) -> Decimal | None:
         """Close part of the position at the book; returns the price."""
+        if not 0 < quantity < dec(trade["quantity"]):
+            return None
         entry = dec(trade["entry_price"])
         sign = 1 if trade["side"] == "LONG" else -1
         touch = book.bid if sign > 0 else book.ask
@@ -800,6 +846,10 @@ class Trader:
         self.aggregator: AggregatorConfig | None = None
         self._aggregator_session: AggregatorSession | None = None
         self._aggregator_warm_task: asyncio.Task | None = None
+        self._aggregator_task: asyncio.Task[Reviews] | None = None
+        self._position_faults: dict[str, tuple[str, str]] = {}
+        self._startup_reconciliation_pending = False
+        self._reported_unprotected: dict[str, str] = {}
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
             try:
@@ -898,12 +948,13 @@ class Trader:
 
     # ---- Kairos Macro Strategist and Risk Manager -------------------------------
 
+    @staticmethod
     def _market_view(
-        self, features: list[Features], metrics: dict[str, dict[str, Any]] | None = None
+        features: list[Features], scan_extras: dict[str, dict[str, Any]], metrics: dict[str, dict[str, Any]]
     ) -> dict[str, dict[str, Any]]:
         view: dict[str, dict[str, Any]] = {}
         for f in features:
-            extras = {**self._extras.get(f.symbol, {}), **(metrics or {}).get(f.symbol, {})}
+            extras = {**scan_extras.get(f.symbol, {}), **metrics.get(f.symbol, {})}
             view[f.symbol] = {
                 "price": round(f.price, 8),
                 "quant_bias": bias_of(f.trend),
@@ -1087,7 +1138,12 @@ class Trader:
         if self.macro is None or not features:
             return
         try:
-            account = await self._account_view()
+            # A slow account read may cross a scan boundary. Capture this scan's features and
+            # optional metrics together before another scan can replace their source.
+            scan_extras = {symbol: fields.copy() for symbol, fields in self._extras.items()}
+            account, metrics = await asyncio.gather(
+                self._account_view(), self._metrics_at(self.scan_slot(now_ms))
+            )
             if isinstance(self.broker, LiveBroker):
                 pilot = self.broker.pilot_status() or {}
                 performance = {"pilot_account_result_usd": pilot.get("account_result")}
@@ -1100,7 +1156,7 @@ class Trader:
                 openai_key=self.openai_key,
                 model=self.config.llm_model,
                 effort=self.config.macro_effort,
-                market=self._market_view(features, await self._metrics_at(self.scan_slot(now_ms))),
+                market=self._market_view(features, scan_extras, metrics),
                 portfolio={k: account[k] for k in ("equity_usd", "available_usd", "positions")},
                 performance={
                     **performance,
@@ -1313,7 +1369,21 @@ class Trader:
         self.store.state["early_exit_pending"] = remaining
         self.store.save()
 
-    def entries_blocked(self) -> str | None:
+    def _protection_block(self, instrument: str | None = None) -> str | None:
+        if not isinstance(self.broker, LiveBroker):
+            return None
+        if instrument is not None:
+            for_instrument = getattr(self.broker, "protection_unavailable_for", None)
+            if for_instrument is not None:
+                return for_instrument(instrument)
+        # An older installed execution package cannot certify position-reducing protection.
+        return getattr(
+            self.broker,
+            "native_protection_unavailable",
+            "Execution Engine does not report qualified position-reducing native protection",
+        )
+
+    def _account_entry_block(self) -> str | None:
         state = self.store.state
         if state.get("halted"):
             return str(state["halted"])
@@ -1325,9 +1395,19 @@ class Trader:
                 return "portfolio loss stop or unavailable performance baseline"
         if self.store.flag("STOP") or self.store.flag("CLOSE"):
             return "stop file present"
+        if state.get("settlement_pending") or self._startup_reconciliation_pending:
+            return "waiting for verified EVEDEX close history"
         if self._day()["trades"] >= self.config.max_trades_per_day:
             return "daily trade limit reached"
         return None
+
+    def entries_blocked(self, instrument: str | None = None) -> str | None:
+        return self._account_entry_block() or self._protection_block(instrument)
+
+    def _ranking_limit(self, candidates: list[Routed], free_slots: int) -> int:
+        # An instrument with unqualified exits may be reviewed but cannot take a live slot.
+        blocked = {c.instrument for c in candidates if self._protection_block(c.instrument)}
+        return free_slots + len(blocked)
 
     def slot_limit(self) -> int:
         return min(HARD_MAX_OPEN_POSITIONS, int(self.config.max_open_positions))
@@ -1353,7 +1433,25 @@ class Trader:
             if resume_reconciled:
                 await self._resume_reconciled(self.broker, trades)
             else:
-                await self._reconcile_portfolio(trades)
+                self._startup_reconciliation_pending = True
+                if not state.get("settlement_pending"):
+                    try:
+                        await self._reconcile_portfolio(trades)
+                    except _SETTLEMENT_PENDING as exc:
+                        self._remember_settlement(exc.symbol)
+                    else:
+                        self._startup_reconciliation_pending = False
+            blocked = {
+                symbol: reason for symbol in self.config.symbols if (reason := self._protection_block(symbol))
+            }
+            if blocked and blocked != self._reported_unprotected:
+                self.store.journal(
+                    "native_protection_unavailable",
+                    reason="; ".join(dict.fromkeys(blocked.values())),
+                    symbols=list(blocked),
+                )
+                say(f"Без подтверждённой защиты EVEDEX: {len(blocked)} из {len(self.config.symbols)}.")
+            self._reported_unprotected = blocked
             status = self.broker.pilot_status()
             pilot_baseline = status["baseline"] if status else None
         if new_session and self.broker.mode == "paper":
@@ -1389,6 +1487,8 @@ class Trader:
             opening = f"Стартовый баланс сессии: {state['session']['start_equity']} USDT"
         say(f"Режим: {self.broker.mode}. {opening}. Позиций одновременно: до {self.slot_limit()}.")
         for trade in self.trades():
+            if trade["symbol"] in state.get("settlement_pending", {}):
+                continue
             say(
                 f"Веду открытую позицию: {trade['symbol']} {trade['side']} {trade['quantity']} "
                 f"по {trade['entry_price']}, "
@@ -1400,10 +1500,74 @@ class Trader:
                 "Состояние печатается раз в 10 минут."
             )
 
-    async def _resume_reconciled(self, broker: LiveBroker, trades: list[dict[str, Any]]) -> None:
+    async def reconcile_while_stopped(self) -> None:
+        if not isinstance(self.broker, LiveBroker) or self.store.state.get("mode") != "live":
+            raise ConfigError("stopped reconciliation requires an existing live portfolio")
+        await self._resume_reconciled(self.broker, self.trades(), while_stopped=True)
+
+    def _remember_settlement(self, symbol: str, reason: str = "VENUE_EXIT") -> None:
+        if not isinstance(self.broker, LiveBroker) or (
+            symbol not in self.config.symbols and not any(t["symbol"] == symbol for t in self.trades())
+        ):
+            raise NeedsOperator("settlement wait does not identify an owned portfolio instrument")
+        waiting = self.store.state.setdefault("settlement_pending", {})
+        if symbol not in waiting:
+            waiting[symbol] = {"reason": reason, "verified": False}
+            self.store.save()
+            self.store.journal("settlement_pending", symbol=symbol)
+            say(f"{symbol}: EVEDEX подтвердил исполнение закрытия. Жду запись в истории позиции.")
+
+    async def _retry_settlements(self, previous: tuple[str, ...]) -> None:
+        waiting = self.store.state.get("settlement_pending", {})
+        for symbol in previous:
+            entry = waiting[symbol]
+            try:
+                if not entry["verified"]:
+                    check = getattr(self.broker, "reconcile_settlement", None)
+                    if check is None:
+                        # A downgraded wheel cannot clear a wait recorded by a newer one.
+                        return
+                    await check(symbol)
+                    # Settlement and the runner report are separately durable. A crash after the
+                    # journal closes must resume reporting without looking for an OPEN journal row.
+                    entry["verified"] = True
+                    self.store.save()
+                trade = next((t for t in self.trades() if t["symbol"] == symbol), None)
+                if trade is None:
+                    self._startup_reconciliation_pending = True
+                else:
+                    await self._finish(trade, entry["reason"], None, close=False)
+            except _SETTLEMENT_PENDING as exc:
+                if exc.symbol != symbol:
+                    raise NeedsOperator("pending close changed instrument during verification") from exc
+                if entry["verified"]:
+                    entry["verified"] = False
+                    self.store.save()
+                continue
+            del waiting[symbol]
+            if not waiting:
+                self.store.state.pop("settlement_pending", None)
+            self.store.save()
+            self.store.journal("settlement_confirmed", symbol=symbol)
+            say(f"{symbol}: закрытие подтверждено историей EVEDEX.")
+        if self._startup_reconciliation_pending and not waiting:
+            try:
+                await self._reconcile_portfolio(self.trades())
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+            else:
+                self._startup_reconciliation_pending = False
+
+    async def _resume_reconciled(
+        self, broker: LiveBroker, trades: list[dict[str, Any]], *, while_stopped: bool = False
+    ) -> None:
         state = self.store.state
         halt = state.get("halted")
         eligible = state.get("entry_reconciliation_halt")
+        # Old runners wrote this specific ownership fault with a false flag. The same
+        # flat-account and venue/journal checks below are required for an explicit resume.
+        if halt == MANUAL_CHECK_PREFIX + POSITION_MISMATCH:
+            eligible = True
         if eligible is None and isinstance(halt, str):
             # Older live runners recorded only the reason, including the affected instrument.
             prefixes = tuple(f"вход {symbol} требует сверки: " for symbol in self.config.symbols)
@@ -1412,8 +1576,8 @@ class Trader:
             raise ConfigError("no execution-reconciliation halt to resume")
         if trades or state.get("pending_entry") or state.get("execution_session"):
             raise NeedsOperator("runner still has an open or pending trade")
-        if self.store.flag("STOP") or self.store.flag("CLOSE"):
-            raise NeedsOperator("operator stop is active")
+        if self.store.flag("STOP") != while_stopped or self.store.flag("CLOSE"):
+            raise NeedsOperator("operator stop state does not match the requested reconciliation")
         if any(await asyncio.gather(self.api.positions(), self.api.open_orders(), self.api.active_tpsl())):
             raise NeedsOperator("venue still has a position or an open order or protection")
 
@@ -1431,11 +1595,16 @@ class Trader:
             <= datetime.fromisoformat(status["observed_at"])
             <= now
             or now >= broker.entry_deadline_utc
-            or self.store.flag("STOP")
+            or self.store.flag("STOP") != while_stopped
             or self.store.flag("CLOSE")
         ):
             raise NeedsOperator("a fresh flat account with an active pilot mandate is required")
-        self.store.journal("entry_halt_reconciled", reason=halt, observed_at=status["observed_at"])
+        self.store.journal(
+            "entry_halt_reconciled",
+            reason=halt,
+            observed_at=status["observed_at"],
+            while_stopped=while_stopped,
+        )
         state.pop("halted")
         state.pop("entry_reconciliation_halt", None)
         self.store.save()
@@ -1791,7 +1960,7 @@ class Trader:
     async def decide(
         self, features: list[Features], candidates: list[Routed], free_slots: int = 1
     ) -> brain.Decision:
-        control = brain.control_decision(candidates, free_slots)
+        control = brain.control_decision(candidates, self._ranking_limit(candidates, free_slots))
         day = self._day()
         if not (self.config.use_llm and self.openai_key):
             decision = control
@@ -1800,6 +1969,10 @@ class Trader:
         else:
             by_aggregator = self.config.review_mode == "aggregator" and self.aggregator is not None
             left = self.config.max_llm_calls_per_day - day["llm_calls"]
+            if by_aggregator and len(candidates) > left:
+                ranked = sorted(candidates, key=lambda c: (-c.strength, c.id))
+                self.store.journal("review_budget_limited", skipped=[c.id for c in ranked[left:]])
+                candidates = ranked[:left]
             shadow_slot = self._probability_shadow is None or self._probability_shadow.done()
             ask_probability = not by_aggregator or (
                 self.config.review_shadow and left > len(candidates) and shadow_slot
@@ -1931,21 +2104,42 @@ class Trader:
             self._market_task.cancel()
         market = self._market["items"] if self._market["boundary"] == boundary else {}
         started_after_close_s = round((time.time() * 1000 - boundary) / 1000, 2)
+        deadline = min(c.route.review_deadline_ms for c in candidates)
+        # Reserve the final half second for publishing the selected decision.
+        remaining = (deadline - 500) / 1000 - time.time()
         try:
-            result = await review_candidates(
-                self.aggregator,
-                candidates=candidates,
-                market=market,
-                closed_bars=self._review_bars,
-                signals=self.news.raw_signals() if self.news else [],
-                macro=self.macro.allocation_message() if self.macro else None,
-                openai_key=self.openai_key,
-                ledger=self.store.directory / "llm-budget.json",
-                monthly_budget_usd=self.config.review_budget_usd,
-                session=self._aggregator_session,
+            if remaining <= 0:
+                raise TimeoutError("review window has elapsed")
+            if self._aggregator_task is not None and not self._aggregator_task.done():
+                raise AggregatorError("previous review is still settling")
+            self._aggregator_task = asyncio.create_task(
+                review_candidates(
+                    self.aggregator,
+                    candidates=candidates,
+                    market=market,
+                    closed_bars=self._review_bars,
+                    signals=self.news.raw_signals() if self.news else [],
+                    macro=self.macro.allocation_message() if self.macro else None,
+                    openai_key=self.openai_key,
+                    ledger=self.store.directory / "llm-budget.json",
+                    monthly_budget_usd=self.config.review_budget_usd,
+                    session=self._aggregator_session,
+                )
             )
+            # Leave any dispatched usage reservation to settle. A late result cannot authorize an entry.
+            self._aggregator_task.add_done_callback(self._observe_review_completion)
+            async with asyncio.timeout(remaining):
+                result = await asyncio.shield(self._aggregator_task)
+            if time.time() * 1000 >= deadline:
+                raise TimeoutError("review returned after the route deadline")
         except (TimeoutError, AggregatorError, OSError) as exc:
-            self.store.journal("aggregator_error", kind=type(exc).__name__, message=str(exc)[:300])
+            self._reviews = {}
+            self.store.journal(
+                "aggregator_error",
+                kind=type(exc).__name__,
+                message=str(exc)[:300] or "review window elapsed while waiting for worker",
+                done_after_close_s=round((time.time() * 1000 - boundary) / 1000, 3),
+            )
             return brain.Decision(
                 "WAIT",
                 None,
@@ -1968,7 +2162,7 @@ class Trader:
                 **result.timing,
             },
         )
-        picks = allowed_in_order(reviews, candidates, free_slots)
+        picks = allowed_in_order(reviews, candidates, self._ranking_limit(candidates, free_slots))
         counts = {name: sum(r["decision"] == name for r in reviews) for name in ("ALLOW", "VETO", "DEFER")}
         top = next((r for r in reviews if picks and r["id"] == picks[0]), None)
         return brain.Decision(
@@ -1995,7 +2189,7 @@ class Trader:
         return self._reviews.get(candidate.id)
 
     async def try_enter(self, candidate: Routed, decision: brain.Decision) -> None:
-        blocked = self.entries_blocked()
+        blocked = self.entries_blocked(candidate.instrument)
         if blocked:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=blocked)
             return
@@ -2055,7 +2249,7 @@ class Trader:
                     self.risk,
                     review=review,
                     allocation={k: v for k, v in allocation.items() if k != "origin"} if allocation else None,
-                    # Read after the venue is measured, just before the decision.
+                    # Capture independent account and book observations concurrently.
                     account=self._account_evidence,
                     session=self.risk_session,
                     scope=scope,
@@ -2066,6 +2260,9 @@ class Trader:
                     min_quantity=minimum,
                     adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+                return
             except (NeedsOperator, PortfolioJournalError) as exc:
                 self.halt(f"портфель требует сверки: {str(exc)[:160]}", reconcile_entry=True)
                 return
@@ -2098,10 +2295,29 @@ class Trader:
         if equity_before is None:
             equity_before = await self.broker.equity()
         leverage = max(1, int(risk_decision.leverage))
+        policy = self.management_policy(now_ms, candidate.intent.strategy_id)
+        target_args: dict[str, Any] = {}
+        if policy and policy.targets() and isinstance(self.broker, LiveBroker):
+            qualifies = getattr(self.broker, "native_ladder_qualified_for", None)
+            if qualifies and qualifies(candidate.instrument):
+                target_args["partial_targets"] = [
+                    {"at_r": target.at_r, "fraction": target.fraction} for target in policy.targets()
+                ]
         try:
             fill = await self.broker.enter(
-                candidate, quantity, book, instrument, stop, take, leverage=leverage, decision=risk_decision
+                candidate,
+                quantity,
+                book,
+                instrument,
+                stop,
+                take,
+                leverage=leverage,
+                decision=risk_decision,
+                **target_args,
             )
+        except _SETTLEMENT_PENDING as exc:
+            self._remember_settlement(exc.symbol)
+            return
         except CanaryAccountError as exc:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=str(exc)[:200])
             return
@@ -2148,16 +2364,21 @@ class Trader:
             # Position management fixed for this trade's life (None: the plan as it is).
             "initial_stop": str(stop),
             "initial_quantity": str(fill["quantity"]),
-            "management": (lambda p: p.as_dict() if p else None)(
-                self.management_policy(now_ms, candidate.intent.strategy_id)
-            ),
+            "management": policy.as_dict() if policy else None,
+            "native_partial_targets": bool(fill.get("native_partial_targets")),
         }
+        if fill.get("closed_at_entry") in {"STOP", "TAKE"}:
+            trade["closed_at_entry"] = fill["closed_at_entry"]
+            trade["exit_price"] = str(fill["exit_price"])
         for other in trades:
             other["solo"] = False
         trades.append(trade)
         self._day()["trades"] += 1
         self.store.save()
         self.store.journal("trade_opened", trade=trade)
+        if trade.get("closed_at_entry"):
+            await self._finish(trade, trade["closed_at_entry"], None, close=False)
+            return
         say(
             f"ВХОД {trade['symbol']} {trade['side']} {trade['quantity']} по {fill['price']}, "
             f"плечо {trade['leverage']}x; "
@@ -2171,9 +2392,20 @@ class Trader:
     # ---- managing open trades ----------------------------------------------
 
     async def manage(self, trade: dict[str, Any], now_ms: int) -> None:
+        if trade.get("closed_at_entry"):
+            await self._finish(trade, trade["closed_at_entry"], None, close=False)
+            return
         if now_ms < trade.get("retry_after_ms", 0):
             return
-        if not await self.broker.position_open(trade):
+        is_open = await self.broker.position_open(trade)
+        if trade.get("native_target_fills"):
+            trade["partial_pnl_usd"] = str(
+                sum(
+                    estimate_pnl({**trade, "quantity": qty}, dec(price), self.fee)
+                    for _, qty, price in trade["native_target_fills"]
+                )
+            )
+        if not is_open:
             # One empty answer is not proof that the position is gone: the venue has had short
             # outages. Its protective orders are cancelled only after several polls agree.
             trade["missing_polls"] = trade.get("missing_polls", 0) + 1
@@ -2226,11 +2458,13 @@ class Trader:
         if part is not None:
             price = await self.broker.partial_close(trade, book, part)
             if price is not None:
-                trade["partial_done"] = "done"
+                if len(trade["management"].get("partial_targets", ())) <= 1:
+                    trade["partial_done"] = "done"
                 if self.broker.mode == "live":
                     # Partial fills remain price estimates until venue accounting is available.
                     partial = estimate_pnl({**trade, "quantity": str(part)}, price, self.fee)
                     trade["partial_pnl_usd"] = str(dec(trade.get("partial_pnl_usd", "0")) + partial)
+                self.store.save()
                 self.store.journal(
                     "partial_exit",
                     id=trade["id"],
@@ -2255,18 +2489,27 @@ class Trader:
             return dec(trade["pnl_usd"]), True
         if trade.get("solo", True):
             return equity - dec(trade["equity_before"]), False
-        if book is None:
-            book = await self.api.book(trade["symbol"])
-        exit_price = book.bid if trade["side"] == "LONG" else book.ask
+        if trade.get("closed_at_entry"):
+            exit_price = dec(trade["exit_price"])
+        else:
+            if book is None:
+                book = await self.api.book(trade["symbol"])
+            exit_price = book.bid if trade["side"] == "LONG" else book.ask
         trade["exit_price"] = str(exit_price)
         return estimate_pnl(trade, exit_price, self.fee) + dec(trade.get("partial_pnl_usd", "0")), False
 
     async def _finish(self, trade: dict[str, Any], reason: str, book: Book | None, *, close: bool) -> None:
-        if close:
-            if book is None:
-                raise NeedsOperator("a position cannot be closed without a fresh order book")
-            await self.broker.close(trade, book, reason)
-        receipt = await self.broker.settle(trade)
+        try:
+            if close:
+                if book is None:
+                    raise NeedsOperator("a position cannot be closed without a fresh order book")
+                await self.broker.close(trade, book, reason)
+            receipt = await self.broker.settle(trade)
+        except _SETTLEMENT_PENDING as exc:
+            if exc.symbol != trade["symbol"]:
+                raise NeedsOperator("pending close does not match the managed trade") from exc
+            self._remember_settlement(exc.symbol, reason)
+            raise
         equity = await self.broker.equity()
         pnl, exact = await self._trade_result(trade, reason, book, equity)
         origin = "operator" if reason == "OPERATOR_CLOSE" else "unknown"
@@ -2386,6 +2629,7 @@ class Trader:
         now_ms = int(time.time() * 1000)
         trades = self.trades()
         failure: Exception | None = None
+        waiting = tuple(self.store.state.get("settlement_pending", {}))
         slot = self.scan_slot(now_ms)
         # A scan that will run goes first: its review window closes 60 s after the bar, and each
         # open position costs venue round trips. Exchange stops protect them meanwhile, and they
@@ -2394,11 +2638,19 @@ class Trader:
             self.store.state.get("last_bar") != slot
             and now_ms - slot >= SCAN_AFTER_CLOSE_MS
             and self.slot_limit() - len(trades) > 0
-            and not self.entries_blocked()
+            and not self._account_entry_block()
+            and not any(self._protection_block(t["symbol"]) for t in trades)
         )
         for trade in [] if scan_first else list(trades):
+            symbol = trade["symbol"]
+            if symbol in waiting:
+                continue
             try:
                 await self.manage(trade, now_ms)
+            except _SETTLEMENT_PENDING as exc:
+                if exc.symbol != symbol:
+                    raise NeedsOperator("pending close does not match the managed trade") from exc
+                self._remember_settlement(exc.symbol)
             except (
                 TimeoutError,
                 EvedexError,
@@ -2406,12 +2658,40 @@ class Trader:
                 CanaryAccountError,
                 aiohttp.ClientError,
             ) as exc:
-                failure = failure or exc  # keep managing the other positions first
+                fault = type(exc).__name__, str(exc)[:300]
+                if self._position_faults.get(symbol) != fault:
+                    self.store.journal(
+                        "position_management_error", symbol=symbol, kind=fault[0], message=fault[1]
+                    )
+                    self._position_faults[symbol] = fault
+                if failure is None or (
+                    isinstance(exc, (NeedsOperator, PortfolioJournalError))
+                    and not isinstance(failure, (NeedsOperator, PortfolioJournalError))
+                ):
+                    failure = exc  # a transient fault on another instrument cannot mask an ownership fault
+            else:
+                if self._position_faults.pop(symbol, None) is not None:
+                    self.store.journal("position_management_recovered", symbol=symbol)
+        if isinstance(self.broker, LiveBroker):
+            try:
+                await self.broker.refresh_performance()
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+            except (
+                TimeoutError,
+                EvedexError,
+                PortfolioJournalError,
+                CanaryAccountError,
+                sqlite3.Error,
+                aiohttp.ClientError,
+            ) as refresh_error:
+                if failure is not None:
+                    raise failure from refresh_error
+                raise
         if failure is not None:
             raise failure
-        if isinstance(self.broker, LiveBroker):
-            await self.broker.refresh_performance()
-        if self.entries_blocked():
+        await self._retry_settlements(waiting)
+        if self._account_entry_block():
             return
         free = self.slot_limit() - len(trades)
         if free <= 0:
@@ -2444,8 +2724,8 @@ class Trader:
             f"Решение ({decision.source}): {decision.action} {', '.join(decision.picks)} "
             f"— {decision.reason[:200]}"
         )
-        for candidate_id in decision.picks[:free]:
-            if self.entries_blocked() or len(self.trades()) >= self.slot_limit():
+        for candidate_id in decision.picks:
+            if self._account_entry_block() or len(self.trades()) >= self.slot_limit():
                 break
             await self.try_enter(next(c for c in eligible if c.id == candidate_id), decision)
 
@@ -2475,6 +2755,11 @@ class Trader:
                     await news_task
             await self.stop_engine_workers()
 
+    @staticmethod
+    def _observe_review_completion(task: asyncio.Task[Reviews]) -> None:
+        if not task.cancelled():
+            task.exception()
+
     async def _warm_review_worker(self, name: str, session: WorkerSession) -> None:
         started = time.monotonic()
         try:
@@ -2487,6 +2772,7 @@ class Trader:
     async def stop_engine_workers(self) -> None:
         """End the background engine work and the persistent workers before the loop closes."""
         for task in (
+            self._aggregator_task,
             self._probability_shadow,
             self._metrics_task,
             self._warm_task,
@@ -2536,6 +2822,8 @@ class Trader:
             self.trades()
             or self.store.state.get("execution_session")
             or self.store.state.get("pending_entry")
+            or self.store.state.get("settlement_pending")
+            or self._startup_reconciliation_pending
         ):
             return False
         stop = self.store.flag("STOP")
@@ -2563,6 +2851,7 @@ class Trader:
 
     async def _loop(self, max_steps: int | None) -> None:
         errors = steps = 0
+        last_fault: tuple[str, str] | None = None
         started_at = datetime.now(UTC).isoformat()
         while max_steps is None or steps < max_steps:
             steps += 1
@@ -2573,6 +2862,11 @@ class Trader:
                     say("Новые входы завершены. Открытых позиций и ожидающих операций нет.")
                     return
                 errors = 0
+                last_fault = None
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+                errors = 0
+                last_fault = None
             except (
                 TimeoutError,
                 EvedexError,
@@ -2582,18 +2876,22 @@ class Trader:
                 aiohttp.ClientError,
             ) as exc:
                 errors += 1
-                self.store.journal(
-                    "error",
-                    kind=type(exc).__name__,
-                    message=str(exc)[:300],
-                    body=getattr(exc, "body", "")[:300],
-                )
-                say(f"Ошибка связи с биржей ({type(exc).__name__}): {str(exc)[:160]}")
+                fault = type(exc).__name__, str(exc)[:300]
+                if last_fault != fault:
+                    self.store.journal(
+                        "error", kind=fault[0], message=fault[1], body=getattr(exc, "body", "")[:300]
+                    )
+                    say(f"Ошибка торгового цикла ({fault[0]}): {fault[1][:160]}")
+                    last_fault = fault
+                active_halt = self.store.state.get("halted")
                 if isinstance(exc, (NeedsOperator, PortfolioJournalError)):
-                    self.halt("нужна ручная проверка счёта: " + str(exc)[:200])
-                if errors >= 30:
-                    self.halt("слишком много ошибок подряд")
-                    errors = 0
+                    if not active_halt or active_halt == REPEATED_ERRORS_HALT:
+                        self.halt(
+                            MANUAL_CHECK_PREFIX + str(exc)[:200],
+                            reconcile_entry=isinstance(exc, NeedsOperator) and str(exc) == POSITION_MISMATCH,
+                        )
+                elif errors >= 30 and not active_halt:
+                    self.halt(REPEATED_ERRORS_HALT)
             self._heartbeat(started_at)
             await asyncio.sleep(self.pause_s(time.time()) if max_steps is None else 0)
 

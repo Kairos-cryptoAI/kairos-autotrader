@@ -12,7 +12,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import time
 
 
 def main() -> int:
@@ -34,7 +33,10 @@ def main() -> int:
         assert "refused" in answer, "a measurement would need the network"
         sys.stdout.write(json.dumps(answer))
         return 0
-    now = int(time.time() * 1000)
+    # Both synthetic sources describe one observation. Do not age their clocks by the
+    # time it takes the test subprocess to import its dependencies on a cold machine.
+    now = payload["sampled_at_ms"]
+    worker._now_ms = lambda: now
 
     lead = int(payload.get("exchange_clock_lead_ms", 0))
 

@@ -36,6 +36,12 @@ MAX_POLICY_AGE_MS = 35 * DAY_MS
 
 
 @dataclass(frozen=True, slots=True)
+class PartialTarget:
+    at_r: float
+    fraction: float  # of the quantity filled at entry
+
+
+@dataclass(frozen=True, slots=True)
 class Management:
     name: str
     breakeven_at_r: float | None = None
@@ -43,24 +49,43 @@ class Management:
     trail_distance_r: float | None = None
     partial_at_r: float | None = None
     partial_fraction: float = 0.0
+    partial_targets: tuple[PartialTarget, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Management:
-        policy = cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        if "partial_targets" in values:
+            values["partial_targets"] = tuple(PartialTarget(**row) for row in values["partial_targets"])
+        policy = cls(**values)
         policy.check()
         return policy
 
     def check(self) -> None:
-        if self.trail_start_r is not None and not (self.trail_distance_r and self.trail_distance_r > 0):
+        if self.trail_start_r is not None and self.trail_distance_r is None:
             raise ValueError("a trailing stop needs a positive distance")
-        if self.partial_at_r is not None and not 0 < self.partial_fraction < 1:
-            raise ValueError("a partial exit takes a fraction strictly between 0 and 1")
-        for value in (self.breakeven_at_r, self.trail_start_r, self.partial_at_r):
-            if value is not None and value <= 0:
+        for value in (self.breakeven_at_r, self.trail_start_r, self.trail_distance_r):
+            if value is not None and not (math.isfinite(value) and value > 0):
                 raise ValueError("management levels are positive R multiples")
+        if self.partial_targets and (self.partial_at_r is not None or self.partial_fraction):
+            raise ValueError("configure partial_targets or a single partial_at_r")
+        targets = self.targets()
+        previous = 0.0
+        for target in targets:
+            if not (math.isfinite(target.at_r) and target.at_r > previous and 0 < target.fraction < 1):
+                raise ValueError(
+                    "partial targets need increasing positive levels and fractions between 0 and 1"
+                )
+            previous = target.at_r
+        if math.fsum(target.fraction for target in targets) >= 1:
+            raise ValueError("partial targets must leave a remainder for the final exit")
+
+    def targets(self) -> tuple[PartialTarget, ...]:
+        if self.partial_at_r is not None:
+            return (PartialTarget(self.partial_at_r, self.partial_fraction),)
+        return self.partial_targets
 
 
 PLAN = Management("plan")
@@ -91,6 +116,11 @@ def policies_for(reward_risk: float) -> tuple[Management, ...]:
             partial_fraction=0.5,
             breakeven_at_r=two_thirds,
         ),
+        Management(
+            f"quarters_at_{third}r_and_{two_thirds}r",
+            partial_targets=(PartialTarget(third, 0.25), PartialTarget(two_thirds, 0.25)),
+            breakeven_at_r=third,
+        ),
     )
 
 
@@ -115,10 +145,12 @@ def managed_stop(policy: Management, side: str, entry: float, initial_stop: floa
 
 
 def partial_level(policy: Management, side: str, entry: float, initial_stop: float) -> float | None:
-    if policy.partial_at_r is None:
+    """Price of the first partial take in the entry plan."""
+    targets = policy.targets()
+    if not targets:
         return None
     sign = 1.0 if side == "LONG" else -1.0
-    return entry + sign * policy.partial_at_r * abs(entry - initial_stop)
+    return entry + sign * targets[0].at_r * abs(entry - initial_stop)
 
 
 def managed_outcome(
@@ -137,7 +169,8 @@ def managed_outcome(
     sign = 1.0 if side == "LONG" else -1.0
     start = int(record["signal_time"])
     deadline = start + int(record["timeout_minutes"]) * MINUTE_MS
-    level = partial_level(policy, side, entry, stop0)
+    targets = tuple(t for t in policy.targets() if t.at_r * risk < sign * (take - entry))
+    next_target = 0
     stop, best, remaining, realized, reason = stop0, entry, 1.0, 0.0, "OPEN"
     exit_ms = None
     for bar in later_bars:
@@ -148,10 +181,12 @@ def managed_outcome(
             realized += remaining * sign * (stop - entry) / risk
             reason = "STOP" if stop == stop0 else "MANAGED_STOP"
             break
-        if level is not None and remaining == 1.0 and (bar.h >= level if sign > 0 else bar.l <= level):
-            if (take - level) * sign > 0:
-                realized += policy.partial_fraction * float(policy.partial_at_r or 0)
-                remaining -= policy.partial_fraction
+        gain_r = sign * ((bar.h if sign > 0 else bar.l) - entry) / risk
+        while next_target < len(targets) and gain_r >= targets[next_target].at_r:
+            target = targets[next_target]
+            realized += target.fraction * target.at_r
+            remaining -= target.fraction
+            next_target += 1
         if bar.h >= take if sign > 0 else bar.l <= take:
             realized += remaining * sign * (take - entry) / risk
             reason = "TAKE"
@@ -162,7 +197,7 @@ def managed_outcome(
             break
         best = max(best, bar.h) if sign > 0 else min(best, bar.l)
         stop = tighter(side, stop, managed_stop(policy, side, entry, stop0, best))
-        if remaining < 1.0 and policy.breakeven_at_r is not None:
+        if remaining < 1.0 and policy.partial_at_r is not None and policy.breakeven_at_r is not None:
             stop = tighter(side, stop, entry)
     else:
         return {"reason": reason, "r": None}

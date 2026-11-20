@@ -8,6 +8,11 @@ management and the historical studies in Russian. The
 [Kairos project](https://github.com/Kairos-cryptoAI/kairos) maintains the service-stack
 manifest, release evidence and readiness statements.
 
+This revision blocks new EVEDEX production entries. A native full-position
+take-profit increased an existing short when it triggered. The runner records
+the reason at startup. Paper trading, account reconciliation, cancellation and
+the dedicated position-close endpoint remain available.
+
 ## From a closed bar to a position
 
 | Stage | What the runner uses |
@@ -80,6 +85,9 @@ A `STOP` file in the runtime directory stops new entries and lets the runner man
 open positions to exit. A `CLOSE` file requests immediate closure of owned positions.
 The signed deadline stops new entries while open trades continue to settlement.
 The runner exits after a fresh observation confirms a flat account and a settled journal.
+With the runner stopped and its `STOP` file present, `reconcile-stopped` can clear
+a resolved ownership mismatch after verifying the account, orders and pilot journal.
+It takes the same runtime, configuration and credential arguments as the live runner.
 `--new-session` starts a new reporting period and preserves live loss controls.
 The historical `runner` executor name selects the portfolio broker. Configuration
 for the retired `execution_engine` single-trade path is supported by the report.

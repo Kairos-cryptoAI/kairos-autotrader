@@ -148,15 +148,17 @@ def lineage(symbol="XRPUSD") -> dict:
     }
 
 
-def test_verifier_keeps_approved_leverage_and_counts_each_open_loss():
-    from kairos_autotrader.risk_worker import RunnerAccountVerifier
+def test_verifier_keeps_approved_leverage_and_counts_each_open_loss(monkeypatch):
+    from kairos_autotrader import risk_worker
 
     winner, loser = lineage(), lineage("SOLUSD")
     loser["mark_price"] = 1.08
     loser["trade"]["risk_trade_id"] = "d" * 64
     loser["trade"]["leverage"] = 3
-    verified = RunnerAccountVerifier(LIVE_ACCOUNT_SOURCE).verify(
-        account(positions=[winner, loser], daily_realized_pnl_usd=-0.5),
+    snapshot = account(positions=[winner, loser], daily_realized_pnl_usd=-0.5)
+    monkeypatch.setattr(risk_worker, "_now_ms", lambda: snapshot["captured_at_ms"])
+    verified = risk_worker.RunnerAccountVerifier(LIVE_ACCOUNT_SOURCE).verify(
+        snapshot,
         source_id=LIVE_ACCOUNT_SOURCE,
         expected_scope=SimpleNamespace(
             account_id="evedex-prod-test",
@@ -220,6 +222,7 @@ def decide(
         input=json.dumps(
             {
                 "request": request,
+                "sampled_at_ms": int(time.time() * 1000),
                 "books": books_ or books(),
                 "refusal_only": refusal_only,
                 "exchange_clock_lead_ms": exchange_clock_lead_ms,
@@ -611,7 +614,60 @@ def _fake_session(tmp_path, monkeypatch, timeout_s=10.0):
     return risk_module.RiskSession(config)
 
 
-def test_risk_session_reads_the_account_after_the_venue_and_reuses_one_process(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_book", [False, True])
+async def test_worker_requests_account_before_book_io_and_consumes_its_reply(monkeypatch, failed_book):
+    from kairos_autotrader import risk_worker
+
+    events = []
+    monkeypatch.setattr(risk_worker, "venue_symbol_for", lambda _: "SOLUSD")
+    monkeypatch.setattr(risk_worker, "_say", lambda message: events.append(message))
+
+    async def measure(*args, **kwargs):
+        assert events == [{"need_account": True}]
+        events.append("books")
+        if failed_book:
+            raise TimeoutError("public book")
+        return "fresh books"
+
+    def read_account():
+        events.append("account reply")
+        return {"account": {"captured_at_ms": 123}}
+
+    monkeypatch.setattr(risk_worker, "_measure", measure)
+    monkeypatch.setattr(risk_worker, "_listen", read_account)
+    monkeypatch.setattr(risk_worker, "decide", lambda req, venue: (req["account"], venue))
+    request = {
+        "review": {"intent": {"symbol": "SOLUSDT"}},
+        "scope": {"instruments": ["SOLUSD"]},
+        "venue": {"taker_fee_bps": 4.5, "assessed_notional_usd": 25.0},
+    }
+    if failed_book:
+        with pytest.raises(TimeoutError, match="public book"):
+            await risk_worker._serve_one(request)
+    else:
+        assert await risk_worker._serve_one(request) == ({"captured_at_ms": 123}, "fresh books")
+    assert events == [{"need_account": True}, "books", "account reply"]
+
+
+async def test_failed_account_reader_discards_the_worker_and_its_unanswered_request(tmp_path, monkeypatch):
+    session = _fake_session(tmp_path, monkeypatch)
+
+    async def broken_account():
+        raise RuntimeError("account unavailable")
+
+    async def recovered_account():
+        return {"captured_at_ms": 123}
+
+    try:
+        with pytest.raises(RuntimeError, match="account unavailable"):
+            await session.ask({"review": 1}, broken_account)
+        assert session._process is None
+        assert (await session.ask({"review": 2}, recovered_account))["echo"] == {"captured_at_ms": 123}
+    finally:
+        await session.stop()
+
+
+def test_risk_session_reads_the_account_on_request_and_reuses_one_process(tmp_path, monkeypatch):
     import asyncio
 
     session = _fake_session(tmp_path, monkeypatch)
@@ -631,7 +687,7 @@ def test_risk_session_reads_the_account_after_the_venue_and_reuses_one_process(t
 
     first, second = asyncio.run(scenario())
     assert first["echo"] == {"captured_at_ms": 1} and second["echo"] == {"captured_at_ms": 2}
-    assert "account" not in first["request_keys"], "the account is never sent before the venue is measured"
+    assert "account" not in first["request_keys"], "the account is read only for eligible candidates"
     assert first["pid"] == second["pid"], "one worker serves every entry"
 
 
@@ -715,10 +771,28 @@ def test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_bey
     assert fraction < Decimal(raised["adaptive"]["per_trade_risk_fraction"]) <= Decimal("0.0025")
     assert "minimum lot" in raised["adaptive"]["reasons"][-1]
     assert decision["worst_case_loss_usd"] <= decision["loss_budget_usd"]
-    # A lot that would need more than the ceiling keeps the small size; the runner skips it.
+    # A subminimum approval cannot authorize an executable entry.
     huge = decide(adaptive_={"outcomes": []}, min_quantity=Decimal(repr(small["quantity"])) * 10)
-    assert huge["evaluation"]["decision"]["quantity"] == small["quantity"]
-    assert "ceiling" in huge["adaptive"]["minimum_lot"]
+    assert "evaluation" not in huge
+    assert huge["refused"] == huge["adaptive"]["minimum_lot"]
+    assert "ceiling" in huge["refused"]
+    fixed_size = decide(min_quantity=Decimal("100000"))
+    assert "evaluation" not in fixed_size
+    assert "below the venue's minimum lot" in fixed_size["refused"]
+
+
+def test_minimum_lot_can_use_the_last_two_percent_of_the_approved_budget():
+    minimum = Decimal("0.227929")
+    result = decide(
+        adaptive_={"outcomes": []},
+        account_=lambda: account(
+            balance_usd=100, available_usd=100, day_start_equity_usd=100, peak_equity_usd=100
+        ),
+        min_quantity=minimum,
+    )
+    decision = result["evaluation"]["decision"]
+    assert decision["approved"] and Decimal(repr(decision["quantity"])) >= minimum
+    assert 0.245 < decision["worst_case_loss_usd"] <= decision["loss_budget_usd"] <= 0.25
 
 
 def test_adaptive_risk_in_chop_sizes_and_levers_for_half_the_budget():

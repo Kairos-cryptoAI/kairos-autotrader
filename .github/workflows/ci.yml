@@ -49,3 +49,68 @@ jobs:
         run: uv run --locked pytest -q --tb=short
       - name: Build wheel and source distribution
         run: uv build --no-sources
+
+  trading-contracts:
+    name: Trading decisions across pinned components
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KAIROS_WORKSPACE_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: kairos-autotrader
+          persist-credentials: false
+      - name: Fetch the public component revisions used by the workers
+        shell: bash
+        run: |
+          while read -r repo revision; do
+            git init --quiet "$repo"
+            git -C "$repo" fetch --quiet --no-tags --depth=1 "https://github.com/Kairos-cryptoAI/$repo.git" "$revision"
+            git -C "$repo" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$repo" rev-parse HEAD)" = "$revision"
+          done <<'PINS'
+          kairos-aggregator 34963c2787e0afcbe587cadde7d612737d996eca
+          kairos-llm 3a4781965f4d6d4d05d233fe525986409f1a5f12
+          kairos-quant-scouts 7f994a3cb7c48fbbe9a4c590a1e4733e6e11a633
+          kairos-risk-manager f7eeeb6de2ceb4e093eddc55bce30348cc7864de
+          kairos-router 06b1a9044af77cdac59c83f9fe8264acd0b1f729
+          PINS
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.3"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "*/uv.lock"
+      - name: Install runner and worker environments from their locks
+        run: |
+          uv sync --locked --project kairos-autotrader
+          for repo in kairos-aggregator kairos-quant-scouts kairos-router; do
+            uv sync --locked --no-dev --project "$repo"
+          done
+      - name: Verify the real workers and run the offline trading regressions
+        working-directory: kairos-autotrader
+        run: |
+          .venv/bin/python - <<'PY'
+          from kairos_autotrader.aggregator_review import AggregatorConfig
+          from kairos_autotrader.risk import RiskConfig
+          from kairos_autotrader.routing import RouterConfig
+
+          for config in (AggregatorConfig(), RiskConfig(), RouterConfig()):
+              config.check()
+          PY
+          .venv/bin/python -m pytest -q --tb=short --junitxml="$RUNNER_TEMP/trading-contracts.xml" \
+            tests/test_aggregator_review.py::test_real_multi_candidate_batch_freezes_all_contexts_at_one_cut \
+            tests/test_aggregator_review.py::test_overdue_batch_returns_wait_while_its_single_request_settles \
+            tests/test_routing.py::test_real_router_ignores_pair_evidence_outside_the_candidate_batch \
+            tests/test_risk.py::test_a_size_below_the_minimum_lot_is_raised_within_the_ceiling_and_never_beyond \
+            tests/test_risk_margin.py::test_registered_risk_worker_fits_margin_after_full_sizing
+          .venv/bin/python - "$RUNNER_TEMP/trading-contracts.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse(sys.argv[1]).findall(".//testcase")
+          skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+          if not cases or skipped:
+              raise SystemExit(f"Expected all trading regressions to execute. Skipped: {skipped}")
+          PY

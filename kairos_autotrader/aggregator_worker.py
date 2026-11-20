@@ -213,8 +213,9 @@ async def review(request: dict, *, compact: bool = False) -> dict:
 
     llm = request["llm"]
     deadline = min(route.review_deadline_ms for route in routes)
-    # One model call may use what is left until the earliest deadline, between 5 and 55 s.
-    timeout_s = max(5.0, min(55.0, (deadline - _now_ms()) / 1000 - 1.0))
+    # Leave time for contract validation, IPC and publication by the runner.
+    finish_ms = deadline - 2_000
+    timeout_s = max(0.001, min(55.0, (finish_ms - _now_ms()) / 1000))
     gateway = BudgetedLLMGateway(
         LLMGateway(
             settings=LLMSettings(
@@ -234,27 +235,42 @@ async def review(request: dict, *, compact: bool = False) -> dict:
     brain = CandidateReviewBrain(gateway, source=settings.service_name, clock_ms=_now_ms)
     ready = time.monotonic()
 
-    async def one(route):
-        cut = _now_ms()
+    # Freeze every route from the same immutable evidence cut before any provider setup or call.
+    # Lazy HTTP client construction and model prompt compilation can run before their first await.
+    cut = _now_ms()
+    contexts = []
+    for route in routes:
         try:
-            context = store.build(route, cutoff_ms=cut, captured_at_ms=cut)
+            contexts.append(store.build(route, cutoff_ms=cut, captured_at_ms=cut))
         except (ValueError, KeyError, TypeError):
-            # The service's own fail-closed result when no valid context can be frozen.
-            result = deterministic_defer(
-                route,
-                reviewed_at_ms=cut,
-                reason_code="DECISION_CONTEXT_INVALID",
-                source=settings.service_name,
-            )
-            return result, None, cut
-        return await brain.review_with_context(route, context), _summary(context), cut
+            contexts.append(None)
+    captured = time.monotonic()
+
+    def defer(route, reason):
+        return deterministic_defer(
+            route, reviewed_at_ms=_now_ms(), reason_code=reason, source=settings.service_name
+        )
+
+    async def one(route, context):
+        if context is None:
+            return defer(route, "DECISION_CONTEXT_INVALID")
+        remaining = (finish_ms - _now_ms()) / 1000
+        if remaining > 0:
+            try:
+                async with asyncio.timeout(remaining):
+                    return await brain.review_with_context(route, context)
+            except TimeoutError:
+                pass
+        return defer(route, "REVIEW_DEADLINE_EXCEEDED")
 
     try:
-        results = await asyncio.gather(*(one(route) for route in routes))
+        results = await asyncio.gather(
+            *(one(route, context) for route, context in zip(routes, contexts, strict=True))
+        )
     finally:
         await gateway.close()
     reviews = []
-    for route, (result, context, cut) in zip(routes, results, strict=True):
+    for route, result, context in zip(routes, results, contexts, strict=True):
         if result.intent != route.intent or result.route != route:
             raise ValueError("a review carries another route than the one that was sent")
         reviews.append(
@@ -263,7 +279,7 @@ async def review(request: dict, *, compact: bool = False) -> dict:
                 "route_id": route.route_id,
                 # The caller holds the exact route and intent verified above.
                 "review": result.model_dump(mode="json", exclude={"route", "intent"} if compact else None),
-                "context": context,
+                "context": _summary(context) if context is not None else None,
                 "context_capture_at_ms": cut,
             }
         )
@@ -274,7 +290,8 @@ async def review(request: dict, *, compact: bool = False) -> dict:
             "validate_ms": round((validated - started) * 1000),
             "ingest_ms": round((ingested - validated) * 1000),
             "gateway_init_ms": round((ready - ingested) * 1000),
-            "review_ms": round((time.monotonic() - ready) * 1000),
+            "capture_ms": round((captured - ready) * 1000),
+            "review_ms": round((time.monotonic() - captured) * 1000),
         },
     }
 
@@ -289,8 +306,15 @@ def main() -> int:
         sys.path.insert(1, sys.argv[2])  # the kairos-llm checkout, ahead of the installed copy
     if "--serve" in sys.argv[3:]:
         # Load libraries before advertising readiness. No key or provider call is needed.
+        import platform
+
         import kairos_llm  # noqa: F401
         from kairos_aggregator import candidate_review, config, decision_context  # noqa: F401
+        from openai.resources.responses import AsyncResponses  # noqa: F401
+
+        # The SDK queries this on the first request. On Windows CPython may start a
+        # shell to discover the OS version; its result is cached by the standard library.
+        platform.platform()
 
         return serve_requests(lambda request: _handle(request, compact=True))
     result = _handle(json.load(sys.stdin), compact=False)

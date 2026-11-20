@@ -10,12 +10,14 @@ from decimal import Decimal
 
 import pytest
 
+from kairos_autotrader import brain
 from kairos_autotrader.engine import Book, Config, management_step
 from kairos_autotrader.management import (
     MAX_POLICY_AGE_MS,
     PLAN,
     POLICY_FILE,
     Management,
+    PartialTarget,
     choose_policy,
     compare_policies,
     load_policy,
@@ -25,11 +27,25 @@ from kairos_autotrader.management import (
     write_policy,
 )
 from kairos_autotrader.signals import Candle, outcome
-from tests.test_autotrader import SOL, FakeVenue, enter, journal_of, only, paper_trader
+from tests.test_autotrader import (
+    SOL,
+    FakeVenue,
+    candidate,
+    enter,
+    journal_of,
+    live_trader,
+    only,
+    paper_trader,
+)
 from tests.test_execution_session import _real_review
 
 TRAIL = Management("trail", trail_start_r=1.0, trail_distance_r=0.5)
 HALF = Management("half", partial_at_r=0.75, partial_fraction=0.5, breakeven_at_r=0.75)
+LADDER = Management(
+    "quarters",
+    partial_targets=(PartialTarget(0.5, 0.25), PartialTarget(1.0, 0.25)),
+    breakeven_at_r=0.5,
+)
 
 
 def record(side="LONG", entry=100.0, stop=95.0, take=107.5, start=0, minutes=60, **over):
@@ -85,6 +101,31 @@ def test_partial_exit_then_break_even():
     bars = path(0, [101, 104, 102, 99.7, 98])
     result = managed_outcome(record(), bars, cost_fraction=0, policy=HALF)
     assert result["reason"] == "MANAGED_STOP" and result["r"] == 0.375, "half at +0.75 R, half at entry"
+
+
+@pytest.mark.parametrize("side,sign", [("LONG", 1), ("SHORT", -1)])
+def test_replay_partial_targets_and_stop_share_one_original_position(side, sign):
+    rec = record(side=side, stop=100 - sign * 5, take=100 + sign * 7.5)
+    bars = path(0, [100 + sign * n for n in (3, 5.5, 8)])
+    result = managed_outcome(rec, bars, cost_fraction=0, policy=LADDER)
+    assert (result["reason"], result["r"]) == ("TAKE", 0.25 * 0.5 + 0.25 + 0.5 * 1.5)
+    reversed_bars = path(0, [100 + sign * n for n in (3, 5.5, -1)])
+    stopped = managed_outcome(rec, reversed_bars, cost_fraction=0, policy=LADDER)
+    assert (stopped["reason"], stopped["r"]) == ("MANAGED_STOP", 0.375)
+    assert any(p.partial_targets == LADDER.partial_targets for p in policies_for(1.5))
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        [{"at_r": 1, "fraction": 0.5}, {"at_r": 2, "fraction": 0.5}],
+        [{"at_r": 1, "fraction": 0.25}, {"at_r": 1, "fraction": 0.25}],
+        [{"at_r": float("nan"), "fraction": 0.25}],
+    ],
+)
+def test_invalid_ladders_cannot_be_admitted(levels):
+    with pytest.raises(ValueError):
+        Management.from_dict({"name": "invalid", "partial_targets": levels})
 
 
 def test_a_policy_is_chosen_only_with_proof_over_many_days():
@@ -162,6 +203,47 @@ def test_management_step_is_on_tick_away_from_the_market_and_never_looser():
     assert small["partial_done"].startswith("skipped")
 
 
+@pytest.mark.parametrize("side,sign", [("LONG", 1), ("SHORT", -1)])
+def test_confirmed_native_take_between_polls_unlocks_breakeven_after_restart(side, sign):
+    policy = Management("half_at_1r", partial_at_r=1, partial_fraction=0.5, breakeven_at_r=1)
+    entry = Decimal("100.005")
+    instrument = dataclasses.replace(SOL, price_step=Decimal("0.01"))
+    initial_stop = str(entry - sign * 5)
+    trade = managed_trade(
+        side=side,
+        entry_price=str(entry),
+        stop=initial_stop,
+        initial_stop=initial_stop,
+        management=policy.as_dict(),
+        quantity="0.5",
+        initial_quantity="1",
+        native_partial_targets=True,
+        # The exchange triggered at 1R and filled slightly below that profit.
+        native_target_fills=[["confirmed-order", "0.5", str(100 + sign * 4.9)]],
+    )
+    # The price already crossed back through entry. Keep the original stop until a
+    # replacement at entry is on the valid side of the current book.
+    assert management_step(trade, Book(0, Decimal("99.99"), Decimal("100.01")), instrument) == (None, None)
+    price = Decimal(100 + sign)
+    book = Book(0, price, price + instrument.price_step)
+    stop, partial = management_step(trade, book, instrument)
+    assert stop == (Decimal("100.01") if sign == 1 else Decimal("100.00"))
+    assert partial is None
+    trade["stop"] = str(stop)
+    assert management_step(trade, book, instrument) == (None, None)
+
+
+def test_ladder_coalesces_small_lots_and_recovers_a_fill_before_the_runner_saved():
+    trade = managed_trade(management=LADDER.as_dict(), quantity="0.2", initial_quantity="0.2")
+    first = Book(0, Decimal("103"), Decimal("103.01"))
+    second = Book(0, Decimal("106"), Decimal("106.01"))
+    assert management_step(trade, first, SOL)[1] is None
+    assert management_step(trade, second, SOL)[1] == Decimal("0.1")
+    # Startup restored a confirmed reduction from Execution, without a runner-side target flag.
+    trade["quantity"] = "0.1"
+    assert management_step(trade, second, SOL)[1] is None
+
+
 def _write_policy(trader, policy: Management) -> None:
     write_policy(
         trader.store.directory,
@@ -169,6 +251,59 @@ def _write_policy(trader, policy: Management) -> None:
         now_ms=int(time.time() * 1000),
         reward_risk=trader.config.reward_risk,
     )
+
+
+@pytest.mark.parametrize("qualified", [True, False])
+def test_live_runner_hands_selected_targets_to_one_execution_owner(tmp_path, monkeypatch, qualified):
+    _real_review(monkeypatch)
+    trader = live_trader(tmp_path, FakeVenue())
+    instrument = dataclasses.replace(SOL, min_quantity=Decimal(".01"), quantity_step=Decimal(".01"))
+    trader.instruments["SOLUSD"] = instrument
+    asyncio.run(trader.start())
+    _write_policy(trader, LADDER)
+    monkeypatch.setattr(trader.broker, "native_ladder_qualified_for", lambda symbol: qualified, raising=False)
+    broker_enter = trader.broker.enter
+    selected = []
+
+    async def submit(*args, partial_targets=None, **kwargs):
+        selected.extend(partial_targets or [])
+        fill = await broker_enter(*args, **kwargs)
+        return {**fill, "native_partial_targets": bool(partial_targets)}
+
+    monkeypatch.setattr(trader.broker, "enter", submit)
+    enter(trader)
+    trade = only(trader)
+    assert trade["native_partial_targets"] is qualified
+    assert selected == (
+        [{"at_r": 0.5, "fraction": 0.25}, {"at_r": 1.0, "fraction": 0.25}] if qualified else []
+    )
+    entry, stop = Decimal(trade["entry_price"]), Decimal(trade["initial_stop"])
+    bid = entry + (entry - stop) * Decimal(".6")
+    moved, partial = management_step(trade, Book(0, bid, bid + SOL.price_step), instrument)
+    assert moved is not None and moved >= entry - SOL.price_step
+    assert (partial is None) is qualified
+
+
+@pytest.mark.parametrize("reason", ["STOP", "TAKE"])
+def test_live_runner_accounts_for_bracket_completed_during_entry(tmp_path, monkeypatch, reason):
+    _real_review(monkeypatch)
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    broker_enter = trader.broker.enter
+
+    async def fast_bracket(*args, **kwargs):
+        fill = await broker_enter(*args, **kwargs)
+        venue.venue_exit("-0.15" if reason == "STOP" else ".27")
+        trader.broker.receipt["exit_origin"] = "system"
+        return {**fill, "closed_at_entry": reason, "exit_price": "82.1"}
+
+    monkeypatch.setattr(trader.broker, "enter", fast_bracket)
+    enter(trader)
+    assert only(trader) is None and not venue.close_bodies and len(venue.market_bodies) == 1
+    assert trader.store.state["round_trips"] == 1
+    (closed,) = [row for row in journal_of(trader) if row["event"] == "trade_closed"]
+    assert (closed["reason"], closed["exit_origin"], closed["exit_price"]) == (reason, "system", "82.1")
 
 
 def test_paper_trade_trails_its_stop_and_exits_above_entry(tmp_path, monkeypatch):
@@ -216,6 +351,53 @@ def test_paper_partial_exit_counts_in_the_trade_result(tmp_path, monkeypatch):
     asyncio.run(trader.manage(trade, int(time.time() * 1000)))
     closed = [e for e in journal_of(trader) if e["event"] == "trade_closed"][-1]
     assert Decimal(closed["r_multiple"]) > 0, "the partial profit is part of the result"
+
+
+@pytest.mark.parametrize("side,sign", [("LONG", 1), ("SHORT", -1)])
+def test_paper_targets_survive_restart_and_leave_a_protected_remainder(tmp_path, monkeypatch, side, sign):
+    _real_review(monkeypatch)
+    venue = FakeVenue()
+    cfg = Config(use_llm=False, cooldown_minutes=0)
+    instrument = dataclasses.replace(SOL, min_quantity=Decimal(".01"), quantity_step=Decimal(".01"))
+
+    def runner():
+        trader = paper_trader(tmp_path, venue, cfg)
+        trader.instruments["SOLUSD"] = instrument
+        asyncio.run(trader.start())
+        return trader
+
+    trader = runner()
+    _write_policy(trader, LADDER)
+    stop, take = (81.5, 83.62) if side == "LONG" else (83.2, 81.08)
+    offer = candidate(side=side, stop=stop, take=take)
+    asyncio.run(trader.try_enter(offer, brain.control_decision([offer])))
+    trade = only(trader)
+    entry, initial = Decimal(trade["entry_price"]), Decimal(trade["initial_stop"])
+    size = Decimal(trade["quantity"])
+    assert size == Decimal(".2")
+
+    def poll(at_r):
+        touch = entry + sign * Decimal(at_r) * abs(entry - initial)
+        venue.bid, venue.ask = (
+            (touch, touch + SOL.price_step) if sign == 1 else (touch - SOL.price_step, touch)
+        )
+        asyncio.run(trader.manage(only(trader), int(time.time() * 1000)))
+
+    poll("0.6")
+    assert Decimal(only(trader)["quantity"]) == size * Decimal(".75")
+    assert abs(Decimal(only(trader)["stop"]) - entry) <= SOL.price_step
+    trader = runner()
+    poll("0.6")
+    poll("1.1")
+    poll("1.1")
+    assert Decimal(only(trader)["quantity"]) == size / 2
+    poll("2")
+    assert only(trader) is None
+    log = journal_of(trader)
+    exits = [Decimal(row["quantity"]) for row in log if row["event"] == "partial_exit"]
+    assert exits == [size / 4, size / 4]
+    (closed,) = [row for row in log if row["event"] == "trade_closed"]
+    assert closed["reason"] == "TAKE" and Decimal(closed["r_multiple"]) > 0
 
 
 def test_without_a_proven_policy_nothing_is_managed(tmp_path, monkeypatch):

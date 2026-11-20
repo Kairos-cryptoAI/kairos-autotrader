@@ -31,7 +31,7 @@ stdin:  {"review": <CandidateReviewV1>, "allocation": <StrategicAllocation> | nu
          "account": {...}, "scope": {...}, "limits": {...},
          "venue": {"taker_fee_bps", "assessed_notional_usd"}}
 stdout: a marker line followed by
-        {"evaluation": <LiveRiskEvaluationV1>} | {"refused": "..."}
+        {"evaluation": <LiveRiskEvaluationV1>} | {"refused": "..."} | {"error": "..."}
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import json
 import math
 import sys
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 MARKER = "@@KAIROS-WORKER@@"
@@ -62,6 +62,29 @@ MAX_CLOCK_LEAD_MS = 2_000
 _clock_lead_ms = 0
 
 
+class VenueBookError(RuntimeError):
+    """A public risk input could not be read or parsed."""
+
+
+class TemporaryVenueBookError(VenueBookError):
+    """A new pair of public books and fresh account evidence may resolve this transport failure."""
+
+
+def _worker_error(exc: Exception) -> dict[str, str]:
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        # Pydantic's full exception includes the input value, potentially an account snapshot.
+        first = exc.errors(include_input=False, include_context=False, include_url=False)[0]
+        field = ".".join(str(part) for part in first["loc"])
+        message = f"{exc.title} {field}: {first['type']}"
+    elif isinstance(exc, VenueBookError):
+        message = str(exc)
+    else:
+        message = type(exc).__name__
+    return {"error": message[:200]}
+
+
 def _venue_now_ms() -> int:
     return _now_ms() + _clock_lead_ms
 
@@ -73,19 +96,42 @@ async def _measure(signal_symbol: str, venue_symbol: str, *, taker_fee_bps: floa
 
     async with aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=10)) as session:
 
-        async def get(url: str, params: dict | None = None):
+        async def get(exchange: str, symbol: str, url: str, params: dict | None = None):
             started = time.perf_counter()
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                payload = await response.json(content_type=None)
+            try:
+                async with session.get(url, params=params) as response:
+                    response.raise_for_status()
+                    payload = await response.json(content_type=None)
+            except TimeoutError as exc:
+                raise TemporaryVenueBookError(f"{exchange} {symbol} order book timed out") from exc
+            except aiohttp.ClientResponseError as exc:
+                if exc.status in {500, 502, 503, 504} and (
+                    exc.headers is None or "Retry-After" not in exc.headers
+                ):
+                    raise TemporaryVenueBookError(
+                        f"{exchange} {symbol} order book returned HTTP {exc.status}"
+                    ) from exc
+                raise VenueBookError(f"{exchange} {symbol} order book returned HTTP {exc.status}") from exc
+            except (aiohttp.ServerDisconnectedError, ConnectionResetError) as exc:
+                raise TemporaryVenueBookError(f"{exchange} {symbol} order book connection closed") from exc
+            except (aiohttp.ClientError, ValueError) as exc:
+                raise VenueBookError(
+                    f"{exchange} {symbol} order book read failed ({type(exc).__name__})"
+                ) from exc
             return payload, (time.perf_counter() - started) * 1000
 
         (evedex_raw, evedex_ms), (binance_raw, binance_ms) = await asyncio.gather(
-            get(EVEDEX_DEPTH.format(symbol=venue_symbol)),
-            get(BINANCE_DEPTH, {"symbol": signal_symbol, "limit": "100"}),
+            get("EVEDEX", venue_symbol, EVEDEX_DEPTH.format(symbol=venue_symbol)),
+            get("Binance", signal_symbol, BINANCE_DEPTH, {"symbol": signal_symbol, "limit": "100"}),
         )
-    evedex = parse_evedex_book(venue_symbol, evedex_raw, latency_ms=evedex_ms)
-    binance = parse_binance_book(signal_symbol, binance_raw, latency_ms=binance_ms)
+    try:
+        evedex = parse_evedex_book(venue_symbol, evedex_raw, latency_ms=evedex_ms)
+    except ValueError as exc:
+        raise VenueBookError(f"EVEDEX {venue_symbol} order book invalid ({type(exc).__name__})") from exc
+    try:
+        binance = parse_binance_book(signal_symbol, binance_raw, latency_ms=binance_ms)
+    except ValueError as exc:
+        raise VenueBookError(f"Binance {signal_symbol} order book invalid ({type(exc).__name__})") from exc
     return venue_quality(
         binance,
         evedex,
@@ -305,24 +351,25 @@ def decide(request: dict, venue) -> dict:
             }
     result = _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_record)
     decision = result.decision
-    minimum = venue_in.get("min_quantity")
+    try:
+        minimum = Decimal(str(venue_in.get("min_quantity") or 0))
+    except InvalidOperation:
+        return {"refused": "venue minimum lot is invalid"}
+    if not minimum.is_finite() or minimum < 0:
+        return {"refused": "venue minimum lot is invalid"}
     if (
         adaptive_record is not None
         and minimum
         and decision.approved
-        and 0 < decision.quantity < float(minimum)
+        and 0 < Decimal(str(decision.quantity)) < minimum
     ):
         # The adaptive share sized a position below the venue's minimum lot: the share is
         # raised just enough for that lot, only within the constitution's ceiling, and the
         # Risk Manager decides again with it.
-        from decimal import Decimal
-
-        needed = (
-            Decimal(adaptive_record["per_trade_risk_fraction"])
-            * Decimal(str(minimum))
-            / Decimal(repr(decision.quantity))
-            * Decimal("1.02")
-        )
+        # The first decision already includes fees, slippage and downward quantity rounding.
+        # minimum_lot_fraction rounds this share up. The second decision verifies the lot.
+        current_fraction = Decimal(adaptive_record["per_trade_risk_fraction"])
+        needed = current_fraction * minimum / Decimal(repr(decision.quantity))
         raised_limits, raised_record = _adaptive_limits(
             request["adaptive"],
             base_limits,
@@ -334,10 +381,15 @@ def decide(request: dict, venue) -> dict:
             needed_fraction=needed,
         )
         if raised_limits is None:
-            adaptive_record = {**adaptive_record, "minimum_lot": raised_record["reasons"][-1]}
-        else:
-            result = _evaluate(scope_in, account, review, allocation, venue, raised_limits, raised_record)
-            adaptive_record = raised_record
+            reason = raised_record["reasons"][-1]
+            return {"refused": reason, "adaptive": {**adaptive_record, "minimum_lot": reason}}
+        result = _evaluate(scope_in, account, review, allocation, venue, raised_limits, raised_record)
+        adaptive_record = raised_record
+    if result.decision.approved and Decimal(str(result.decision.quantity)) < minimum:
+        refusal: dict[str, Any] = {"refused": "approved risk size is below the venue's minimum lot"}
+        if adaptive_record is not None:
+            refusal["adaptive"] = adaptive_record
+        return refusal
     answer: dict[str, Any] = {"evaluation": result.model_dump(mode="json"), "clock_lead_ms": _clock_lead_ms}
     if adaptive_record is not None:
         answer["adaptive"] = adaptive_record
@@ -368,7 +420,7 @@ def _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_rec
         account_verifiers={account["source_id"]: RunnerAccountVerifier(account["source_id"])},
         input_verifier=RunnerInputVerifier(venue),
     )
-    return evaluator.evaluate(
+    result = evaluator.evaluate(
         account,
         source_id=account["source_id"],
         review=review,
@@ -377,8 +429,17 @@ def _evaluate(scope_in, account, review, allocation, venue, limits, adaptive_rec
         decided_at_ms=_venue_now_ms(),
         system_mode=SystemMode.NORMAL,
         raw_inputs_evidence=venue.measurement_id,
-        leverage=float(adaptive_record["leverage"]) if adaptive_record else 1.0,
+        adaptive_leverage_ceiling=int(adaptive_record["leverage_ceiling"]) if adaptive_record else None,
     )
+    if adaptive_record is not None:
+        chosen = int(result.decision.leverage)
+        adaptive_record["leverage"] = str(chosen)
+        if result.decision.approved:
+            adaptive_record["leverage_reasons"].append(
+                f"approved notional {result.decision.notional_usd:.4f} USD "
+                f"fits verified free margin at {chosen}x"
+            )
+    return result
 
 
 def _learning_ledger(outcomes):
@@ -422,7 +483,6 @@ def _adaptive_limits(
         minimum_lot_fraction,
     )
     from kairos_risk.learning import UNKNOWN_REGIME
-    from kairos_risk.live import CHOP_RISK_MULTIPLIER
 
     ledger = _learning_ledger(adaptive.get("outcomes", []))
     regime = allocation.regime.value if allocation is not None else UNKNOWN_REGIME
@@ -458,25 +518,14 @@ def _adaptive_limits(
                 ]
             }
         decision = raised
-    # Leverage: the margin the open book and this trade at its full risk need, capped by the
-    # same evidence, the stop, the venue's maximum and the constitution (kairos_risk).
-    open_notional = sum(
-        Decimal(str(abs(p["quantity"]))) * Decimal(str(p["mark_price"])) for p in account.get("positions", [])
-    )
+    # The evaluator fits this evidence ceiling to the actual post-reservation margin
+    # and final risk-approved size, including the Macro reserve, fees and venue limits.
     reference = Decimal(str(review.intent.reference_price))
     stop_fraction = abs(reference - Decimal(str(review.intent.exit_plan.stop_price))) / reference
-    loss_budget = min(equity * decision.fraction, Decimal(str(limits.per_trade_dollar_cap_usd)))
-    if regime == "CHOP":
-        loss_budget *= CHOP_RISK_MULTIPLIER  # the Risk Manager sizes a CHOP entry at half its budget
-    this_notional = min(
-        loss_budget / stop_fraction if stop_fraction > 0 else Decimal(0),
-        Decimal(str(limits.max_position_notional_usd)),
-    )
     leverage = adaptive_leverage(
         AdaptiveRiskPolicyV1(ceiling_fraction=Decimal(str(limits.per_trade_risk_fraction))),
         edge,
         constitution_max=Decimal(str(limits.max_leverage)),
-        required_gross=(open_notional + this_notional) / equity,
         equity_usd=equity,
         peak_equity_usd=peak,
         stop_fraction=stop_fraction,
@@ -484,7 +533,7 @@ def _adaptive_limits(
     )
     record = {
         "regime": regime,
-        "leverage": str(leverage.leverage),
+        "leverage_ceiling": str(leverage.leverage),
         "leverage_reasons": list(leverage.reasons),
         "edge_level": edge.level,
         "edge_samples": edge.samples,
@@ -533,20 +582,31 @@ def _listen() -> dict:
 
 
 async def _serve_one(request: dict) -> dict:
-    """Measure the venue first, then ask for the account, so it is read just before deciding."""
+    """Read books and account concurrently after confirming the instrument is in scope."""
     signal_symbol = request["review"]["intent"]["symbol"]
     venue_symbol = venue_symbol_for(signal_symbol)
     if venue_symbol is None or venue_symbol not in set(request["scope"]["instruments"]):
         return {"refused": f"{signal_symbol} is outside Quant Scouts' approved PROD symbol map"}
-    venue = await _measure(
-        signal_symbol,
-        venue_symbol,
-        taker_fee_bps=float(request["venue"]["taker_fee_bps"]),
-        assessed=float(request["venue"]["assessed_notional_usd"]),
-    )
-    _say({"need_account": True})
-    request = {**request, "account": _listen()["account"]}
-    return decide(request, venue)
+
+    async def read_inputs():
+        _say({"need_account": True})
+        try:
+            venue = await _measure(
+                signal_symbol,
+                venue_symbol,
+                taker_fee_bps=float(request["venue"]["taker_fee_bps"]),
+                assessed=float(request["venue"]["assessed_notional_usd"]),
+            )
+        finally:
+            # Consume precisely this attempt's snapshot even when a public read fails.
+            account = _listen()["account"]
+        return venue, account
+
+    try:
+        venue, account = await read_inputs()
+    except TemporaryVenueBookError:
+        venue, account = await read_inputs()
+    return decide({**request, "account": account}, venue)
 
 
 def serve() -> int:
@@ -561,7 +621,7 @@ def serve() -> int:
         except EOFError:
             return 0
         except ValueError as exc:
-            _say({"error": f"ValueError: {str(exc)[:300]}"})
+            _say(_worker_error(exc))
             continue
         try:
             answer = (
@@ -570,7 +630,7 @@ def serve() -> int:
         except EOFError:
             return 0
         except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
-            answer = {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+            answer = _worker_error(exc)
         _say(answer)
 
 
@@ -587,7 +647,7 @@ def main() -> int:
             ledger_table(request) if request.get("op") == "ledger" else asyncio.run(evaluate(request))
         )
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which fails closed
-        answer = {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+        answer = _worker_error(exc)
     sys.stdout.write("\n" + MARKER + json.dumps(answer, separators=(",", ":")) + "\n")
     return 0
 
