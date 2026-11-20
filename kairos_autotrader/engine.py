@@ -22,6 +22,7 @@ from typing import Any
 
 import aiohttp
 from kairos_core.contracts import StrategyIntentV1
+from kairos_execution import portfolio_broker
 from kairos_execution.one_canary_account import CanaryAccountError
 from kairos_execution.portfolio_broker import NeedsOperator
 from kairos_execution.portfolio_broker import PortfolioBroker as LiveBroker
@@ -147,6 +148,9 @@ SCAN_AFTER_CLOSE_MS = 5_000
 POSITION_MISMATCH = "position quantity, side or price differs from the owned entry"
 MANUAL_CHECK_PREFIX = "нужна ручная проверка счёта: "
 REPEATED_ERRORS_HALT = "слишком много ошибок подряд"
+# An older Execution wheel never reports a proved, temporarily unindexed close.
+_SETTLEMENT_PENDING = getattr(portfolio_broker, "SettlementPending", ())
+
 BAR_CONCURRENCY = 8
 ENGINE_PROCESSES = 8
 # The right-tail rule reads 35 days of minute bars per instrument; it runs beside the hourly
@@ -832,6 +836,7 @@ class Trader:
         self._aggregator_warm_task: asyncio.Task | None = None
         self._aggregator_task: asyncio.Task[Reviews] | None = None
         self._position_faults: dict[str, tuple[str, str]] = {}
+        self._startup_reconciliation_pending = False
         self._reported_unprotected: dict[str, str] = {}
         if config.use_llm and (config.review_mode == "aggregator" or config.review_shadow):
             candidate_review = AggregatorConfig()
@@ -1378,6 +1383,8 @@ class Trader:
                 return "portfolio loss stop or unavailable performance baseline"
         if self.store.flag("STOP") or self.store.flag("CLOSE"):
             return "stop file present"
+        if state.get("settlement_pending") or self._startup_reconciliation_pending:
+            return "waiting for verified EVEDEX close history"
         if self._day()["trades"] >= self.config.max_trades_per_day:
             return "daily trade limit reached"
         return None
@@ -1414,7 +1421,14 @@ class Trader:
             if resume_reconciled:
                 await self._resume_reconciled(self.broker, trades)
             else:
-                await self._reconcile_portfolio(trades)
+                self._startup_reconciliation_pending = True
+                if not state.get("settlement_pending"):
+                    try:
+                        await self._reconcile_portfolio(trades)
+                    except _SETTLEMENT_PENDING as exc:
+                        self._remember_settlement(exc.symbol)
+                    else:
+                        self._startup_reconciliation_pending = False
             blocked = {
                 symbol: reason for symbol in self.config.symbols if (reason := self._protection_block(symbol))
             }
@@ -1461,6 +1475,8 @@ class Trader:
             opening = f"Стартовый баланс сессии: {state['session']['start_equity']} USDT"
         say(f"Режим: {self.broker.mode}. {opening}. Позиций одновременно: до {self.slot_limit()}.")
         for trade in self.trades():
+            if trade["symbol"] in state.get("settlement_pending", {}):
+                continue
             say(
                 f"Веду открытую позицию: {trade['symbol']} {trade['side']} {trade['quantity']} "
                 f"по {trade['entry_price']}, "
@@ -1476,6 +1492,59 @@ class Trader:
         if not isinstance(self.broker, LiveBroker) or self.store.state.get("mode") != "live":
             raise ConfigError("stopped reconciliation requires an existing live portfolio")
         await self._resume_reconciled(self.broker, self.trades(), while_stopped=True)
+
+    def _remember_settlement(self, symbol: str, reason: str = "VENUE_EXIT") -> None:
+        if not isinstance(self.broker, LiveBroker) or (
+            symbol not in self.config.symbols and not any(t["symbol"] == symbol for t in self.trades())
+        ):
+            raise NeedsOperator("settlement wait does not identify an owned portfolio instrument")
+        waiting = self.store.state.setdefault("settlement_pending", {})
+        if symbol not in waiting:
+            waiting[symbol] = {"reason": reason, "verified": False}
+            self.store.save()
+            self.store.journal("settlement_pending", symbol=symbol)
+            say(f"{symbol}: EVEDEX подтвердил исполнение закрытия. Жду запись в истории позиции.")
+
+    async def _retry_settlements(self, previous: tuple[str, ...]) -> None:
+        waiting = self.store.state.get("settlement_pending", {})
+        for symbol in previous:
+            entry = waiting[symbol]
+            try:
+                if not entry["verified"]:
+                    check = getattr(self.broker, "reconcile_settlement", None)
+                    if check is None:
+                        # A downgraded wheel cannot clear a wait recorded by a newer one.
+                        return
+                    await check(symbol)
+                    # Settlement and the runner report are separately durable. A crash after the
+                    # journal closes must resume reporting without looking for an OPEN journal row.
+                    entry["verified"] = True
+                    self.store.save()
+                trade = next((t for t in self.trades() if t["symbol"] == symbol), None)
+                if trade is None:
+                    self._startup_reconciliation_pending = True
+                else:
+                    await self._finish(trade, entry["reason"], None, close=False)
+            except _SETTLEMENT_PENDING as exc:
+                if exc.symbol != symbol:
+                    raise NeedsOperator("pending close changed instrument during verification") from exc
+                if entry["verified"]:
+                    entry["verified"] = False
+                    self.store.save()
+                continue
+            del waiting[symbol]
+            if not waiting:
+                self.store.state.pop("settlement_pending", None)
+            self.store.save()
+            self.store.journal("settlement_confirmed", symbol=symbol)
+            say(f"{symbol}: закрытие подтверждено историей EVEDEX.")
+        if self._startup_reconciliation_pending and not waiting:
+            try:
+                await self._reconcile_portfolio(self.trades())
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+            else:
+                self._startup_reconciliation_pending = False
 
     async def _resume_reconciled(
         self, broker: LiveBroker, trades: list[dict[str, Any]], *, while_stopped: bool = False
@@ -2179,6 +2248,9 @@ class Trader:
                     min_quantity=minimum,
                     adaptive={"outcomes": self.learning_outcomes()} if self.config.adaptive_risk else None,
                 )
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
+                return
             except (NeedsOperator, PortfolioJournalError) as exc:
                 self.halt(f"портфель требует сверки: {str(exc)[:160]}", reconcile_entry=True)
                 return
@@ -2231,6 +2303,9 @@ class Trader:
                 decision=risk_decision,
                 **target_args,
             )
+        except _SETTLEMENT_PENDING as exc:
+            self._remember_settlement(exc.symbol)
+            return
         except CanaryAccountError as exc:
             self.store.journal("entry_skipped", candidate=candidate.id, reason=str(exc)[:200])
             return
@@ -2412,11 +2487,17 @@ class Trader:
         return estimate_pnl(trade, exit_price, self.fee) + dec(trade.get("partial_pnl_usd", "0")), False
 
     async def _finish(self, trade: dict[str, Any], reason: str, book: Book | None, *, close: bool) -> None:
-        if close:
-            if book is None:
-                raise NeedsOperator("a position cannot be closed without a fresh order book")
-            await self.broker.close(trade, book, reason)
-        receipt = await self.broker.settle(trade)
+        try:
+            if close:
+                if book is None:
+                    raise NeedsOperator("a position cannot be closed without a fresh order book")
+                await self.broker.close(trade, book, reason)
+            receipt = await self.broker.settle(trade)
+        except _SETTLEMENT_PENDING as exc:
+            if exc.symbol != trade["symbol"]:
+                raise NeedsOperator("pending close does not match the managed trade") from exc
+            self._remember_settlement(exc.symbol, reason)
+            raise
         equity = await self.broker.equity()
         pnl, exact = await self._trade_result(trade, reason, book, equity)
         origin = "operator" if reason == "OPERATOR_CLOSE" else "unknown"
@@ -2536,6 +2617,7 @@ class Trader:
         now_ms = int(time.time() * 1000)
         trades = self.trades()
         failure: Exception | None = None
+        waiting = tuple(self.store.state.get("settlement_pending", {}))
         slot = self.scan_slot(now_ms)
         # A scan that will run goes first: its review window closes 60 s after the bar, and each
         # open position costs venue round trips. Exchange stops protect them meanwhile, and they
@@ -2549,8 +2631,14 @@ class Trader:
         )
         for trade in [] if scan_first else list(trades):
             symbol = trade["symbol"]
+            if symbol in waiting:
+                continue
             try:
                 await self.manage(trade, now_ms)
+            except _SETTLEMENT_PENDING as exc:
+                if exc.symbol != symbol:
+                    raise NeedsOperator("pending close does not match the managed trade") from exc
+                self._remember_settlement(exc.symbol)
             except (
                 TimeoutError,
                 EvedexError,
@@ -2575,6 +2663,8 @@ class Trader:
         if isinstance(self.broker, LiveBroker):
             try:
                 await self.broker.refresh_performance()
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
             except (
                 TimeoutError,
                 EvedexError,
@@ -2588,6 +2678,7 @@ class Trader:
                 raise
         if failure is not None:
             raise failure
+        await self._retry_settlements(waiting)
         if self._account_entry_block():
             return
         free = self.slot_limit() - len(trades)
@@ -2719,6 +2810,8 @@ class Trader:
             self.trades()
             or self.store.state.get("execution_session")
             or self.store.state.get("pending_entry")
+            or self.store.state.get("settlement_pending")
+            or self._startup_reconciliation_pending
         ):
             return False
         stop = self.store.flag("STOP")
@@ -2756,6 +2849,10 @@ class Trader:
                     self._heartbeat(started_at)
                     say("Новые входы завершены. Открытых позиций и ожидающих операций нет.")
                     return
+                errors = 0
+                last_fault = None
+            except _SETTLEMENT_PENDING as exc:
+                self._remember_settlement(exc.symbol)
                 errors = 0
                 last_fault = None
             except (

@@ -1704,3 +1704,149 @@ def test_engine_warm_up_reads_windows_the_cache_covers_and_journals_what_it_skip
     assert asked["hourly"] == trader.scan_slot(before) or asked["hourly"] == trader.scan_slot(now_ms())
     warm = {e["rule"]: e for e in journal_of(trader) if e["event"] == "engine_warm"}
     assert warm["right_tail"]["skipped"] == 1 and warm["hourly"]["skipped"] == 0
+
+
+def test_known_flat_close_waits_through_restart_without_repeating_close(tmp_path, monkeypatch):
+    from kairos_autotrader import engine
+
+    class Pending(engine.EvedexError):
+        def __init__(self, symbol):
+            super().__init__("test pending history")
+            self.symbol = symbol
+
+    monkeypatch.setattr(engine, "_SETTLEMENT_PENDING", Pending)
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    enter(trader)
+    trade = only(trader)
+    original_close = trader.broker.close
+
+    async def accepted_close(t, book, reason):
+        await original_close(t, book, reason)
+        raise Pending(t["symbol"])
+
+    monkeypatch.setattr(trader.broker, "close", accepted_close)
+    with pytest.raises(Pending):
+        asyncio.run(trader._finish(trade, "OPERATOR_CLOSE", asyncio.run(venue.book("SOLUSD")), close=True))
+    assert (
+        trader.store.state["settlement_pending"]
+        == {"SOLUSD": {"reason": "OPERATOR_CLOSE", "verified": False}}
+        and len(venue.close_bodies) == 1
+    )
+    restarted = live_trader(tmp_path, venue)
+    asyncio.run(restarted.start())
+    restarted.store.state["open_trades"].append({**trade, "id": "other", "symbol": "LINKUSD"})
+    checked, other = [], []
+    ready = False
+    original_recovery = restarted.broker.reconcile_start
+
+    async def check(symbol):
+        checked.append(symbol)
+        if not ready:
+            raise Pending(symbol)
+
+    async def manage(t, now):
+        assert t["symbol"] == "LINKUSD"
+        other.append(now)
+
+    async def recovered(trades, pending):
+        assert ready
+        await original_recovery(trades, pending)
+
+    monkeypatch.setattr(restarted.broker, "reconcile_settlement", check, raising=False)
+    monkeypatch.setattr(restarted.broker, "reconcile_start", recovered)
+    monkeypatch.setattr(restarted, "manage", manage)
+    asyncio.run(restarted._loop(31))
+    assert len(checked) == len(other) == 31
+    assert restarted.entries_blocked() and not restarted.store.state.get("halted")
+    assert len(venue.close_bodies) == 1 and len(venue.market_bodies) == 1
+    assert events(restarted).count("settlement_pending") == 1
+    (restarted.store.directory / "STOP").touch()
+    ready = True
+    asyncio.run(restarted.step())
+    assert "settlement_pending" not in restarted.store.state
+    assert restarted.entries_blocked() == "stop file present"
+    assert [t["symbol"] for t in restarted.trades()] == ["LINKUSD"]
+    reports = [r for r in journal_of(restarted) if r["event"] == "trade_closed"]
+    assert len(reports) == 1 and reports[0]["reason"] == "OPERATOR_CLOSE"
+    assert events(restarted).count("settlement_confirmed") == 1 and len(venue.close_bodies) == 1
+
+
+def test_startup_wait_for_journal_only_close_preserves_other_halt(tmp_path, monkeypatch):
+    from kairos_autotrader import engine
+
+    class Pending(engine.EvedexError):
+        symbol = "SOLUSD"
+
+    monkeypatch.setattr(engine, "_SETTLEMENT_PENDING", Pending)
+    trader = live_trader(tmp_path, FakeVenue())
+    ready = False
+    calls = []
+
+    async def reconcile(trades, pending):
+        calls.append("startup")
+        if not ready:
+            raise Pending("test pending history")
+
+    async def read(symbol):
+        calls.append(symbol)
+        if not ready:
+            raise Pending("test pending history")
+
+    monkeypatch.setattr(trader.broker, "reconcile_start", reconcile)
+    monkeypatch.setattr(trader.broker, "reconcile_settlement", read, raising=False)
+    asyncio.run(trader.start())
+    assert not trader.trades() and trader.entries_blocked()
+    assert not asyncio.run(trader._can_stop_flat())
+    trader.halt("prior independent safety stop")
+    asyncio.run(trader.step())
+    assert calls == ["startup", "SOLUSD"]
+    ready = True
+    asyncio.run(trader.step())
+    assert calls == ["startup", "SOLUSD", "SOLUSD", "startup"]
+    assert trader.entries_blocked() == "prior independent safety stop"
+    assert not trader.store.state.get("settlement_pending")
+
+
+def test_old_execution_never_guesses_a_pending_history_from_error_text(tmp_path, monkeypatch):
+    from kairos_autotrader import engine
+
+    monkeypatch.setattr(engine, "_SETTLEMENT_PENDING", ())
+    trader = live_trader(tmp_path, FakeVenue())
+    trader.store.state["settlement_pending"] = {"SOLUSD": {"reason": "VENUE_EXIT", "verified": False}}
+    monkeypatch.setattr(trader.broker, "reconcile_settlement", None, raising=False)
+    asyncio.run(trader.start())
+    asyncio.run(trader._loop(31))
+    assert trader.entries_blocked() and not trader.store.state.get("halted")
+    assert trader.store.state["settlement_pending"] == {"SOLUSD": {"reason": "VENUE_EXIT", "verified": False}}
+
+    async def failed():
+        raise engine.EvedexError("test pending history")
+
+    monkeypatch.setattr(trader.broker, "refresh_performance", failed)
+    asyncio.run(trader._loop(31))
+    assert trader.store.state["halted"] == engine.REPEATED_ERRORS_HALT
+
+
+def test_verified_wait_can_finish_reporting_after_journal_already_closed(tmp_path, monkeypatch):
+    venue = FakeVenue()
+    trader = live_trader(tmp_path, venue)
+    asyncio.run(trader.start())
+    enter(trader)
+    venue.venue_exit("0.03")
+    trader.store.state["settlement_pending"] = {"SOLUSD": {"reason": "VENUE_EXIT", "verified": True}}
+    trader.store.save()
+    restarted = live_trader(tmp_path, venue)
+
+    async def never_read_missing_open_journal(symbol):
+        raise AssertionError("verified close was already recorded")
+
+    monkeypatch.setattr(
+        restarted.broker, "reconcile_settlement", never_read_missing_open_journal, raising=False
+    )
+    asyncio.run(restarted.start())
+    (restarted.store.directory / "STOP").touch()
+    asyncio.run(restarted.step())
+    assert not restarted.trades() and not restarted.store.state.get("settlement_pending")
+    assert events(restarted).count("trade_closed") == 1 and not venue.close_bodies
