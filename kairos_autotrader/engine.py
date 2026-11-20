@@ -432,7 +432,8 @@ def management_step(
 ) -> tuple[Decimal | None, Decimal | None]:
     """What the trade's management policy asks for now: a tighter stop and/or a partial exit.
 
-    The best price since entry is updated from the book. A new stop is on the price tick,
+    The best price since entry includes book observations and confirmed native target fills.
+    A new stop is on the price tick,
     strictly less risky than the stop in force and away from the market by one tick; a
     partial exit is a multiple of the quantity step and leaves at least the minimum lot.
     """
@@ -442,8 +443,12 @@ def management_step(
     side, entry = trade["side"], float(trade["entry_price"])
     initial = float(trade.get("initial_stop", trade["stop"]))
     touch = book.bid if side == "LONG" else book.ask
-    best = float(trade.get("best_price", trade["entry_price"]))
-    best = max(best, float(touch)) if side == "LONG" else min(best, float(touch))
+    # A resting target can fill between polls, even while the runner is restarting.
+    # Execution reconciles these fills to this position before management runs.
+    favorable = max if side == "LONG" else min
+    best = favorable(float(trade.get("best_price", trade["entry_price"])), float(touch))
+    for _, _, price in trade.get("native_target_fills", ()):
+        best = favorable(best, float(price))
     trade["best_price"] = repr(best)
     part: Decimal | None = None
     targets = policy.targets()
@@ -475,10 +480,13 @@ def management_step(
             elif len(targets) == 1 and initial_quantity == quantity:
                 trade["partial_done"] = "skipped: the position is not divisible into minimum lots"
     desired = managed_stop(policy, side, entry, initial, best)
+    # Even a slipped partial fill proves its trigger was reached. All native
+    # levels are at least the first configured target, including rounded levels.
     if (
-        policy.partial_at_r is not None
-        and trade.get("partial_done") == "done"
+        (trade.get("native_target_fills") or trade.get("partial_done") == "done")
+        and targets
         and policy.breakeven_at_r is not None
+        and policy.breakeven_at_r <= targets[0].at_r
     ):
         desired = tighter(side, desired, entry)
     if instrument is None:
@@ -486,6 +494,10 @@ def management_step(
     tick = instrument.price_step
     rounding = ROUND_DOWN if side == "LONG" else ROUND_UP
     stop = (Decimal(repr(desired)) / tick).to_integral_value(rounding=rounding) * tick
+    if policy.breakeven_at_r is not None and desired == entry:
+        # An average fill can lie between ticks. Use the profitable side of entry.
+        rounding = ROUND_UP if side == "LONG" else ROUND_DOWN
+        stop = (dec(trade["entry_price"]) / tick).to_integral_value(rounding=rounding) * tick
     current = dec(trade["stop"])
     safe = stop <= touch - tick if side == "LONG" else stop >= touch + tick
     better = stop > current if side == "LONG" else stop < current

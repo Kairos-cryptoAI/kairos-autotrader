@@ -203,6 +203,36 @@ def test_management_step_is_on_tick_away_from_the_market_and_never_looser():
     assert small["partial_done"].startswith("skipped")
 
 
+@pytest.mark.parametrize("side,sign", [("LONG", 1), ("SHORT", -1)])
+def test_confirmed_native_take_between_polls_unlocks_breakeven_after_restart(side, sign):
+    policy = Management("half_at_1r", partial_at_r=1, partial_fraction=0.5, breakeven_at_r=1)
+    entry = Decimal("100.005")
+    instrument = dataclasses.replace(SOL, price_step=Decimal("0.01"))
+    initial_stop = str(entry - sign * 5)
+    trade = managed_trade(
+        side=side,
+        entry_price=str(entry),
+        stop=initial_stop,
+        initial_stop=initial_stop,
+        management=policy.as_dict(),
+        quantity="0.5",
+        initial_quantity="1",
+        native_partial_targets=True,
+        # The exchange triggered at 1R and filled slightly below that profit.
+        native_target_fills=[["confirmed-order", "0.5", str(100 + sign * 4.9)]],
+    )
+    # The price already crossed back through entry. Keep the original stop until a
+    # replacement at entry is on the valid side of the current book.
+    assert management_step(trade, Book(0, Decimal("99.99"), Decimal("100.01")), instrument) == (None, None)
+    price = Decimal(100 + sign)
+    book = Book(0, price, price + instrument.price_step)
+    stop, partial = management_step(trade, book, instrument)
+    assert stop == (Decimal("100.01") if sign == 1 else Decimal("100.00"))
+    assert partial is None
+    trade["stop"] = str(stop)
+    assert management_step(trade, book, instrument) == (None, None)
+
+
 def test_ladder_coalesces_small_lots_and_recovers_a_fill_before_the_runner_saved():
     trade = managed_trade(management=LADDER.as_dict(), quantity="0.2", initial_quantity="0.2")
     first = Book(0, Decimal("103"), Decimal("103.01"))
